@@ -56,7 +56,8 @@
 
 /** Directory and file used to persist original NIC settings across crashes */
 #define NIC_SAVE_DIR  "/run/runtime"
-#define NIC_SAVE_FILE NIC_SAVE_DIR "/ecat_nic_saved.conf"
+/* Per-interface save files are built by nic_save_path() as:
+ *   NIC_SAVE_DIR "/ecat_nic_saved_<iface>.conf"  */
 
 typedef struct {
     char iface[NIC_IFNAME_MAX];  /* interface these settings belong to     */
@@ -74,7 +75,52 @@ typedef struct {
     int  offloads_saved;         /* non-zero if offload values valid       */
 } nic_saved_settings_t;
 
-static nic_saved_settings_t g_nic_saved = { .saved = 0 };
+#define ECAT_MAX_NIC_SAVED ECAT_MAX_MASTERS
+static nic_saved_settings_t g_nic_saved[ECAT_MAX_NIC_SAVED];
+static int g_nic_saved_count = 0;
+static pthread_mutex_t g_nic_saved_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/**
+ * @brief Find saved NIC settings by interface name.
+ *
+ * Caller must hold g_nic_saved_mutex.
+ *
+ * @return Pointer to the matching entry, or NULL if not found.
+ */
+static nic_saved_settings_t *find_nic_saved(const char *iface)
+{
+    for (int i = 0; i < g_nic_saved_count; i++) {
+        if (strcmp(g_nic_saved[i].iface, iface) == 0)
+            return &g_nic_saved[i];
+    }
+    return NULL;
+}
+
+/**
+ * @brief Find or allocate a NIC saved settings slot for the given interface.
+ *
+ * Returns the existing slot if one already exists for this interface,
+ * otherwise reserves a new slot. Either way the returned slot is
+ * zero-initialized and has the interface name pre-filled.
+ *
+ * Caller must hold g_nic_saved_mutex.
+ *
+ * @return Pointer to the slot, or NULL if the array is full.
+ */
+static nic_saved_settings_t *get_nic_slot(const char *iface)
+{
+    nic_saved_settings_t *slot = find_nic_saved(iface);
+    if (!slot) {
+        if (g_nic_saved_count >= ECAT_MAX_NIC_SAVED)
+            return NULL;
+        slot = &g_nic_saved[g_nic_saved_count++];
+    }
+
+    memset(slot, 0, sizeof(*slot));
+    strncpy(slot->iface, iface, NIC_IFNAME_MAX - 1);
+    slot->iface[NIC_IFNAME_MAX - 1] = '\0';
+    return slot;
+}
 
 /* ------------------------------------------------------------------ */
 /*  Helpers: ethtool output parsing                                    */
@@ -189,7 +235,19 @@ static int validate_iface_name(const char *iface)
  * atomically: we write to a temporary path and rename, so a crash
  * mid-write never leaves a half-written file.
  */
-static void persist_nic_settings(plugin_logger_t *logger)
+/**
+ * @brief Build the per-interface persistence file path.
+ *
+ * @param iface  Interface name (e.g. "eth0")
+ * @param buf    Output buffer
+ * @param size   Size of output buffer
+ */
+static void nic_save_path(const char *iface, char *buf, size_t size)
+{
+    snprintf(buf, size, NIC_SAVE_DIR "/ecat_nic_saved_%s.conf", iface);
+}
+
+static void persist_nic_settings(const nic_saved_settings_t *ns, plugin_logger_t *logger)
 {
     /* Ensure the directory exists (may already exist for the log socket) */
     if (mkdir(NIC_SAVE_DIR, 0755) != 0 && errno != EEXIST) {
@@ -199,8 +257,11 @@ static void persist_nic_settings(plugin_logger_t *logger)
         return;
     }
 
+    char save_file[128];
+    nic_save_path(ns->iface, save_file, sizeof(save_file));
+
     char tmp_path[128];
-    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", NIC_SAVE_FILE);
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", save_file);
 
     FILE *fp = fopen(tmp_path, "w");
     if (!fp) {
@@ -210,58 +271,66 @@ static void persist_nic_settings(plugin_logger_t *logger)
         return;
     }
 
-    fprintf(fp, "iface=%s\n", g_nic_saved.iface);
+    fprintf(fp, "iface=%s\n", ns->iface);
 
-    if (g_nic_saved.coalescing_saved) {
-        fprintf(fp, "rx_usecs=%d\n", g_nic_saved.rx_usecs);
-        fprintf(fp, "tx_usecs=%d\n", g_nic_saved.tx_usecs);
+    if (ns->coalescing_saved) {
+        fprintf(fp, "rx_usecs=%d\n", ns->rx_usecs);
+        fprintf(fp, "tx_usecs=%d\n", ns->tx_usecs);
     }
 
-    if (g_nic_saved.offloads_saved) {
-        fprintf(fp, "gro=%s\n", g_nic_saved.gro ? "on" : "off");
-        fprintf(fp, "gso=%s\n", g_nic_saved.gso ? "on" : "off");
-        fprintf(fp, "tso=%s\n", g_nic_saved.tso ? "on" : "off");
+    if (ns->offloads_saved) {
+        fprintf(fp, "gro=%s\n", ns->gro ? "on" : "off");
+        fprintf(fp, "gso=%s\n", ns->gso ? "on" : "off");
+        fprintf(fp, "tso=%s\n", ns->tso ? "on" : "off");
     }
 
     fflush(fp);
     fclose(fp);
 
     /* Atomic rename so we never have a half-written file */
-    if (rename(tmp_path, NIC_SAVE_FILE) != 0) {
+    if (rename(tmp_path, save_file) != 0) {
         plugin_logger_warn(logger, "Cannot rename %s -> %s: %s",
-                           tmp_path, NIC_SAVE_FILE, strerror(errno));
+                           tmp_path, save_file, strerror(errno));
         unlink(tmp_path);
         return;
     }
 
-    plugin_logger_info(logger, "NIC settings persisted to %s", NIC_SAVE_FILE);
+    plugin_logger_info(logger, "NIC settings persisted to %s", save_file);
 }
 
 /**
  * @brief Remove the persistence file (called after a successful restore).
  */
-static void remove_nic_save_file(plugin_logger_t *logger)
+static void remove_nic_save_file(const char *iface, plugin_logger_t *logger)
 {
-    if (unlink(NIC_SAVE_FILE) == 0) {
-        plugin_logger_debug(logger, "Removed %s", NIC_SAVE_FILE);
+    char save_file[128];
+    nic_save_path(iface, save_file, sizeof(save_file));
+    if (unlink(save_file) == 0) {
+        plugin_logger_debug(logger, "Removed %s", save_file);
     }
     /* ENOENT is fine - file already gone */
 }
 
 /**
- * @brief Load saved NIC settings from the persistence file.
+ * @brief Load saved NIC settings from the persistence file for a given interface.
  *
- * Populates g_nic_saved from the file contents.
+ * Populates a slot in g_nic_saved from the file contents.
  *
- * @return 1 if a valid save file was found and loaded, 0 otherwise
+ * @param iface  Interface name to load settings for
+ * @param logger Logger instance
+ * @return Pointer to the loaded settings, or NULL if no file found / invalid
  */
-static int load_nic_settings_from_file(plugin_logger_t *logger)
+static nic_saved_settings_t *load_nic_settings_from_file(const char *iface, plugin_logger_t *logger)
 {
-    FILE *fp = fopen(NIC_SAVE_FILE, "r");
-    if (!fp)
-        return 0;
+    char save_file[128];
+    nic_save_path(iface, save_file, sizeof(save_file));
 
-    memset(&g_nic_saved, 0, sizeof(g_nic_saved));
+    FILE *fp = fopen(save_file, "r");
+    if (!fp)
+        return NULL;
+
+    nic_saved_settings_t tmp;
+    memset(&tmp, 0, sizeof(tmp));
 
     char line[128];
     while (fgets(line, sizeof(line), fp)) {
@@ -278,38 +347,50 @@ static int load_nic_settings_from_file(plugin_logger_t *logger)
         const char *val = eq + 1;
 
         if (strcmp(key, "iface") == 0) {
-            strncpy(g_nic_saved.iface, val, NIC_IFNAME_MAX - 1);
-            g_nic_saved.iface[NIC_IFNAME_MAX - 1] = '\0';
+            strncpy(tmp.iface, val, NIC_IFNAME_MAX - 1);
+            tmp.iface[NIC_IFNAME_MAX - 1] = '\0';
         } else if (strcmp(key, "rx_usecs") == 0) {
-            g_nic_saved.rx_usecs = atoi(val);
-            g_nic_saved.coalescing_saved = 1;
+            tmp.rx_usecs = atoi(val);
+            tmp.coalescing_saved = 1;
         } else if (strcmp(key, "tx_usecs") == 0) {
-            g_nic_saved.tx_usecs = atoi(val);
-            g_nic_saved.coalescing_saved = 1;
+            tmp.tx_usecs = atoi(val);
+            tmp.coalescing_saved = 1;
         } else if (strcmp(key, "gro") == 0) {
-            g_nic_saved.gro = (strcmp(val, "on") == 0) ? 1 : 0;
-            g_nic_saved.offloads_saved = 1;
+            tmp.gro = (strcmp(val, "on") == 0) ? 1 : 0;
+            tmp.offloads_saved = 1;
         } else if (strcmp(key, "gso") == 0) {
-            g_nic_saved.gso = (strcmp(val, "on") == 0) ? 1 : 0;
-            g_nic_saved.offloads_saved = 1;
+            tmp.gso = (strcmp(val, "on") == 0) ? 1 : 0;
+            tmp.offloads_saved = 1;
         } else if (strcmp(key, "tso") == 0) {
-            g_nic_saved.tso = (strcmp(val, "on") == 0) ? 1 : 0;
-            g_nic_saved.offloads_saved = 1;
+            tmp.tso = (strcmp(val, "on") == 0) ? 1 : 0;
+            tmp.offloads_saved = 1;
         }
     }
 
     fclose(fp);
 
-    if (g_nic_saved.iface[0] == '\0' || !validate_iface_name(g_nic_saved.iface)) {
+    if (tmp.iface[0] == '\0' || !validate_iface_name(tmp.iface)) {
         plugin_logger_warn(logger,
-            "Invalid or empty interface in %s - discarding", NIC_SAVE_FILE);
-        remove_nic_save_file(logger);
-        memset(&g_nic_saved, 0, sizeof(g_nic_saved));
-        return 0;
+            "Invalid or empty interface in %s - discarding", save_file);
+        remove_nic_save_file(iface, logger);
+        return NULL;
     }
 
-    g_nic_saved.saved = 1;
-    return 1;
+    /* Allocate a slot and copy the loaded data */
+    pthread_mutex_lock(&g_nic_saved_mutex);
+    nic_saved_settings_t *slot = get_nic_slot(tmp.iface);
+    if (!slot) {
+        pthread_mutex_unlock(&g_nic_saved_mutex);
+        plugin_logger_warn(logger,
+            "No free NIC saved-settings slot for %s - discarding", tmp.iface);
+        remove_nic_save_file(iface, logger);
+        return NULL;
+    }
+
+    *slot = tmp;
+    slot->saved = 1;
+    pthread_mutex_unlock(&g_nic_saved_mutex);
+    return slot;
 }
 
 /* ------------------------------------------------------------------ */
@@ -321,9 +402,21 @@ static int load_nic_settings_from_file(plugin_logger_t *logger)
  */
 static void save_nic_settings(const char *iface, plugin_logger_t *logger)
 {
-    memset(&g_nic_saved, 0, sizeof(g_nic_saved));
-    strncpy(g_nic_saved.iface, iface, NIC_IFNAME_MAX - 1);
-    g_nic_saved.iface[NIC_IFNAME_MAX - 1] = '\0';
+    pthread_mutex_lock(&g_nic_saved_mutex);
+    nic_saved_settings_t *ns = get_nic_slot(iface);
+    if (!ns) {
+        pthread_mutex_unlock(&g_nic_saved_mutex);
+        plugin_logger_warn(logger,
+            "%s: no free NIC saved-settings slot - skipping save", iface);
+        return;
+    }
+    pthread_mutex_unlock(&g_nic_saved_mutex);
+
+    /* Capture current NIC settings (slow shell calls -- run without lock) */
+    nic_saved_settings_t local;
+    memset(&local, 0, sizeof(local));
+    strncpy(local.iface, iface, NIC_IFNAME_MAX - 1);
+    local.iface[NIC_IFNAME_MAX - 1] = '\0';
 
     char cmd[128];
     char output[2048];
@@ -332,13 +425,13 @@ static void save_nic_settings(const char *iface, plugin_logger_t *logger)
     snprintf(cmd, sizeof(cmd), "ethtool -c %s 2>/dev/null", iface);
     if (run_capture(cmd, output, sizeof(output)) == 0) {
         int ok = 0;
-        ok += (parse_ethtool_int(output, "rx-usecs", &g_nic_saved.rx_usecs) == 0);
-        ok += (parse_ethtool_int(output, "tx-usecs", &g_nic_saved.tx_usecs) == 0);
+        ok += (parse_ethtool_int(output, "rx-usecs", &local.rx_usecs) == 0);
+        ok += (parse_ethtool_int(output, "tx-usecs", &local.tx_usecs) == 0);
         if (ok > 0) {
-            g_nic_saved.coalescing_saved = 1;
+            local.coalescing_saved = 1;
             plugin_logger_info(logger,
                 "%s: saved coalescing (rx-usecs=%d, tx-usecs=%d)",
-                iface, g_nic_saved.rx_usecs, g_nic_saved.tx_usecs);
+                iface, local.rx_usecs, local.tx_usecs);
         }
     }
 
@@ -346,24 +439,29 @@ static void save_nic_settings(const char *iface, plugin_logger_t *logger)
     snprintf(cmd, sizeof(cmd), "ethtool -k %s 2>/dev/null", iface);
     if (run_capture(cmd, output, sizeof(output)) == 0) {
         int ok = 0;
-        ok += (parse_ethtool_bool(output, "generic-receive-offload", &g_nic_saved.gro) == 0);
-        ok += (parse_ethtool_bool(output, "generic-segmentation-offload", &g_nic_saved.gso) == 0);
-        ok += (parse_ethtool_bool(output, "tcp-segmentation-offload", &g_nic_saved.tso) == 0);
+        ok += (parse_ethtool_bool(output, "generic-receive-offload", &local.gro) == 0);
+        ok += (parse_ethtool_bool(output, "generic-segmentation-offload", &local.gso) == 0);
+        ok += (parse_ethtool_bool(output, "tcp-segmentation-offload", &local.tso) == 0);
         if (ok > 0) {
-            g_nic_saved.offloads_saved = 1;
+            local.offloads_saved = 1;
             plugin_logger_info(logger,
                 "%s: saved offloads (gro=%s, gso=%s, tso=%s)",
                 iface,
-                g_nic_saved.gro ? "on" : "off",
-                g_nic_saved.gso ? "on" : "off",
-                g_nic_saved.tso ? "on" : "off");
+                local.gro ? "on" : "off",
+                local.gso ? "on" : "off",
+                local.tso ? "on" : "off");
         }
     }
 
-    g_nic_saved.saved = 1;
+    local.saved = 1;
+
+    /* Commit captured values back to the shared slot */
+    pthread_mutex_lock(&g_nic_saved_mutex);
+    *ns = local;
+    pthread_mutex_unlock(&g_nic_saved_mutex);
 
     /* Persist to disk so a crash does not lose the original values */
-    persist_nic_settings(logger);
+    persist_nic_settings(&local, logger);
 }
 
 /**
@@ -372,44 +470,54 @@ static void save_nic_settings(const char *iface, plugin_logger_t *logger)
  * Works both for the in-memory path (normal shutdown) and for settings
  * loaded from the persistence file (crash recovery).
  */
-static void restore_nic_settings(plugin_logger_t *logger)
+static void restore_nic_settings(const char *iface, plugin_logger_t *logger)
 {
-    if (!g_nic_saved.saved)
-        return;
+    /* Copy saved settings to stack so ethtool runs without the lock */
+    nic_saved_settings_t local;
+    nic_saved_settings_t *ns;
 
-    const char *iface = g_nic_saved.iface;
+    pthread_mutex_lock(&g_nic_saved_mutex);
+    ns = find_nic_saved(iface);
+    if (!ns || !ns->saved) {
+        pthread_mutex_unlock(&g_nic_saved_mutex);
+        return;
+    }
+    local = *ns;
+    ns->saved = 0;
+    pthread_mutex_unlock(&g_nic_saved_mutex);
+
+    /* Restore NIC settings (slow shell calls -- run without lock) */
     char cmd[128];
 
-    if (g_nic_saved.coalescing_saved) {
+    if (local.coalescing_saved) {
         snprintf(cmd, sizeof(cmd),
             "ethtool -C %s rx-usecs %d tx-usecs %d 2>/dev/null",
-            iface, g_nic_saved.rx_usecs, g_nic_saved.tx_usecs);
+            iface, local.rx_usecs, local.tx_usecs);
         if (system(cmd) == 0) {
             plugin_logger_info(logger,
                 "%s: restored coalescing (rx-usecs=%d, tx-usecs=%d)",
-                iface, g_nic_saved.rx_usecs, g_nic_saved.tx_usecs);
+                iface, local.rx_usecs, local.tx_usecs);
         }
     }
 
-    if (g_nic_saved.offloads_saved) {
+    if (local.offloads_saved) {
         snprintf(cmd, sizeof(cmd),
             "ethtool -K %s gro %s gso %s tso %s 2>/dev/null",
             iface,
-            g_nic_saved.gro ? "on" : "off",
-            g_nic_saved.gso ? "on" : "off",
-            g_nic_saved.tso ? "on" : "off");
+            local.gro ? "on" : "off",
+            local.gso ? "on" : "off",
+            local.tso ? "on" : "off");
         if (system(cmd) == 0) {
             plugin_logger_info(logger,
                 "%s: restored offloads (gro=%s, gso=%s, tso=%s)",
                 iface,
-                g_nic_saved.gro ? "on" : "off",
-                g_nic_saved.gso ? "on" : "off",
-                g_nic_saved.tso ? "on" : "off");
+                local.gro ? "on" : "off",
+                local.gso ? "on" : "off",
+                local.tso ? "on" : "off");
         }
     }
 
-    g_nic_saved.saved = 0;
-    remove_nic_save_file(logger);
+    remove_nic_save_file(iface, logger);
     plugin_logger_info(logger, "%s: NIC settings restored to original values", iface);
 }
 
@@ -420,17 +528,21 @@ static void restore_nic_settings(plugin_logger_t *logger)
  * before it could restore the NIC.  Load the file and apply the
  * saved settings now, before we capture fresh ones and re-tune.
  */
-static void recover_nic_settings(plugin_logger_t *logger)
+static void recover_nic_settings(const char *iface, plugin_logger_t *logger)
 {
-    if (!load_nic_settings_from_file(logger))
+    nic_saved_settings_t *ns = load_nic_settings_from_file(iface, logger);
+    if (!ns)
         return;
+
+    char save_file[128];
+    nic_save_path(iface, save_file, sizeof(save_file));
 
     plugin_logger_warn(logger,
         "Found stale NIC settings file (%s) - previous process likely crashed. "
         "Restoring %s to original settings before re-tuning.",
-        NIC_SAVE_FILE, g_nic_saved.iface);
+        save_file, iface);
 
-    restore_nic_settings(logger);
+    restore_nic_settings(iface, logger);
 }
 
 #endif /* !__CYGWIN__ && !_WIN32 */
@@ -441,23 +553,8 @@ static void recover_nic_settings(plugin_logger_t *logger)
  * =============================================================================
  */
 
-/** Maximum IO map size in bytes */
-#define ECAT_IOMAP_SIZE 4096
-
 /** Number of retries when polling for OPERATIONAL state */
 #define ECAT_OP_POLL_RETRIES 10
-
-/** SOEM context - manages all bus state */
-static ecx_contextt g_ecx_context;
-
-/** IO map buffer for process data exchange */
-static uint8 g_iomap[ECAT_IOMAP_SIZE];
-
-/** Track whether SOEM was initialized (ec_init called) */
-static int g_soem_initialized = 0;
-
-/** Track total IOmap size after mapping */
-static size_t g_iomap_used_size = 0;
 
 /*
  * =============================================================================
@@ -465,9 +562,10 @@ static size_t g_iomap_used_size = 0;
  * =============================================================================
  */
 
-int ecat_master_validate_topology(const ecat_config_t *config, plugin_logger_t *logger)
+int ecat_master_validate_topology(ecat_master_instance_t *inst, plugin_logger_t *logger)
 {
-    int found_count = g_ecx_context.slavecount;
+    const ecat_config_t *config = &inst->config;
+    int found_count = inst->ecx_context.slavecount;
 
     if (found_count != config->slave_count) {
         plugin_logger_error(logger,
@@ -487,7 +585,7 @@ int ecat_master_validate_topology(const ecat_config_t *config, plugin_logger_t *
             return -1;
         }
 
-        ec_slavet *found = &g_ecx_context.slavelist[pos];
+        ec_slavet *found = &inst->ecx_context.slavelist[pos];
 
         /* Vendor ID check (can be disabled per slave via startup_checks) */
         if (expected->startup_checks.check_vendor_id) {
@@ -559,7 +657,7 @@ static void tune_nic(const char *iface, plugin_logger_t *logger)
     }
 
     /* If a previous process crashed, restore the NIC first */
-    recover_nic_settings(logger);
+    recover_nic_settings(iface, logger);
 
     /* Save current settings so they can be restored on close */
     save_nic_settings(iface, logger);
@@ -583,12 +681,14 @@ static void tune_nic(const char *iface, plugin_logger_t *logger)
 #endif
 }
 
-int ecat_master_open_and_scan(const ecat_config_t *config, plugin_logger_t *logger)
+int ecat_master_open_and_scan(ecat_master_instance_t *inst, plugin_logger_t *logger)
 {
+    const ecat_config_t *config = &inst->config;
+
     /* Zero-initialize the SOEM context before use */
-    memset(&g_ecx_context, 0, sizeof(g_ecx_context));
-    memset(g_iomap, 0, sizeof(g_iomap));
-    g_iomap_used_size = 0;
+    memset(&inst->ecx_context, 0, sizeof(inst->ecx_context));
+    memset(inst->iomap, 0, sizeof(inst->iomap));
+    inst->iomap_used_size = 0;
 
     /* Step 0: Tune NIC for low-latency EtherCAT frame delivery */
     tune_nic(config->master.interface, logger);
@@ -596,7 +696,7 @@ int ecat_master_open_and_scan(const ecat_config_t *config, plugin_logger_t *logg
     /* Step 1: Initialize SOEM on the configured network interface */
     plugin_logger_info(logger, "Opening network interface: %s", config->master.interface);
 
-    if (!ecx_init(&g_ecx_context, config->master.interface)) {
+    if (!ecx_init(&inst->ecx_context, config->master.interface)) {
 #if defined(__CYGWIN__) || defined(_WIN32)
         plugin_logger_error(logger,
             "Failed to initialize EtherCAT interface '%s'. "
@@ -614,7 +714,7 @@ int ecat_master_open_and_scan(const ecat_config_t *config, plugin_logger_t *logg
         return -1;
     }
 
-    g_soem_initialized = 1;
+    inst->soem_initialized = 1;
     plugin_logger_info(logger, "Network interface opened successfully");
 
     /* Enable SO_BUSY_POLL on the SOEM raw socket.
@@ -623,7 +723,7 @@ int ecat_master_open_and_scan(const ecat_config_t *config, plugin_logger_t *logg
 #ifdef ECAT_BUSY_POLL_US
     {
         int busy_us = ECAT_BUSY_POLL_US;
-        int sockfd = g_ecx_context.port.sockhandle;
+        int sockfd = inst->ecx_context.port.sockhandle;
         if (sockfd >= 0) {
             if (setsockopt(sockfd, SOL_SOCKET, SO_BUSY_POLL,
                            &busy_us, sizeof(busy_us)) == 0) {
@@ -640,32 +740,32 @@ int ecat_master_open_and_scan(const ecat_config_t *config, plugin_logger_t *logg
     /* Step 2: Scan the bus and enumerate slaves */
     plugin_logger_info(logger, "Scanning EtherCAT bus...");
 
-    if (ecx_config_init(&g_ecx_context) <= 0) {
+    if (ecx_config_init(&inst->ecx_context) <= 0) {
         plugin_logger_error(logger,
             "No EtherCAT slaves found on interface '%s'. "
             "Check cable connections and slave power.",
             config->master.interface);
-        ecx_close(&g_ecx_context);
-        g_soem_initialized = 0;
+        ecx_close(&inst->ecx_context);
+        inst->soem_initialized = 0;
         return -1;
     }
 
-    plugin_logger_info(logger, "Found %d slave(s) on the bus", g_ecx_context.slavecount);
+    plugin_logger_info(logger, "Found %d slave(s) on the bus", inst->ecx_context.slavecount);
 
     /* Log discovered slaves */
-    for (int i = 1; i <= g_ecx_context.slavecount; i++) {
-        ec_slavet *slave = &g_ecx_context.slavelist[i];
+    for (int i = 1; i <= inst->ecx_context.slavecount; i++) {
+        ec_slavet *slave = &inst->ecx_context.slavelist[i];
         plugin_logger_info(logger,
             "  [%d] %s - vendor=0x%08X, product=0x%08X, rev=0x%08X",
             i, slave->name, slave->eep_man, slave->eep_id, slave->eep_rev);
     }
 
     /* Step 3: Validate topology against JSON configuration */
-    if (ecat_master_validate_topology(config, logger) != 0) {
+    if (ecat_master_validate_topology(inst, logger) != 0) {
         plugin_logger_error(logger,
             "Topology validation failed - aborting master initialization");
-        ecx_close(&g_ecx_context);
-        g_soem_initialized = 0;
+        ecx_close(&inst->ecx_context);
+        inst->soem_initialized = 0;
         return -1;
     }
 
@@ -687,12 +787,12 @@ int ecat_master_open_and_scan(const ecat_config_t *config, plugin_logger_t *logg
         max_preop_timeout_us = EC_TIMEOUTSTATE * 4;
     plugin_logger_debug(logger, "Using INIT->PRE-OP timeout: %d us", max_preop_timeout_us);
 
-    ecx_statecheck(&g_ecx_context, 0, EC_STATE_PRE_OP, max_preop_timeout_us);
-    ecx_readstate(&g_ecx_context);
+    ecx_statecheck(&inst->ecx_context, 0, EC_STATE_PRE_OP, max_preop_timeout_us);
+    ecx_readstate(&inst->ecx_context);
 
     int all_preop = 1;
-    for (int i = 1; i <= g_ecx_context.slavecount; i++) {
-        ec_slavet *slave = &g_ecx_context.slavelist[i];
+    for (int i = 1; i <= inst->ecx_context.slavecount; i++) {
+        ec_slavet *slave = &inst->ecx_context.slavelist[i];
         if (slave->state < EC_STATE_PRE_OP) {
             plugin_logger_error(logger,
                 "Slave %d (%s) failed to reach PRE-OP (state=0x%04X, ALstatus=0x%04X)",
@@ -703,8 +803,8 @@ int ecat_master_open_and_scan(const ecat_config_t *config, plugin_logger_t *logg
 
     if (!all_preop) {
         plugin_logger_error(logger, "Not all slaves reached PRE-OP - aborting");
-        ecx_close(&g_ecx_context);
-        g_soem_initialized = 0;
+        ecx_close(&inst->ecx_context);
+        inst->soem_initialized = 0;
         return -1;
     }
 
@@ -719,16 +819,17 @@ int ecat_master_open_and_scan(const ecat_config_t *config, plugin_logger_t *logg
  * =============================================================================
  */
 
-int ecat_master_write_sdos(int slave_pos, const ecat_sdo_config_t *sdos,
+int ecat_master_write_sdos(ecat_master_instance_t *inst, int slave_pos,
+                           const ecat_sdo_config_t *sdos,
                            int sdo_count, int sdo_timeout_ms,
                            plugin_logger_t *logger)
 {
-    if (!g_soem_initialized) {
+    if (!inst->soem_initialized) {
         plugin_logger_error(logger, "Cannot write SDOs: SOEM not initialized");
         return -1;
     }
 
-    if (slave_pos < 1 || slave_pos > g_ecx_context.slavecount) {
+    if (slave_pos < 1 || slave_pos > inst->ecx_context.slavecount) {
         plugin_logger_error(logger, "Invalid slave position %d for SDO write", slave_pos);
         return -1;
     }
@@ -788,7 +889,7 @@ int ecat_master_write_sdos(int slave_pos, const ecat_sdo_config_t *sdos,
         /* Use per-slave SDO timeout if configured, otherwise SOEM default */
         int sdo_timeout_us = (sdo_timeout_ms > 0) ? (sdo_timeout_ms * 1000) : EC_TIMEOUTRXM;
 
-        int wkc = ecx_SDOwrite(&g_ecx_context, (uint16)slave_pos,
+        int wkc = ecx_SDOwrite(&inst->ecx_context, (uint16)slave_pos,
                                 index, sdo->subindex,
                                 FALSE, size, value_buf, sdo_timeout_us);
 
@@ -830,7 +931,8 @@ int ecat_master_write_sdos(int slave_pos, const ecat_sdo_config_t *sdos,
  * @param wd        Watchdog configuration
  * @param logger    Plugin logger instance
  */
-static void ecat_master_configure_watchdog(int slave_pos, const ecat_watchdog_t *wd,
+static void ecat_master_configure_watchdog(ecat_master_instance_t *inst, int slave_pos,
+                                           const ecat_watchdog_t *wd,
                                            plugin_logger_t *logger)
 {
     /* Maximum watchdog timeout in ms that fits in a uint16_t register
@@ -838,7 +940,7 @@ static void ecat_master_configure_watchdog(int slave_pos, const ecat_watchdog_t 
      * 65535 / 16 = 4095.9 ms */
     const int max_watchdog_ms = UINT16_MAX / 16;
 
-    uint16_t configadr = g_ecx_context.slavelist[slave_pos].configadr;
+    uint16_t configadr = inst->ecx_context.slavelist[slave_pos].configadr;
     int wkc;
 
     /* SM watchdog register 0x0420 - only write if explicitly enabled. */
@@ -854,7 +956,7 @@ static void ecat_master_configure_watchdog(int slave_pos, const ecat_watchdog_t 
             }
             sm_wd_ticks = (uint16_t)(clamped_ms * 16);
         }
-        wkc = ecx_FPWR(&g_ecx_context.port, configadr, 0x0420,
+        wkc = ecx_FPWR(&inst->ecx_context.port, configadr, 0x0420,
                             sizeof(sm_wd_ticks), &sm_wd_ticks, EC_TIMEOUTRET);
         if (wkc <= 0) {
             plugin_logger_warn(logger,
@@ -885,7 +987,7 @@ static void ecat_master_configure_watchdog(int slave_pos, const ecat_watchdog_t 
             }
             pdi_wd_ticks = (uint16_t)(clamped_ms * 16);
         }
-        wkc = ecx_FPWR(&g_ecx_context.port, configadr, 0x0402,
+        wkc = ecx_FPWR(&inst->ecx_context.port, configadr, 0x0402,
                         sizeof(pdi_wd_ticks), &pdi_wd_ticks, EC_TIMEOUTRET);
         if (wkc <= 0) {
             plugin_logger_warn(logger,
@@ -913,11 +1015,13 @@ static void ecat_master_configure_watchdog(int slave_pos, const ecat_watchdog_t 
  * @param config Parsed EtherCAT configuration
  * @param logger Plugin logger instance
  */
-static void ecat_master_configure_dc(const ecat_config_t *config, plugin_logger_t *logger)
+static void ecat_master_configure_dc(ecat_master_instance_t *inst, plugin_logger_t *logger)
 {
+    const ecat_config_t *config = &inst->config;
+
     /* Step 1: Let SOEM discover DC-capable slaves and measure delays */
     plugin_logger_info(logger, "Configuring Distributed Clocks...");
-    ecx_configdc(&g_ecx_context);
+    ecx_configdc(&inst->ecx_context);
 
     /* Step 2: Apply per-slave DC configuration */
     for (int i = 0; i < config->slave_count; i++) {
@@ -927,14 +1031,14 @@ static void ecat_master_configure_dc(const ecat_config_t *config, plugin_logger_
         if (!slave->dc.enabled)
             continue;
 
-        if (pos < 1 || pos > g_ecx_context.slavecount) {
+        if (pos < 1 || pos > inst->ecx_context.slavecount) {
             plugin_logger_warn(logger,
                 "Slave %d (%s): DC config skipped - position out of range",
                 pos, slave->name);
             continue;
         }
 
-        if (!g_ecx_context.slavelist[pos].hasdc) {
+        if (!inst->ecx_context.slavelist[pos].hasdc) {
             plugin_logger_warn(logger,
                 "Slave %d (%s): DC config requested but slave has no DC support",
                 pos, slave->name);
@@ -957,7 +1061,7 @@ static void ecat_master_configure_dc(const ecat_config_t *config, plugin_logger_
                 ? (uint32_t)(slave->dc.sync1_cycle_us * 1000) : cycle_ns;
             int32_t shift_ns = (int32_t)(slave->dc.sync0_shift_us * 1000);
 
-            ecx_dcsync01(&g_ecx_context, (uint16)pos, TRUE,
+            ecx_dcsync01(&inst->ecx_context, (uint16)pos, TRUE,
                          cycle0_ns, cycle1_ns, shift_ns);
 
             plugin_logger_info(logger,
@@ -971,7 +1075,7 @@ static void ecat_master_configure_dc(const ecat_config_t *config, plugin_logger_
                 ? (uint32_t)(slave->dc.sync0_cycle_us * 1000) : cycle_ns;
             int32_t shift_ns = (int32_t)(slave->dc.sync0_shift_us * 1000);
 
-            ecx_dcsync0(&g_ecx_context, (uint16)pos, TRUE,
+            ecx_dcsync0(&inst->ecx_context, (uint16)pos, TRUE,
                         sync0_ns, shift_ns);
 
             plugin_logger_info(logger,
@@ -987,9 +1091,11 @@ static void ecat_master_configure_dc(const ecat_config_t *config, plugin_logger_
     }
 }
 
-int ecat_master_configure(const ecat_config_t *config, plugin_logger_t *logger)
+int ecat_master_configure(ecat_master_instance_t *inst, plugin_logger_t *logger)
 {
-    if (!g_soem_initialized) {
+    const ecat_config_t *config = &inst->config;
+
+    if (!inst->soem_initialized) {
         plugin_logger_error(logger, "Cannot configure: SOEM not initialized");
         return -1;
     }
@@ -997,9 +1103,9 @@ int ecat_master_configure(const ecat_config_t *config, plugin_logger_t *logger)
     /* Step 4: Map process data (IO map) */
     plugin_logger_info(logger, "Mapping process data...");
 
-    ecx_config_map_group(&g_ecx_context, &g_iomap, 0);
+    ecx_config_map_group(&inst->ecx_context, &inst->iomap, 0);
 
-    ec_groupt *grp = &g_ecx_context.grouplist[0];
+    ec_groupt *grp = &inst->ecx_context.grouplist[0];
 
     /* Check that total I/O fits in the IOmap buffer */
     uint32_t total_io = (uint32_t)grp->Obytes + (uint32_t)grp->Ibytes;
@@ -1009,7 +1115,7 @@ int ecat_master_configure(const ecat_config_t *config, plugin_logger_t *logger)
         return -1;
     }
 
-    g_iomap_used_size = (size_t)total_io;
+    inst->iomap_used_size = (size_t)total_io;
 
     plugin_logger_info(logger, "IO map: %d output bytes, %d input bytes, %d segments",
                        grp->Obytes, grp->Ibytes, grp->nsegments);
@@ -1019,13 +1125,13 @@ int ecat_master_configure(const ecat_config_t *config, plugin_logger_t *logger)
     for (int i = 0; i < config->slave_count; i++) {
         const ecat_slave_t *slave = &config->slaves[i];
         int pos = slave->position;
-        if (pos >= 1 && pos <= g_ecx_context.slavecount) {
-            ecat_master_configure_watchdog(pos, &slave->watchdog, logger);
+        if (pos >= 1 && pos <= inst->ecx_context.slavecount) {
+            ecat_master_configure_watchdog(inst, pos, &slave->watchdog, logger);
         }
     }
 
     /* Step 6: Configure Distributed Clocks per slave */
-    ecat_master_configure_dc(config, logger);
+    ecat_master_configure_dc(inst, logger);
 
     return 0;
 }
@@ -1036,21 +1142,21 @@ int ecat_master_configure(const ecat_config_t *config, plugin_logger_t *logger)
  * =============================================================================
  */
 
-int ecat_master_transition_to_op(const ecat_config_t *config, plugin_logger_t *logger)
+int ecat_master_transition_to_op(ecat_master_instance_t *inst, plugin_logger_t *logger)
 {
-    if (!g_soem_initialized) {
+    const ecat_config_t *config = &inst->config;
+
+    if (!inst->soem_initialized) {
         plugin_logger_error(logger, "Cannot transition: SOEM not initialized");
         return -1;
     }
 
     /* Compute maximum SAFE-OP->OP timeout across all configured slaves */
     int max_safeop_timeout_us = 0;
-    if (config != NULL) {
-        for (int i = 0; i < config->slave_count; i++) {
-            int t_us = config->slaves[i].timeouts.safeop_to_op_timeout_ms * 1000;
-            if (t_us > max_safeop_timeout_us)
-                max_safeop_timeout_us = t_us;
-        }
+    for (int i = 0; i < config->slave_count; i++) {
+        int t_us = config->slaves[i].timeouts.safeop_to_op_timeout_ms * 1000;
+        if (t_us > max_safeop_timeout_us)
+            max_safeop_timeout_us = t_us;
     }
     if (max_safeop_timeout_us == 0)
         max_safeop_timeout_us = EC_TIMEOUTSTATE * 4;
@@ -1059,18 +1165,18 @@ int ecat_master_transition_to_op(const ecat_config_t *config, plugin_logger_t *l
     plugin_logger_info(logger, "Waiting for SAFE_OP state...");
     plugin_logger_debug(logger, "Using SAFE-OP->OP timeout: %d us", max_safeop_timeout_us);
 
-    ecx_statecheck(&g_ecx_context, 0, EC_STATE_SAFE_OP, max_safeop_timeout_us);
+    ecx_statecheck(&inst->ecx_context, 0, EC_STATE_SAFE_OP, max_safeop_timeout_us);
 
     /* Read back actual states */
-    ecx_readstate(&g_ecx_context);
-    if (g_ecx_context.slavelist[0].state != EC_STATE_SAFE_OP) {
+    ecx_readstate(&inst->ecx_context);
+    if (inst->ecx_context.slavelist[0].state != EC_STATE_SAFE_OP) {
         plugin_logger_error(logger,
             "Not all slaves reached SAFE_OP state (current state: 0x%04X)",
-            g_ecx_context.slavelist[0].state);
+            inst->ecx_context.slavelist[0].state);
 
         /* Log individual slave states for debugging */
-        for (int i = 1; i <= g_ecx_context.slavecount; i++) {
-            ec_slavet *slave = &g_ecx_context.slavelist[i];
+        for (int i = 1; i <= inst->ecx_context.slavecount; i++) {
+            ec_slavet *slave = &inst->ecx_context.slavelist[i];
             if (slave->state != EC_STATE_SAFE_OP) {
                 plugin_logger_error(logger,
                     "  Slave %d (%s): state=0x%04X, ALstatuscode=0x%04X",
@@ -1087,12 +1193,12 @@ int ecat_master_transition_to_op(const ecat_config_t *config, plugin_logger_t *l
     plugin_logger_info(logger, "Requesting OPERATIONAL state...");
 
     /* Send one round of process data to make slave outputs happy */
-    ecx_send_processdata(&g_ecx_context);
-    ecx_receive_processdata(&g_ecx_context, EC_TIMEOUTRET);
+    ecx_send_processdata(&inst->ecx_context);
+    ecx_receive_processdata(&inst->ecx_context, EC_TIMEOUTRET);
 
     /* Request OP state */
-    g_ecx_context.slavelist[0].state = EC_STATE_OPERATIONAL;
-    ecx_writestate(&g_ecx_context, 0);
+    inst->ecx_context.slavelist[0].state = EC_STATE_OPERATIONAL;
+    ecx_writestate(&inst->ecx_context, 0);
 
     /* Poll for OP state with process data exchange between checks */
     int op_reached = 0;
@@ -1101,11 +1207,11 @@ int ecat_master_transition_to_op(const ecat_config_t *config, plugin_logger_t *l
         poll_timeout_us = EC_TIMEOUTRET;
 
     for (int retry = 0; retry < ECAT_OP_POLL_RETRIES; retry++) {
-        ecx_send_processdata(&g_ecx_context);
-        ecx_receive_processdata(&g_ecx_context, EC_TIMEOUTRET);
-        ecx_statecheck(&g_ecx_context, 0, EC_STATE_OPERATIONAL, poll_timeout_us);
+        ecx_send_processdata(&inst->ecx_context);
+        ecx_receive_processdata(&inst->ecx_context, EC_TIMEOUTRET);
+        ecx_statecheck(&inst->ecx_context, 0, EC_STATE_OPERATIONAL, poll_timeout_us);
 
-        if (g_ecx_context.slavelist[0].state == EC_STATE_OPERATIONAL) {
+        if (inst->ecx_context.slavelist[0].state == EC_STATE_OPERATIONAL) {
             op_reached = 1;
             break;
         }
@@ -1117,9 +1223,9 @@ int ecat_master_transition_to_op(const ecat_config_t *config, plugin_logger_t *l
             ECAT_OP_POLL_RETRIES);
 
         /* Log individual slave states for debugging */
-        ecx_readstate(&g_ecx_context);
-        for (int i = 1; i <= g_ecx_context.slavecount; i++) {
-            ec_slavet *slave = &g_ecx_context.slavelist[i];
+        ecx_readstate(&inst->ecx_context);
+        for (int i = 1; i <= inst->ecx_context.slavecount; i++) {
+            ec_slavet *slave = &inst->ecx_context.slavelist[i];
             if (slave->state != EC_STATE_OPERATIONAL) {
                 plugin_logger_error(logger,
                     "  Slave %d (%s): state=0x%04X, ALstatuscode=0x%04X",
@@ -1131,7 +1237,7 @@ int ecat_master_transition_to_op(const ecat_config_t *config, plugin_logger_t *l
     }
 
     plugin_logger_info(logger, "EtherCAT master operational with %d slave(s)",
-                       g_ecx_context.slavecount);
+                       inst->ecx_context.slavecount);
 
     return 0;
 }
@@ -1142,30 +1248,30 @@ int ecat_master_transition_to_op(const ecat_config_t *config, plugin_logger_t *l
  * =============================================================================
  */
 
-void ecat_master_close(plugin_logger_t *logger)
+void ecat_master_close(ecat_master_instance_t *inst, plugin_logger_t *logger)
 {
-    if (g_soem_initialized) {
+    if (inst->soem_initialized) {
         /* Transition all slaves to INIT state */
         plugin_logger_info(logger, "Transitioning slaves to INIT state...");
-        g_ecx_context.slavelist[0].state = EC_STATE_INIT;
-        ecx_writestate(&g_ecx_context, 0);
+        inst->ecx_context.slavelist[0].state = EC_STATE_INIT;
+        ecx_writestate(&inst->ecx_context, 0);
 
         /* Close the network interface */
-        ecx_close(&g_ecx_context);
-        g_soem_initialized = 0;
+        ecx_close(&inst->ecx_context);
+        inst->soem_initialized = 0;
     }
 
     /* Always attempt to restore NIC settings, even if SOEM init had failed
      * after tune_nic() already modified the interface. The restore function
-     * checks g_nic_saved.saved internally and is a no-op when there is
+     * checks the saved flag internally and is a no-op when there is
      * nothing to undo. */
 #if !defined(__CYGWIN__) && !defined(_WIN32)
-    restore_nic_settings(logger);
+    restore_nic_settings(inst->config.master.interface, logger);
 #endif
 
     /* Clear IO map */
-    memset(g_iomap, 0, sizeof(g_iomap));
-    g_iomap_used_size = 0;
+    memset(inst->iomap, 0, sizeof(inst->iomap));
+    inst->iomap_used_size = 0;
 
     plugin_logger_info(logger, "EtherCAT master closed");
 }
@@ -1176,50 +1282,50 @@ void ecat_master_close(plugin_logger_t *logger)
  * =============================================================================
  */
 
-int ecat_master_exchange_processdata(int timeout_us)
+int ecat_master_exchange_processdata(ecat_master_instance_t *inst, int timeout_us)
 {
-    ecx_send_processdata(&g_ecx_context);
-    int wkc = ecx_receive_processdata(&g_ecx_context,
+    ecx_send_processdata(&inst->ecx_context);
+    int wkc = ecx_receive_processdata(&inst->ecx_context,
                                        (timeout_us > 0) ? timeout_us : EC_TIMEOUTRET);
     return wkc;
 }
 
-int ecat_master_get_expected_wkc(void)
+int ecat_master_get_expected_wkc(ecat_master_instance_t *inst)
 {
-    ec_groupt *grp = &g_ecx_context.grouplist[0];
+    ec_groupt *grp = &inst->ecx_context.grouplist[0];
     return (grp->outputsWKC * 2) + grp->inputsWKC;
 }
 
-const ec_slavet *ecat_master_get_slave(int position)
+const ec_slavet *ecat_master_get_slave(ecat_master_instance_t *inst, int position)
 {
-    if (position < 1 || position > g_ecx_context.slavecount)
+    if (position < 1 || position > inst->ecx_context.slavecount)
         return NULL;
-    return &g_ecx_context.slavelist[position];
+    return &inst->ecx_context.slavelist[position];
 }
 
-int ecat_master_is_operational(void)
+int ecat_master_is_operational(ecat_master_instance_t *inst)
 {
-    if (!g_soem_initialized)
+    if (!inst->soem_initialized)
         return 0;
-    return (g_ecx_context.slavelist[0].state == EC_STATE_OPERATIONAL) ? 1 : 0;
+    return (inst->ecx_context.slavelist[0].state == EC_STATE_OPERATIONAL) ? 1 : 0;
 }
 
-uint16_t ecat_master_get_slave_state(int position)
+uint16_t ecat_master_get_slave_state(ecat_master_instance_t *inst, int position)
 {
-    if (position < 1 || position > g_ecx_context.slavecount)
+    if (position < 1 || position > inst->ecx_context.slavecount)
         return 0;
-    return g_ecx_context.slavelist[position].state;
+    return inst->ecx_context.slavelist[position].state;
 }
 
-int ecat_master_request_state(int position, uint16_t state, plugin_logger_t *logger)
+int ecat_master_request_state(ecat_master_instance_t *inst, int position, uint16_t state, plugin_logger_t *logger)
 {
-    if (position < 1 || position > g_ecx_context.slavecount) {
+    if (position < 1 || position > inst->ecx_context.slavecount) {
         plugin_logger_error(logger, "Invalid slave position %d for state request", position);
         return -1;
     }
 
-    g_ecx_context.slavelist[position].state = state;
-    ecx_writestate(&g_ecx_context, (uint16)position);
+    inst->ecx_context.slavelist[position].state = state;
+    ecx_writestate(&inst->ecx_context, (uint16)position);
 
     plugin_logger_debug(logger, "Requested state 0x%04X for slave %d", state, position);
     return 0;
@@ -1231,14 +1337,14 @@ int ecat_master_request_state(int position, uint16_t state, plugin_logger_t *log
  * =============================================================================
  */
 
-int ecat_master_recover_slave(int position, plugin_logger_t *logger)
+int ecat_master_recover_slave(ecat_master_instance_t *inst, int position, plugin_logger_t *logger)
 {
-    if (position < 1 || position > g_ecx_context.slavecount) {
+    if (position < 1 || position > inst->ecx_context.slavecount) {
         plugin_logger_error(logger, "Invalid slave position %d for recovery", position);
         return -1;
     }
 
-    ec_slavet *slave = &g_ecx_context.slavelist[position];
+    ec_slavet *slave = &inst->ecx_context.slavelist[position];
     uint16_t current_state = slave->state;
 
     if (current_state == EC_STATE_OPERATIONAL) {
@@ -1253,14 +1359,14 @@ int ecat_master_recover_slave(int position, plugin_logger_t *logger)
             position, slave->name, slave->ALstatuscode);
 
         slave->state = EC_STATE_SAFE_OP + EC_STATE_ACK;
-        ecx_writestate(&g_ecx_context, (uint16)position);
+        ecx_writestate(&inst->ecx_context, (uint16)position);
 
         /* Now request OP */
         slave->state = EC_STATE_OPERATIONAL;
-        ecx_writestate(&g_ecx_context, (uint16)position);
+        ecx_writestate(&inst->ecx_context, (uint16)position);
 
         /* Check if it worked */
-        ecx_statecheck(&g_ecx_context, (uint16)position,
+        ecx_statecheck(&inst->ecx_context, (uint16)position,
                         EC_STATE_OPERATIONAL, EC_TIMEOUTRET);
 
         if (slave->state == EC_STATE_OPERATIONAL) {
@@ -1277,9 +1383,9 @@ int ecat_master_recover_slave(int position, plugin_logger_t *logger)
                            position, slave->name);
 
         slave->state = EC_STATE_OPERATIONAL;
-        ecx_writestate(&g_ecx_context, (uint16)position);
+        ecx_writestate(&inst->ecx_context, (uint16)position);
 
-        ecx_statecheck(&g_ecx_context, (uint16)position,
+        ecx_statecheck(&inst->ecx_context, (uint16)position,
                         EC_STATE_OPERATIONAL, EC_TIMEOUTRET);
 
         if (slave->state == EC_STATE_OPERATIONAL) {
@@ -1296,12 +1402,12 @@ int ecat_master_recover_slave(int position, plugin_logger_t *logger)
             "Slave %d (%s): state=0x%04X, attempting reconfig",
             position, slave->name, current_state);
 
-        if (ecx_reconfig_slave(&g_ecx_context, (uint16)position, EC_TIMEOUTRET)) {
+        if (ecx_reconfig_slave(&inst->ecx_context, (uint16)position, EC_TIMEOUTRET)) {
             slave->islost = FALSE;
             plugin_logger_info(logger, "Slave %d (%s): reconfigured", position, slave->name);
 
             /* After reconfig, check if it reached OP */
-            ecx_statecheck(&g_ecx_context, (uint16)position,
+            ecx_statecheck(&inst->ecx_context, (uint16)position,
                             EC_STATE_OPERATIONAL, EC_TIMEOUTRET);
             if (slave->state == EC_STATE_OPERATIONAL)
                 return 1;
@@ -1312,7 +1418,7 @@ int ecat_master_recover_slave(int position, plugin_logger_t *logger)
 
     /* EC_STATE_NONE: slave is lost, try recover */
     if (!slave->islost) {
-        ecx_statecheck(&g_ecx_context, (uint16)position,
+        ecx_statecheck(&inst->ecx_context, (uint16)position,
                         EC_STATE_OPERATIONAL, EC_TIMEOUTRET);
         if (slave->state == EC_STATE_NONE) {
             slave->islost = TRUE;
@@ -1323,7 +1429,7 @@ int ecat_master_recover_slave(int position, plugin_logger_t *logger)
     }
 
     /* Slave was marked lost - try to recover */
-    if (ecx_recover_slave(&g_ecx_context, (uint16)position, EC_TIMEOUTRET)) {
+    if (ecx_recover_slave(&inst->ecx_context, (uint16)position, EC_TIMEOUTRET)) {
         slave->islost = FALSE;
         plugin_logger_info(logger, "Slave %d (%s): recovered from lost state",
                            position, slave->name);
@@ -1333,10 +1439,10 @@ int ecat_master_recover_slave(int position, plugin_logger_t *logger)
     return 0;
 }
 
-void ecat_master_read_states(void)
+void ecat_master_read_states(ecat_master_instance_t *inst)
 {
-    if (g_soem_initialized)
-        ecx_readstate(&g_ecx_context);
+    if (inst->soem_initialized)
+        ecx_readstate(&inst->ecx_context);
 }
 
 /*
@@ -1345,21 +1451,21 @@ void ecat_master_read_states(void)
  * =============================================================================
  */
 
-uint8_t *ecat_master_get_iomap(void)
+uint8_t *ecat_master_get_iomap(ecat_master_instance_t *inst)
 {
-    if (!g_soem_initialized)
+    if (!inst->soem_initialized)
         return NULL;
-    return g_iomap;
+    return inst->iomap;
 }
 
-size_t ecat_master_get_iomap_size(void)
+size_t ecat_master_get_iomap_size(ecat_master_instance_t *inst)
 {
-    return g_iomap_used_size;
+    return inst->iomap_used_size;
 }
 
-int ecat_master_get_slave_count(void)
+int ecat_master_get_slave_count(ecat_master_instance_t *inst)
 {
-    if (!g_soem_initialized)
+    if (!inst->soem_initialized)
         return 0;
-    return g_ecx_context.slavecount;
+    return inst->ecx_context.slavecount;
 }

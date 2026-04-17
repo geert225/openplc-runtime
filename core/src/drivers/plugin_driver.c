@@ -679,6 +679,9 @@ void *generate_structured_args_with_driver(plugin_type_t type, plugin_driver_t *
     args->journal_write_dint = plugin_journal_write_dint;
     args->journal_write_lint = plugin_journal_write_lint;
 
+    // PLC base tick time
+    args->common_ticktime_ns = ext_common_ticktime__ ? *ext_common_ticktime__ : 0;
+
     // printf("[PLUGIN]: Runtime args initialized:\n");
     // printf("[PLUGIN]:   buffer_size = %d\n", args->buffer_size);
     // printf("[PLUGIN]:   bits_per_buffer = %d\n", args->bits_per_buffer);

@@ -30,11 +30,11 @@
  *   2. Scan the bus for slaves
  *   3. Validate topology against JSON configuration
  *
- * @param config Parsed EtherCAT configuration
+ * @param inst   Per-master instance (contains config, SOEM context, IOmap)
  * @param logger Plugin logger instance
  * @return 0 on success, -1 on failure
  */
-int ecat_master_open_and_scan(const ecat_config_t *config, plugin_logger_t *logger);
+int ecat_master_open_and_scan(ecat_master_instance_t *inst, plugin_logger_t *logger);
 
 /**
  * @brief Write SDO parameters to a slave
@@ -43,6 +43,7 @@ int ecat_master_open_and_scan(const ecat_config_t *config, plugin_logger_t *logg
  * Must be called while slaves are in PRE-OP state (after open_and_scan,
  * before configure).
  *
+ * @param inst           Per-master instance
  * @param slave_pos      1-based slave position on the bus
  * @param sdos           Array of SDO configuration entries
  * @param sdo_count      Number of SDO entries
@@ -50,7 +51,8 @@ int ecat_master_open_and_scan(const ecat_config_t *config, plugin_logger_t *logg
  * @param logger         Plugin logger instance
  * @return Number of SDOs successfully written, or -1 on critical error
  */
-int ecat_master_write_sdos(int slave_pos, const ecat_sdo_config_t *sdos,
+int ecat_master_write_sdos(ecat_master_instance_t *inst, int slave_pos,
+                           const ecat_sdo_config_t *sdos,
                            int sdo_count, int sdo_timeout_ms,
                            plugin_logger_t *logger);
 
@@ -61,11 +63,11 @@ int ecat_master_write_sdos(int slave_pos, const ecat_sdo_config_t *sdos,
  *   4. Map process data (IOmap)
  *   5. Configure Distributed Clocks
  *
- * @param config Parsed EtherCAT configuration
+ * @param inst   Per-master instance
  * @param logger Plugin logger instance
  * @return 0 on success, -1 on failure
  */
-int ecat_master_configure(const ecat_config_t *config, plugin_logger_t *logger);
+int ecat_master_configure(ecat_master_instance_t *inst, plugin_logger_t *logger);
 
 /**
  * @brief Transition all slaves to OPERATIONAL state
@@ -77,11 +79,11 @@ int ecat_master_configure(const ecat_config_t *config, plugin_logger_t *logger);
  * Uses per-slave safeop_to_op_timeout_ms from the configuration (the
  * maximum across all slaves is applied to the broadcast statecheck).
  *
- * @param config Parsed EtherCAT configuration (for per-slave timeouts)
+ * @param inst   Per-master instance (for config and SOEM context)
  * @param logger Plugin logger instance
  * @return 0 on success, -1 on failure
  */
-int ecat_master_transition_to_op(const ecat_config_t *config, plugin_logger_t *logger);
+int ecat_master_transition_to_op(ecat_master_instance_t *inst, plugin_logger_t *logger);
 
 /**
  * @brief Validate bus topology against configuration
@@ -90,74 +92,81 @@ int ecat_master_transition_to_op(const ecat_config_t *config, plugin_logger_t *l
  * - Number of slaves must match
  * - For each slave: vendor_id and product_code must match
  *
- * @param config Parsed EtherCAT configuration
+ * @param inst   Per-master instance
  * @param logger Plugin logger instance
  * @return 0 on success, -1 on mismatch
  */
-int ecat_master_validate_topology(const ecat_config_t *config, plugin_logger_t *logger);
+int ecat_master_validate_topology(ecat_master_instance_t *inst, plugin_logger_t *logger);
 
 /**
  * @brief Close the EtherCAT master
  *
  * Transitions all slaves to INIT state and closes the network interface.
  *
+ * @param inst   Per-master instance
  * @param logger Plugin logger instance
  */
-void ecat_master_close(plugin_logger_t *logger);
+void ecat_master_close(ecat_master_instance_t *inst, plugin_logger_t *logger);
 
 /**
  * @brief Exchange process data with all slaves
  *
  * Sends outputs to slaves and receives inputs.
  *
+ * @param inst       Per-master instance
  * @param timeout_us Receive timeout in microseconds (0 = use SOEM default)
  * @return Working counter value from receive, or -1 on error
  */
-int ecat_master_exchange_processdata(int timeout_us);
+int ecat_master_exchange_processdata(ecat_master_instance_t *inst, int timeout_us);
 
 /**
  * @brief Get the expected working counter for the bus
  *
  * Calculated as: outputsWKC * 2 + inputsWKC for group 0.
  *
+ * @param inst Per-master instance
  * @return Expected WKC value
  */
-int ecat_master_get_expected_wkc(void);
+int ecat_master_get_expected_wkc(ecat_master_instance_t *inst);
 
 /**
  * @brief Get a pointer to a live SOEM slave descriptor
  *
+ * @param inst     Per-master instance
  * @param position 1-based slave position on the bus
  * @return Pointer to ec_slavet, or NULL if position is invalid
  */
-const ec_slavet *ecat_master_get_slave(int position);
+const ec_slavet *ecat_master_get_slave(ecat_master_instance_t *inst, int position);
 
 /**
  * @brief Check if all slaves are in OPERATIONAL state
  *
+ * @param inst Per-master instance
  * @return 1 if operational, 0 otherwise
  */
-int ecat_master_is_operational(void);
+int ecat_master_is_operational(ecat_master_instance_t *inst);
 
 /**
  * @brief Get the AL state of a specific slave
  *
  * Reads the current state from the SOEM slavelist (cached from last bus read).
  *
+ * @param inst     Per-master instance
  * @param position 1-based slave position
  * @return EC_STATE_* value, or 0 if position is invalid
  */
-uint16_t ecat_master_get_slave_state(int position);
+uint16_t ecat_master_get_slave_state(ecat_master_instance_t *inst, int position);
 
 /**
  * @brief Request a state transition for a specific slave
  *
+ * @param inst     Per-master instance
  * @param position 1-based slave position
  * @param state    Target EC_STATE_* value
  * @param logger   Plugin logger instance
  * @return 0 on success, -1 on failure
  */
-int ecat_master_request_state(int position, uint16_t state, plugin_logger_t *logger);
+int ecat_master_request_state(ecat_master_instance_t *inst, int position, uint16_t state, plugin_logger_t *logger);
 
 /**
  * @brief Attempt to recover a slave that has left OPERATIONAL state
@@ -167,38 +176,44 @@ int ecat_master_request_state(int position, uint16_t state, plugin_logger_t *log
  *   - SAFE_OP: request OP directly
  *   - Lower states: ecx_reconfig_slave + ecx_recover_slave
  *
+ * @param inst     Per-master instance
  * @param position 1-based slave position
  * @param logger   Plugin logger instance
  * @return 1 if recovered to OP, 0 if still recovering, -1 on error
  */
-int ecat_master_recover_slave(int position, plugin_logger_t *logger);
+int ecat_master_recover_slave(ecat_master_instance_t *inst, int position, plugin_logger_t *logger);
 
 /**
  * @brief Read back all slave states from the bus
  *
  * Calls ecx_readstate() to refresh the cached slave states.
+ *
+ * @param inst Per-master instance
  */
-void ecat_master_read_states(void);
+void ecat_master_read_states(ecat_master_instance_t *inst);
 
 /**
  * @brief Get a pointer to the IOmap buffer base
  *
+ * @param inst Per-master instance
  * @return Pointer to the IOmap buffer, or NULL if not initialized
  */
-uint8_t *ecat_master_get_iomap(void);
+uint8_t *ecat_master_get_iomap(ecat_master_instance_t *inst);
 
 /**
  * @brief Get the total IOmap size (inputs + outputs)
  *
+ * @param inst Per-master instance
  * @return Total bytes used in the IOmap, or 0 if not initialized
  */
-size_t ecat_master_get_iomap_size(void);
+size_t ecat_master_get_iomap_size(ecat_master_instance_t *inst);
 
 /**
  * @brief Get the number of slaves discovered on the bus
  *
+ * @param inst Per-master instance
  * @return Slave count, or 0 if not initialized
  */
-int ecat_master_get_slave_count(void);
+int ecat_master_get_slave_count(ecat_master_instance_t *inst);
 
 #endif /* ETHERCAT_MASTER_H */
