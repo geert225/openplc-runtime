@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from enum import Enum, auto
 import os
+import time
 import zipfile
 import subprocess
 import threading
@@ -341,6 +342,37 @@ def run_compile(runtime_manager: RuntimeManager, cwd: str = "core/generated"):
     # Restart PLC only if everything succeeded
     if build_state.status == BuildStatus.SUCCESS:
         runtime_manager.reset_crash_tracking()
-        runtime_manager.start_plc()
+        _restart_plc_after_build(runtime_manager)
     else:
         build_state.log("[WARNING] PLC program has not been updated because the build failed\n")
+
+
+def _restart_plc_after_build(runtime_manager: RuntimeManager) -> None:
+    """Send START to the PLC after a successful build, retrying while the
+    runtime is still finishing the previous STOP transition.
+
+    The runtime's C side performs state transitions on a detached thread and
+    sets an ``is_transitioning`` flag during that window. STOP returns OK
+    immediately but the unload (plugin cleanup, pthread_join, etc.) can take
+    several hundred milliseconds to a few seconds depending on installed
+    plugins. If START arrives while the flag is still set, the runtime
+    replies ``COMMAND:BUSY`` and the PLC stays stopped. Poll STATUS and
+    retry START until it is accepted (or we exhaust the budget).
+    """
+    max_wait_seconds = 5.0
+    poll_interval = 0.1
+    deadline = time.monotonic() + max_wait_seconds
+
+    while time.monotonic() < deadline:
+        response = runtime_manager.start_plc() or ""
+        if "START:OK" in response or "ALREADY_RUNNING" in response:
+            return
+        if "BUSY" not in response and "ERROR" not in response:
+            # Unknown/empty response — treat as transient and retry
+            pass
+        time.sleep(poll_interval)
+
+    build_state.log(
+        "[WARNING] PLC did not restart within %.1fs after upload; "
+        "send START manually if it stays stopped.\n" % max_wait_seconds
+    )
