@@ -177,6 +177,10 @@ void handle_unix_socket_commands(const char *command, char *response, size_t res
     else if (strcmp(command, "STATS") == 0)
     {
         format_timing_stats_response(response, response_size);
+        // Splice in any plugin-contributed statistics. Safe no-op when no
+        // plugin exports get_stats.
+        if (g_plugin_driver)
+            plugin_driver_append_stats_json(g_plugin_driver, response, response_size);
     }
     else if (strncmp(command, "DEBUG:", 6) == 0)
     {

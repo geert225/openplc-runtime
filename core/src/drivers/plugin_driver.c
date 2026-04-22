@@ -1013,6 +1013,10 @@ int native_plugin_get_symbols(plugin_instance_t *plugin)
                  plugin->config.path);
     }
 
+    native_bundle->get_stats = (plugin_get_stats_func_t)dlsym(handle, "get_stats");
+    // get_stats is fully optional — plugins that don't publish statistics
+    // simply don't export it. No warning.
+
     // Store the native bundle and handle in the plugin instance
     plugin->native_plugin = native_bundle;
 
@@ -1024,6 +1028,7 @@ int native_plugin_get_symbols(plugin_instance_t *plugin)
     log_info("  - cycle_end: %s", native_bundle->cycle_end ? "(PASS)" : "(FAIL)");
     log_info("  - cleanup: %s", native_bundle->cleanup ? "(PASS)" : "(FAIL)");
     log_info("  - execute_command: %s", native_bundle->execute_command ? "(PASS)" : "(FAIL)");
+    log_info("  - get_stats: %s", native_bundle->get_stats ? "(PASS)" : "(FAIL)");
 
     return 0;
 }
@@ -1123,6 +1128,141 @@ int plugin_driver_execute_command(plugin_driver_t *driver, const char *plugin_na
 
     snprintf(response, response_size, "{\"error\":\"plugin '%s' not found\"}", plugin_name);
     return -1;
+}
+
+// ===================================================================
+// Plugin-contributed statistics aggregation
+// ===================================================================
+//
+// Called from the STATS response path. Takes an already-formatted JSON
+// response ending in "}\n" (or "}"), asks each native plugin that
+// exports get_stats to produce a JSON object snippet, and splices them
+// into a "plugin_stats" member before the closing brace.
+//
+// Per-plugin budget: PLUGIN_STATS_SLOT_BUDGET bytes.
+// Combined budget:  PLUGIN_STATS_TOTAL_BUDGET bytes.
+// Output is best-effort: malformed plugin output (doesn't start with
+// '{' and end with '}') is silently dropped, overflow truncates, and
+// the core STATS response is always preserved.
+#define PLUGIN_STATS_SLOT_BUDGET   1024
+#define PLUGIN_STATS_TOTAL_BUDGET  8192
+
+size_t plugin_driver_append_stats_json(plugin_driver_t *driver, char *buffer,
+                                       size_t buffer_size)
+{
+    if (!buffer || buffer_size == 0)
+        return 0;
+
+    size_t len = strlen(buffer);
+
+    // Detect and strip a trailing newline — we'll re-add it after splicing.
+    int had_newline = 0;
+    if (len > 0 && buffer[len - 1] == '\n')
+    {
+        had_newline = 1;
+        buffer[--len] = '\0';
+    }
+
+    // Expect the core STATS payload to end in '}'. If it doesn't, the
+    // response is malformed and we won't risk making it worse.
+    if (len == 0 || buffer[len - 1] != '}')
+    {
+        if (had_newline && len + 1 < buffer_size)
+        {
+            buffer[len] = '\n';
+            buffer[len + 1] = '\0';
+            len++;
+        }
+        return len;
+    }
+
+    if (!driver || driver->plugin_count == 0)
+    {
+        if (had_newline && len + 1 < buffer_size)
+        {
+            buffer[len] = '\n';
+            buffer[len + 1] = '\0';
+            len++;
+        }
+        return len;
+    }
+
+    // Build the ,"plugin_stats":{...} section in a scratch buffer so we
+    // can commit-or-rollback atomically if it would overflow the response.
+    char scratch[PLUGIN_STATS_TOTAL_BUDGET];
+    size_t spos = 0;
+    int emitted = 0;
+
+    for (int i = 0; i < driver->plugin_count; i++)
+    {
+        plugin_instance_t *p = &driver->plugins[i];
+        if (p->config.type != PLUGIN_TYPE_NATIVE)
+            continue;
+        if (!p->native_plugin || !p->native_plugin->get_stats)
+            continue;
+
+        char slot[PLUGIN_STATS_SLOT_BUDGET];
+        slot[0] = '\0';
+        if (p->native_plugin->get_stats(slot, sizeof(slot)) != 0)
+            continue;
+
+        size_t slen = strnlen(slot, sizeof(slot));
+        if (slen < 2 || slot[0] != '{' || slot[slen - 1] != '}')
+            continue; // malformed — drop silently
+
+        int n = snprintf(scratch + spos, sizeof(scratch) - spos, "%s\"%s\":%s",
+                         emitted ? "," : "", p->config.name, slot);
+        if (n < 0 || (size_t)n >= sizeof(scratch) - spos)
+            break; // scratch full; commit what we have
+
+        spos += (size_t)n;
+        emitted = 1;
+    }
+
+    if (!emitted)
+    {
+        if (had_newline && len + 1 < buffer_size)
+        {
+            buffer[len] = '\n';
+            buffer[len + 1] = '\0';
+            len++;
+        }
+        return len;
+    }
+
+    // Splice: overwrite the closing '}' with ,"plugin_stats":{...}} and
+    // re-append the newline if present.
+    size_t insert_pos = len - 1;
+    int n = snprintf(buffer + insert_pos, buffer_size - insert_pos,
+                     ",\"plugin_stats\":{%s}}%s", scratch, had_newline ? "\n" : "");
+    if (n < 0)
+    {
+        // snprintf failure — restore newline and bail.
+        if (had_newline && len + 1 < buffer_size)
+        {
+            buffer[len] = '\n';
+            buffer[len + 1] = '\0';
+            len++;
+        }
+        return len;
+    }
+    if ((size_t)n >= buffer_size - insert_pos)
+    {
+        // Would overflow the response buffer; roll back by restoring the '}'
+        // and the newline.
+        buffer[insert_pos] = '}';
+        buffer[insert_pos + 1] = '\0';
+        len = insert_pos + 1;
+        if (had_newline && len + 1 < buffer_size)
+        {
+            buffer[len] = '\n';
+            buffer[len + 1] = '\0';
+            len++;
+        }
+        return len;
+    }
+
+    return insert_pos + (size_t)n;
 }
 
 // Cleanup Python plugin
