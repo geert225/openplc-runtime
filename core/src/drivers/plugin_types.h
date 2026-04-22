@@ -52,6 +52,21 @@ typedef int (*plugin_journal_write_dint_func_t)(int type, int index, unsigned in
 typedef int (*plugin_journal_write_lint_func_t)(int type, int index, unsigned long long value);
 
 /**
+ * @brief PLC stop request from a plugin
+ *
+ * Asks the runtime to transition from RUNNING to STOPPED through the normal
+ * shutdown path (stop all plugins cleanly, unload program, clear image
+ * tables). Used by plugins that detect unrecoverable hardware faults — e.g.
+ * a fieldbus plugin losing communication with its backplane — so the PLC
+ * scan thread stops consuming stale inputs.
+ *
+ * The call is non-blocking: the runtime spawns a worker thread for the
+ * transition and returns immediately. `reason` is logged at error level.
+ * Safe to call from any plugin thread.
+ */
+typedef void (*plugin_request_plc_stop_func_t)(const char *reason);
+
+/**
  * @brief Runtime buffer access structure for plugins
  *
  * This structure is passed to plugins during initialization, providing
@@ -112,6 +127,9 @@ typedef struct
     plugin_journal_write_int_func_t journal_write_int;
     plugin_journal_write_dint_func_t journal_write_dint;
     plugin_journal_write_lint_func_t journal_write_lint;
+
+    /* Async request to stop the whole PLC — see plugin_request_plc_stop_func_t. */
+    plugin_request_plc_stop_func_t request_plc_stop;
 } plugin_runtime_args_t;
 
 #endif /* PLUGIN_TYPES_H */

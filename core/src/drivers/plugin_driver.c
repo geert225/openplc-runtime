@@ -15,6 +15,8 @@
 
 #include "../plc_app/image_tables.h"
 #include "../plc_app/journal_buffer.h"
+#include "../plc_app/plc_state_manager.h"
+#include "../plc_app/unix_socket.h"
 #include "../plc_app/utils/log.h"
 #include "../plc_app/utils/utils.h"
 #include "plugin_config.h"
@@ -106,6 +108,28 @@ static int plugin_journal_write_dint(int type, int index, unsigned int value)
 static int plugin_journal_write_lint(int type, int index, unsigned long long value)
 {
     return journal_write_lint((journal_buffer_type_t)type, (uint16_t)index, (uint64_t)value);
+}
+
+// Plugin-invoked async PLC stop. Logs the reason at error level and kicks
+// off a detached state-transition worker via the same path the unix-socket
+// STOP command uses — the transition flag blocks overlapping commands, and
+// all plugins get their stop_loop / cleanup hooks called in the normal
+// order. Non-blocking by design: the caller's I/O thread returns
+// immediately, then continues running for the brief window until the
+// plugin's own stop_loop is invoked. Plugins that enter fault-stopped state
+// are expected to short-circuit their I/O during that window.
+static void plugin_request_plc_stop(const char *reason)
+{
+    log_error("[PLUGIN] stop requested: %s", reason ? reason : "(no reason given)");
+    if (plc_get_state() != PLC_STATE_RUNNING)
+    {
+        log_warn("[PLUGIN] stop request ignored — PLC is not running");
+        return;
+    }
+    if (!plc_begin_transition(PLC_STATE_STOPPED))
+    {
+        log_error("[PLUGIN] failed to start stop transition");
+    }
 }
 
 // Python capsule destructor for runtime args
@@ -701,6 +725,9 @@ void *generate_structured_args_with_driver(plugin_type_t type, plugin_driver_t *
     args->journal_write_int  = plugin_journal_write_int;
     args->journal_write_dint = plugin_journal_write_dint;
     args->journal_write_lint = plugin_journal_write_lint;
+
+    // Plugin-initiated async PLC stop (for unrecoverable hardware faults).
+    args->request_plc_stop = plugin_request_plc_stop;
 
     // printf("[PLUGIN]: Runtime args initialized:\n");
     // printf("[PLUGIN]:   buffer_size = %d\n", args->buffer_size);
