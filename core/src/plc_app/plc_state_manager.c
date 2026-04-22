@@ -20,7 +20,6 @@ struct timespec timer_start;
 pthread_t plc_thread;
 PluginManager *plc_program = NULL;
 
-extern plc_timing_stats_t plc_timing_stats;
 extern atomic_long plc_heartbeat;
 extern plugin_driver_t *plugin_driver;
 
@@ -141,7 +140,9 @@ void *plc_cycle_thread(void *arg)
     pthread_mutex_unlock(&state_mutex);
     log_info("PLC State: RUNNING");
 
-    plc_timing_stats.scan_count = 0;
+    // Wipe all stats — min/max/avg/count/overruns — so this run doesn't
+    // inherit metrics from the previous program.
+    scan_cycle_stats_reset();
 
     // Get the start time for the running program
     clock_gettime(CLOCK_MONOTONIC, &timer_start);
@@ -339,6 +340,11 @@ int unload_plc_program(PluginManager *pm)
         // Destroy the plugin manager
         plugin_manager_destroy(pm);
         plc_program = NULL;
+
+        // Wipe timing stats so clients querying during the stopped
+        // window (or before the next program starts) see zeros rather
+        // than stale numbers from the previous run.
+        scan_cycle_stats_reset();
 
         log_info("PLC program unloaded successfully");
 

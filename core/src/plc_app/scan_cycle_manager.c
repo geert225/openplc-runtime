@@ -137,6 +137,27 @@ void scan_cycle_manager_cleanup(void)
     pthread_mutex_destroy(&stats_mutex);
 }
 
+void scan_cycle_stats_reset(void)
+{
+    pthread_mutex_lock(&stats_mutex);
+    plc_timing_stats = (plc_timing_stats_t){
+        .scan_time_min     = INT64_MAX,
+        .scan_time_max     = 0,
+        .scan_time_avg     = 0,
+        .cycle_time_min    = INT64_MAX,
+        .cycle_time_max    = 0,
+        .cycle_time_avg    = 0,
+        .cycle_latency_min = INT64_MAX,
+        .cycle_latency_max = 0,
+        .cycle_latency_avg = 0,
+        .scan_count        = 0,
+        .overruns          = 0,
+    };
+    expected_start_us = 0;
+    last_start_us     = 0;
+    pthread_mutex_unlock(&stats_mutex);
+}
+
 int format_timing_stats_response(char *buffer, size_t buffer_size)
 {
     plc_timing_stats_t snapshot;

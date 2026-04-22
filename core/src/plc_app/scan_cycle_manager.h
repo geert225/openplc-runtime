@@ -40,4 +40,9 @@ int scan_cycle_manager_init(void);
 // Cleanup scan cycle manager resources
 void scan_cycle_manager_cleanup(void);
 
+// Reset all timing stats to their initial state (mins to INT64_MAX,
+// everything else to 0). Call on PLC start so a new run doesn't inherit
+// averages/min/max from the previous run.
+void scan_cycle_stats_reset(void);
+
 #endif // SCAN_CYCLE_MANAGER_H
