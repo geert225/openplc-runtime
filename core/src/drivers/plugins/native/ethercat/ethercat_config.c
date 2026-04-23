@@ -248,6 +248,8 @@ static void parse_master_section(const cJSON *master, ecat_master_config_t *conf
     config->receive_timeout_us = get_int(master, "receive_timeout_us", 2000);
     config->watchdog_timeout_cycles = get_int(master, "watchdog_timeout_cycles", 3);
     safe_strcpy(config->log_level, get_string(master, "log_level", "info"), sizeof(config->log_level));
+    safe_strcpy(config->task_name, get_string(master, "task_name", ""), sizeof(config->task_name));
+    config->task_cycle_time_us = get_int(master, "task_cycle_time_us", 0);
 }
 
 /**
@@ -554,6 +556,8 @@ void ecat_config_init_defaults(ecat_config_t *config)
     config->master.receive_timeout_us = 2000;
     config->master.watchdog_timeout_cycles = 3;
     safe_strcpy(config->master.log_level, "info", sizeof(config->master.log_level));
+    config->master.task_name[0] = '\0';
+    config->master.task_cycle_time_us = 0;
 
     /* Diagnostics defaults */
     config->diagnostics.log_connections = true;
@@ -620,6 +624,100 @@ int ecat_config_parse(const char *config_path, ecat_config_t *config)
 
     /* Validate the parsed configuration */
     return ecat_config_validate(config);
+}
+
+int ecat_config_parse_all(const char *config_path,
+                          ecat_master_instance_t *instances,
+                          int max_masters,
+                          int *out_count)
+{
+    if (config_path == NULL || instances == NULL || out_count == NULL || max_masters < 1) {
+        return ECAT_CONFIG_ERR_INVALID;
+    }
+
+    *out_count = 0;
+
+    /* Read file contents */
+    char *json_str = read_file(config_path);
+    if (json_str == NULL) {
+        return ECAT_CONFIG_ERR_FILE;
+    }
+
+    /* Parse JSON */
+    cJSON *root = cJSON_Parse(json_str);
+    free(json_str);
+
+    if (root == NULL) {
+        return ECAT_CONFIG_ERR_PARSE;
+    }
+
+    if (!cJSON_IsArray(root)) {
+        /* Fall back to single-entry parse for bare config objects */
+        ecat_config_init_defaults(&instances[0].config);
+        const cJSON *config_obj = cJSON_GetObjectItemCaseSensitive(root, "config");
+        if (config_obj == NULL) {
+            config_obj = root;
+        }
+        const char *name = get_string(root, "name", "master");
+        safe_strcpy(instances[0].name, name, sizeof(instances[0].name));
+        parse_master_section(cJSON_GetObjectItemCaseSensitive(config_obj, "master"),
+                             &instances[0].config.master);
+        parse_slaves_section(cJSON_GetObjectItemCaseSensitive(config_obj, "slaves"),
+                             &instances[0].config);
+        parse_diagnostics_section(cJSON_GetObjectItemCaseSensitive(config_obj, "diagnostics"),
+                                  &instances[0].config.diagnostics);
+        cJSON_Delete(root);
+        int result = ecat_config_validate(&instances[0].config);
+        if (result == ECAT_CONFIG_OK) {
+            *out_count = 1;
+        }
+        return result;
+    }
+
+    /* Iterate all entries in the array */
+    int count = 0;
+    int array_size = cJSON_GetArraySize(root);
+
+    for (int i = 0; i < array_size && count < max_masters; i++) {
+        const cJSON *entry = cJSON_GetArrayItem(root, i);
+        if (entry == NULL) continue;
+
+        /* Check protocol is ETHERCAT (case-insensitive) */
+        const char *protocol = get_string(entry, "protocol", "");
+        if (strcasecmp_local(protocol, "ETHERCAT") != 0) continue;
+
+        const cJSON *config_obj = cJSON_GetObjectItemCaseSensitive(entry, "config");
+        if (config_obj == NULL) continue;
+
+        /* Initialize this instance's config with defaults */
+        ecat_config_init_defaults(&instances[count].config);
+
+        /* Extract master name */
+        const char *name = get_string(entry, "name", "master");
+        safe_strcpy(instances[count].name, name, sizeof(instances[count].name));
+
+        /* Parse configuration sections */
+        parse_master_section(cJSON_GetObjectItemCaseSensitive(config_obj, "master"),
+                             &instances[count].config.master);
+        parse_slaves_section(cJSON_GetObjectItemCaseSensitive(config_obj, "slaves"),
+                             &instances[count].config);
+        parse_diagnostics_section(cJSON_GetObjectItemCaseSensitive(config_obj, "diagnostics"),
+                                  &instances[count].config.diagnostics);
+
+        /* Validate this master's config */
+        int result = ecat_config_validate(&instances[count].config);
+        if (result == ECAT_CONFIG_OK) {
+            count++;
+        } else {
+            fprintf(stderr, "ETHERCAT CONFIG: skipping entry[%d] '%s' "
+                    "(validation failed, error=%d)\n", i, name, result);
+        }
+    }
+
+    cJSON_Delete(root);
+    *out_count = count;
+
+    return (count > 0) ? ECAT_CONFIG_OK : ECAT_CONFIG_ERR_MISSING;
 }
 
 int ecat_config_validate(const ecat_config_t *config)

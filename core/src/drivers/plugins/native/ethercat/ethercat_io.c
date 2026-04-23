@@ -273,13 +273,14 @@ static const char *iec_size_name(iec_size_t sz)
 
 int ecat_io_build_channel_map(const ecat_config_t *config,
                               ecat_channel_map_t *map,
+                              ecat_master_instance_t *inst,
                               plugin_runtime_args_t *args,
                               plugin_logger_t *logger)
 {
     memset(map, 0, sizeof(*map));
 
     /* Get IOmap base for offset calculation */
-    uint8_t *iomap_base = ecat_master_get_iomap();
+    uint8_t *iomap_base = ecat_master_get_iomap(inst);
     if (!iomap_base) {
         plugin_logger_error(logger, "IOmap base pointer is NULL");
         return -1;
@@ -293,7 +294,7 @@ int ecat_io_build_channel_map(const ecat_config_t *config,
         int pos = cfg_slave->position;
 
         /* Get live SOEM slave descriptor */
-        const ec_slavet *soem_slave = ecat_master_get_slave(pos);
+        const ec_slavet *soem_slave = ecat_master_get_slave(inst, pos);
         if (!soem_slave) {
             plugin_logger_warn(logger,
                 "Slave '%s' position %d: not found in SOEM context, skipping channels",

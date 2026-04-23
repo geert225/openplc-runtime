@@ -12,9 +12,15 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdatomic.h>
+#include <pthread.h>
+
+#include "soem/soem.h"
 
 /* Maximum sizes */
+#define ECAT_MAX_MASTERS      4
 #define ECAT_MAX_SLAVES      64
+#define ECAT_IOMAP_SIZE    8192
 #define ECAT_MAX_CHANNELS    64
 #define ECAT_MAX_PDO_ENTRIES 32
 #define ECAT_MAX_PDOS        16
@@ -215,6 +221,8 @@ typedef struct {
     int              receive_timeout_us;
     int              watchdog_timeout_cycles;
     char             log_level[8];
+    char             task_name[ECAT_MAX_NAME_LEN];
+    int              task_cycle_time_us;
 } ecat_master_config_t;
 
 /**
@@ -370,6 +378,198 @@ typedef struct {
     int                 expected_wkc;
     uint64_t            exchange_skips;
 } ecat_master_status_t;
+
+/*
+ * =============================================================================
+ * Cycle Diagnostics
+ * =============================================================================
+ */
+
+/**
+ * @brief Per-cycle timing diagnostics
+ *
+ * Updated by cycle_start() in the PLC thread.
+ * Uses Welford's incremental algorithm for moving averages.
+ */
+typedef struct {
+    uint64_t cycle_count;         /* total cycles executed              */
+    uint64_t wkc_error_count;     /* total WKC errors (wkc < expected)  */
+    uint64_t noframe_count;       /* total EC_NOFRAME (-1) errors       */
+    uint64_t exchange_ns;         /* last send+receive duration (ns)    */
+    uint64_t io_read_ns;          /* last read_inputs duration (ns)     */
+    uint64_t io_write_ns;         /* last write_outputs duration (ns)   */
+    uint64_t total_ns;            /* last full cycle total (ns)         */
+    uint64_t max_exchange_ns;     /* worst-case send+receive            */
+    uint64_t max_total_ns;        /* worst-case total                   */
+    int64_t  avg_total_ns;        /* incremental moving average (Welford) */
+    int64_t  avg_exchange_ns;     /* incremental moving average (Welford) */
+    uint64_t min_exchange_ns;     /* best-case send+receive             */
+    uint64_t min_total_ns;        /* best-case total                    */
+} ecat_cycle_diag_t;
+
+/*
+ * =============================================================================
+ * I/O Channel Map and Transfer List Types
+ * =============================================================================
+ *
+ * These types are defined here (rather than in ethercat_io.h) so that
+ * ecat_master_instance_t can embed them directly, avoiding a circular
+ * include between ethercat_config.h and ethercat_io.h.
+ */
+
+/* Maximum entries in a single direction of the channel map */
+#define ECAT_MAX_MAP_ENTRIES 256
+
+/**
+ * @brief IEC 61131-3 data size qualifiers
+ */
+typedef enum {
+    IEC_SIZE_BIT,    /* X -- single bit   */
+    IEC_SIZE_BYTE,   /* B -- 1 byte       */
+    IEC_SIZE_WORD,   /* W -- 2 bytes      */
+    IEC_SIZE_DWORD,  /* D -- 4 bytes      */
+    IEC_SIZE_LWORD   /* L -- 8 bytes      */
+} iec_size_t;
+
+/**
+ * @brief IEC 61131-3 direction qualifiers
+ */
+typedef enum {
+    IEC_DIR_INPUT,   /* I -- physical input  */
+    IEC_DIR_OUTPUT   /* Q -- physical output */
+} iec_dir_t;
+
+/**
+ * @brief Parsed IEC location -- result of parsing a string like "%IX0.3"
+ */
+typedef struct {
+    iec_dir_t  direction;   /* I or Q            */
+    iec_size_t size;        /* X, B, W, D, L     */
+    int        byte_index;  /* byte address       */
+    int        bit_index;   /* bit within byte (X only, 0-7; -1 otherwise) */
+} iec_location_t;
+
+/**
+ * @brief Single entry in the channel map
+ */
+typedef struct {
+    /* IOmap side */
+    size_t   iomap_offset;     /* byte offset from IOmap base            */
+    int      iomap_bit_offset; /* bit offset within the byte (0-7)       */
+    uint8_t  bit_length;       /* channel width in bits                  */
+
+    /* PLC side */
+    iec_size_t      size;      /* IEC size qualifier                     */
+    int             byte_index;/* byte index into PLC buffer             */
+    int             bit_index; /* bit index (IEC_SIZE_BIT only, else -1) */
+    ecat_data_type_t data_type;/* CoE data type from the PDO entry       */
+} ecat_channel_map_entry_t;
+
+/**
+ * @brief Complete channel map -- separate arrays for inputs and outputs
+ */
+typedef struct {
+    ecat_channel_map_entry_t inputs[ECAT_MAX_MAP_ENTRIES];
+    int                      input_count;
+    ecat_channel_map_entry_t outputs[ECAT_MAX_MAP_ENTRIES];
+    int                      output_count;
+} ecat_channel_map_t;
+
+/**
+ * @brief Single pre-resolved transfer entry
+ */
+typedef struct {
+    void    *plc_ptr;           /* direct pointer to the PLC variable        */
+    size_t   iomap_offset;      /* byte offset from IOmap base               */
+    int      iomap_bit_offset;  /* bit offset within the byte (0-7)          */
+    uint8_t  byte_count;        /* bytes to copy (1, 2, 4, or 8)            */
+    bool     is_bit;            /* true for IEC_SIZE_BIT channels            */
+} ecat_transfer_entry_t;
+
+/**
+ * @brief Complete transfer list -- separate arrays for inputs and outputs
+ */
+typedef struct {
+    ecat_transfer_entry_t inputs[ECAT_MAX_MAP_ENTRIES];
+    int                   input_count;
+    ecat_transfer_entry_t outputs[ECAT_MAX_MAP_ENTRIES];
+    int                   output_count;
+} ecat_transfer_list_t;
+
+/*
+ * =============================================================================
+ * Multi-Master Instance Structures
+ * =============================================================================
+ */
+
+/**
+ * @brief Per-master instance state
+ *
+ * Encapsulates ALL state for a single EtherCAT master, enabling
+ * multiple independent masters on different network interfaces.
+ * Must be heap-allocated (too large for stack: ~7MB per instance
+ * due to the inline ecat_config_t slave array).
+ */
+typedef struct {
+    /* Identity */
+    char name[ECAT_MAX_NAME_LEN];       /* master name from JSON config */
+
+    /* Configuration (parsed from JSON) */
+    ecat_config_t config;
+
+    /* SOEM context and IOmap — per-instance, NOT shared */
+    ecx_contextt ecx_context;
+    uint8_t iomap[ECAT_IOMAP_SIZE];
+    int soem_initialized;
+    size_t iomap_used_size;
+
+    /* I/O channel map and transfer list (populated by start_loop) */
+    ecat_channel_map_t channel_map;
+    ecat_transfer_list_t transfer_list;
+
+    /* State machine */
+    _Atomic(int) plugin_state;          /* ecat_plugin_state_t */
+    int expected_wkc;
+    int receive_timeout_us;
+
+    /* Diagnostics (updated by cycle_start in PLC thread) */
+    ecat_cycle_diag_t diag;
+    _Atomic(int) consecutive_wkc_errors;
+    _Atomic(int) recovery_attempts;
+    uint64_t cycle_counter;
+    unsigned int tick_divisor;
+
+    /* Status snapshot for queries via execute_command */
+    ecat_master_status_t status_snapshot;
+    pthread_mutex_t status_mutex;
+
+#if ECAT_ENABLE_MONITOR_THREAD
+    /* Monitor thread — per-instance for cooperative SOEM access */
+    pthread_t monitor_thread;
+    _Atomic(bool) monitor_running;
+    _Atomic(bool) soem_pause_requested;
+    _Atomic(bool) soem_paused;
+    _Atomic(uint64_t) exchange_skips;
+#endif
+} ecat_master_instance_t;
+
+/**
+ * @brief Parse all EtherCAT master configurations from a JSON file
+ *
+ * Iterates ALL entries in the JSON array (not just the first).
+ * Each entry with "protocol": "ETHERCAT" is parsed into a separate config.
+ * Also extracts the master name from each entry.
+ *
+ * @param config_path  Path to the JSON configuration file
+ * @param instances    Output array of master instances (only name + config are populated)
+ * @param max_masters  Maximum number of masters to parse
+ * @param out_count    Output: number of masters actually parsed
+ * @return ECAT_CONFIG_OK on success, negative error code on failure
+ */
+int ecat_config_parse_all(const char *config_path,
+                          ecat_master_instance_t *instances,
+                          int max_masters,
+                          int *out_count);
 
 /**
  * @brief Convert plugin state enum to human-readable string

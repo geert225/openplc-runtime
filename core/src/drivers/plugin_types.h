@@ -130,6 +130,9 @@ typedef struct
 
     /* Async request to stop the whole PLC — see plugin_request_plc_stop_func_t. */
     plugin_request_plc_stop_func_t request_plc_stop;
+
+    /* PLC base tick time in nanoseconds (GCD of all IEC task intervals) */
+    unsigned long long common_ticktime_ns;
 } plugin_runtime_args_t;
 
 #endif /* PLUGIN_TYPES_H */
