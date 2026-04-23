@@ -97,6 +97,16 @@ int main(int argc, char *argv[])
         return -1;
     }
 
+    // Initialize scan-cycle stats at process scope. The stats mutex
+    // must outlive every plc_cycle_thread because scan_cycle_stats_reset()
+    // can run on the state-manager thread after the cycle thread has
+    // already exited (e.g. during unload_plc_program).
+    if (scan_cycle_manager_init() != 0)
+    {
+        log_error("Failed to initialize scan cycle manager");
+        return -1;
+    }
+
     // Initialize plugin driver system BEFORE loading the PLC program.
     // plc_set_state(RUNNING) triggers load_plc_program() which uses the plugin
     // driver to update config and re-init plugins, and plc_cycle_thread() calls
@@ -154,6 +164,7 @@ int main(int argc, char *argv[])
 
     // Cleanup
     log_info("Shutting down...");
+    scan_cycle_manager_cleanup();
     plc_state_manager_cleanup();
     return 0;
 }

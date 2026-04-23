@@ -66,12 +66,6 @@ void *plc_cycle_thread(void *arg)
     plc_thread_id = pthread_self();
     plc_crash_signal = 0;
 
-    // Initialize scan cycle manager (priority-inheriting stats mutex)
-    if (scan_cycle_manager_init() != 0)
-    {
-        log_error("Failed to initialize scan cycle manager");
-    }
-
     // Initialize PLC with real-time optimizations
     set_realtime_priority();
     lock_memory();
@@ -218,8 +212,6 @@ void *plc_cycle_thread(void *arg)
     // Restore default signal handlers when exiting normally
     signal(SIGFPE, SIG_DFL);
     signal(SIGSEGV, SIG_DFL);
-
-    scan_cycle_manager_cleanup();
 
     return NULL;
 }
