@@ -7,9 +7,8 @@ and returns responses through the WebSocket connection.
 """
 
 from flask import request
-from flask_jwt_extended import decode_token
+from flask_jwt_extended import verify_jwt_in_request
 from flask_socketio import SocketIO, emit
-from jwt.exceptions import ExpiredSignatureError, InvalidTokenError
 
 from webserver.logger import get_logger
 
@@ -78,18 +77,18 @@ def init_debug_websocket(app, unix_client_instance):
                 logger.warning("Debug WebSocket connection attempt without token")
                 return False
 
-            try:
-                decoded = decode_token(token)
-                logger.info("Debug WebSocket connected for user %s", decoded.get("sub"))
-                emit("connected", {"status": "ok"})
-                return True
+            # Inject token into the request so verify_jwt_in_request() uses
+            # the same authentication pipeline as @jwt_required() -- including
+            # blacklist checks and user identity validation.
+            request.environ["HTTP_AUTHORIZATION"] = f"Bearer {token}"
+            verify_jwt_in_request()
 
-            except (ExpiredSignatureError, InvalidTokenError) as e:
-                logger.warning("Debug WebSocket auth failed: %s", e)
-                return False
+            logger.info("Debug WebSocket connected")
+            emit("connected", {"status": "ok"})
+            return True
 
         except Exception as e:
-            logger.error("Error during debug WebSocket connection: %s", e)
+            logger.warning("Debug WebSocket auth failed: %s", e)
             return False
 
     @_socketio.on("disconnect", namespace="/api/debug")
@@ -143,9 +142,7 @@ def init_debug_websocket(app, unix_client_instance):
                 emit("debug_response", {"success": True, "data": response_hex})
             elif response.startswith("DEBUG:ERROR"):
                 error_msg = (
-                    response.split(":", 2)[2]
-                    if len(response.split(":")) > 2
-                    else "Unknown error"
+                    response.split(":", 2)[2] if len(response.split(":")) > 2 else "Unknown error"
                 )
                 logger.warning("Debug error from runtime: %s", error_msg)
                 emit("debug_response", {"success": False, "error": error_msg})

@@ -62,7 +62,6 @@ class User(db.Model):  # type: ignore[name-defined]
     id: int = db.Column(db.Integer, primary_key=True)
     username: str = db.Column(db.Text, nullable=False, unique=True)
     password_hash: str = db.Column(db.Text, nullable=False)
-    role: str = db.Column(db.String(20), default="user")
 
     # Use PBKDF2 with SHA256 and 600,000 iterations for password hashing
     derivation_method: str = "pbkdf2:sha256:600000"
@@ -77,7 +76,7 @@ class User(db.Model):  # type: ignore[name-defined]
         return check_password_hash(self.password_hash, password)
 
     def to_dict(self):
-        return {"id": self.id, "username": self.username, "role": self.role}
+        return {"id": self.id, "username": self.username}
 
 
 @jwt.user_identity_loader
@@ -126,10 +125,6 @@ def create_user():
             password:
               type: string
               example: openplc
-            role:
-              type: string
-              enum: [admin, user]
-              default: user
     responses:
       201:
         description: User created successfully
@@ -163,7 +158,6 @@ def create_user():
     data = request.get_json()
     username = data.get("username")
     password = data.get("password")
-    role = data.get("role", "user")
 
     if not username or not password:
         return jsonify({"msg": "Missing username or password"}), 400
@@ -172,7 +166,7 @@ def create_user():
         return jsonify({"msg": "Username already exists"}), 409
 
     # Create a new user
-    user = User(username=username, role=role)
+    user = User(username=username)
     user.set_password(password)
     db.session.add(user)
     db.session.commit()
@@ -207,9 +201,6 @@ def get_user_info(user_id):
               type: integer
               example: 1
             username:
-              type: string
-              example: admin
-            role:
               type: string
               example: admin
       404:
@@ -249,8 +240,6 @@ def get_users_info():
               id:
                 type: integer
               username:
-                type: string
-              role:
                 type: string
       404:
         description: No users found
