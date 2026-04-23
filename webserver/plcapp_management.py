@@ -344,6 +344,18 @@ def run_compile(runtime_manager: RuntimeManager, cwd: str = "core/generated"):
     # confirmed a clean build, which gives it control over retries when the
     # previous STOP transition is still finishing (COMMAND:BUSY window).
     if build_state.status == BuildStatus.SUCCESS:
+        # Re-run plugin configuration now that compile.sh has produced any
+        # VPP plugin .so files. The pre-compile call at upload time can only
+        # register pre-built plugins; VPP plugins are compiled on-target
+        # during run_compile, so their entries in plugins.conf have to be
+        # written after the compile step succeeds.
+        #
+        # Hold status back in COMPILING while we finalize plugins.conf so
+        # the editor doesn't poll SUCCESS and send START before the VPP
+        # plugin entry is written.
+        build_state.status = BuildStatus.COMPILING
+        update_plugin_configurations(cwd)
+        build_state.status = BuildStatus.SUCCESS
         runtime_manager.reset_crash_tracking()
     else:
         build_state.log("[WARNING] PLC program has not been updated because the build failed\n")
