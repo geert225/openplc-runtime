@@ -73,9 +73,9 @@ void *plc_cycle_thread(void *arg)
         log_error("Failed to initialize scan cycle manager");
     }
 
-    // Initialize PLC with real-time optimizations
-    set_realtime_priority();
+    // mlockall is process-wide; safe to call before plugin init.
     lock_memory();
+
     symbols_init(pm);
     ext_config_init__();
     ext_glueVars();
@@ -119,6 +119,11 @@ void *plc_cycle_thread(void *arg)
         plugin_driver_start(plugin_driver);
         log_info("[PLUGIN]: Enabled plugins started");
     }
+
+    // Elevate AFTER plugins start: pthread default is PTHREAD_INHERIT_SCHED,
+    // so any thread spawned during plugin_driver_start would otherwise
+    // inherit FIFO and contend with the scan on its core.
+    set_realtime_priority();
 
     // Install signal handlers for crash recovery BEFORE entering the main loop.
     // This allows SIGFPE (e.g. division by zero) and SIGSEGV (e.g. bad array

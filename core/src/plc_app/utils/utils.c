@@ -15,6 +15,7 @@
 #if !defined(__CYGWIN__) && !defined(__MSYS__)
 #include <sched.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #define HAS_REALTIME_FEATURES 1
 #else
 #define HAS_REALTIME_FEATURES 0
@@ -72,12 +73,13 @@ void timespec_diff(struct timespec *a, struct timespec *b, struct timespec *resu
     }
 }
 
-// configure SCHED_FIFO priority and pin to the highest-numbered CPU core
+// CPU affinity is left to deployment (taskset, cgroup cpuset, systemd
+// CPUAffinity=) so the runtime stays hardware-agnostic.
 void set_realtime_priority(void)
 {
 #if HAS_REALTIME_FEATURES
     struct sched_param param;
-    param.sched_priority = 20; // Priority between 1 and 99
+    param.sched_priority = 20;
 
     if (sched_setscheduler(0, SCHED_FIFO, &param) != 0)
     {
@@ -88,46 +90,15 @@ void set_realtime_priority(void)
         log_info("Scheduler set to SCHED_FIFO, priority %d", param.sched_priority);
     }
 
-    // Pin PLC thread to the highest-numbered CPU core.
-    // On a 4-core system (0-3) this selects core 3, which is the best
-    // candidate for isolation (isolcpus= boot parameter).
-    // If the core is not available (e.g. Docker --cpuset-cpus restricts
-    // the set), fall back to the last available core in the affinity mask.
-    int num_cpus = sysconf(_SC_NPROCESSORS_ONLN);
-    if (num_cpus > 1)
+    // Default timer slack (50us) directly becomes wake-up jitter on
+    // clock_nanosleep(TIMER_ABSTIME). PR_SET_TIMERSLACK is per-thread.
+    if (prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0) != 0)
     {
-        cpu_set_t available;
-        CPU_ZERO(&available);
-        if (sched_getaffinity(0, sizeof(available), &available) == 0)
-        {
-            // Find the highest available core
-            int target_cpu = -1;
-            for (int i = num_cpus - 1; i >= 0; i--)
-            {
-                if (CPU_ISSET(i, &available))
-                {
-                    target_cpu = i;
-                    break;
-                }
-            }
-
-            if (target_cpu >= 0)
-            {
-                cpu_set_t cpuset;
-                CPU_ZERO(&cpuset);
-                CPU_SET(target_cpu, &cpuset);
-                if (pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset) == 0)
-                {
-                    log_info("PLC thread pinned to CPU %d (of %d available)",
-                             target_cpu, num_cpus);
-                }
-                else
-                {
-                    log_warn("Failed to pin PLC thread to CPU %d: %s",
-                             target_cpu, strerror(errno));
-                }
-            }
-        }
+        log_warn("PR_SET_TIMERSLACK failed: %s", strerror(errno));
+    }
+    else
+    {
+        log_info("Timer slack reduced to 1ns for PLC thread");
     }
 #else
     // Real-time scheduling not available on MSYS2/Cygwin
