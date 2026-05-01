@@ -10,6 +10,10 @@
 
 #include "log.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 extern unsigned long long *ext_common_ticktime__;
 extern unsigned long tick__;
 extern char *ext_plc_program_md5;
@@ -83,5 +87,9 @@ void bytes_to_hex_string(const uint8_t *bytes, size_t len, char *out_str, size_t
  * @return 0 on success, -1 on failure
  */
 int init_rt_mutex(pthread_mutex_t *mutex);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // UTILS_H

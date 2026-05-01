@@ -19,7 +19,6 @@
 #include "../plc_app/utils/utils.h"
 #include "plugin_config.h"
 #include "plugin_driver.h"
-#include "plugin_utils.h"
 #include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -646,11 +645,11 @@ void *generate_structured_args_with_driver(plugin_type_t type, plugin_driver_t *
     args->bool_memory = bool_memory;
 
     // Initialize mutex functions
-    args->mutex_take    = plugin_mutex_take;
-    args->mutex_give    = plugin_mutex_give;
-    args->get_var_list  = get_var_list;
-    args->get_var_size  = get_var_size;
-    args->get_var_count = get_var_count;
+    args->mutex_take = plugin_mutex_take;
+    args->mutex_give = plugin_mutex_give;
+    // get_var_list / get_var_size / get_var_count fields removed in the
+    // STruC++ migration (Phase 5). Plugins consuming variables migrate
+    // to the hierarchical strucpp_debug_* surface — see Phase 9 docs.
     // Set buffer mutex from driver
     args->buffer_mutex = &driver->buffer_mutex;
 

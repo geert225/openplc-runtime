@@ -6,6 +6,10 @@
 #include "plugin_types.h"
 #include "python_plugin_bridge.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // Maximum number of plugins
 #define MAX_PLUGINS 16
 
@@ -86,5 +90,9 @@ int native_plugin_get_symbols(plugin_instance_t *plugin);
 void *generate_structured_args_with_driver(plugin_type_t type, plugin_driver_t *driver,
                                            int plugin_index);
 void free_structured_args(plugin_runtime_args_t *args);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // PLUGIN_DRIVER_H

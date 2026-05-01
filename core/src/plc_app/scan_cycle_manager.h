@@ -2,7 +2,12 @@
 #define SCAN_CYCLE_MANAGER_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 typedef struct
 {
@@ -39,5 +44,9 @@ int scan_cycle_manager_init(void);
 
 // Cleanup scan cycle manager resources
 void scan_cycle_manager_cleanup(void);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // SCAN_CYCLE_MANAGER_H

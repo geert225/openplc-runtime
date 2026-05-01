@@ -4,6 +4,10 @@
 #include "plcapp_manager.h"
 #include <stdbool.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef enum
 {
     PLC_STATE_INIT,
@@ -45,5 +49,9 @@ void plc_force_error_state(void);
  * @return The signal number (e.g. SIGFPE, SIGSEGV), or 0 if no crash occurred
  */
 int plc_get_crash_signal(void);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // PLC_STATE_MANAGER_H

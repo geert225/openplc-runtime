@@ -1,59 +1,68 @@
 #!/bin/bash
+#
+# compile.sh — build the user PLC program into core/build/new_libplc.so
+#
+# STruC++ migration (Phase 5+): the editor uploads:
+#   - core/generated/generated.cpp        (STruC++-emitted IEC body)
+#   - core/generated/generated.hpp
+#   - core/generated/generated_debug.cpp  (per-project pointer tables)
+#   - optionally: core/generated/c_blocks_code.cpp + c_blocks.h
+#
+# The runtime contributes:
+#   - core/strucpp_runtime/runtime_v4_entry.cpp  (static C-linkage shim)
+#   - core/strucpp_runtime/include/              (vendored strucpp headers)
+#
+# The MatIEC-era files (Config0.c, Res0.c, debug.c, glueVars.c) are
+# rejected with a clear error so stale uploads fail loudly instead of
+# silently building against the old pipeline.
+
 set -euo pipefail
 
-# Paths
-ROOT="core/generated"
-LIB_PATH="$ROOT/lib"
-SRC_PATH="$ROOT"
-BUILD_PATH="build"
+GENERATED_DIR="core/generated"
+RUNTIME_SHIM="core/strucpp_runtime/runtime_v4_entry.cpp"
+RUNTIME_INC="core/strucpp_runtime/include"
 PYTHON_INCLUDE_PATH="core/src/plc_app/include"
 PYTHON_LOADER_SRC="core/src/plc_app/python_loader.c"
+BUILD_DIR="build"
 
-FLAGS="-w -O3 -fPIC"
+mkdir -p "$BUILD_DIR"
 
 check_required_files() {
-    local missing_files=()
+    local missing=()
 
-    if [ ! -f "$SRC_PATH/Config0.c" ]; then
-        missing_files+=("$SRC_PATH/Config0.c")
-    fi
-    if [ ! -f "$SRC_PATH/Res0.c" ]; then
-        missing_files+=("$SRC_PATH/Res0.c")
-    fi
-    if [ ! -f "$SRC_PATH/debug.c" ]; then
-        missing_files+=("$SRC_PATH/debug.c")
-    fi
-    if [ ! -f "$SRC_PATH/glueVars.c" ]; then
-        missing_files+=("$SRC_PATH/glueVars.c")
-    fi
-    if [ ! -d "$LIB_PATH" ]; then
-        missing_files+=("$LIB_PATH (directory)")
+    if [ -f "$GENERATED_DIR/Config0.c" ] || [ -f "$GENERATED_DIR/glueVars.c" ]; then
+        echo "[ERROR] core/generated contains MatIEC files (Config0.c / glueVars.c)." >&2
+        echo "        This runtime no longer supports MatIEC programs."              >&2
+        echo "        Re-export the project from a STruC++-aware editor build."      >&2
+        exit 2
     fi
 
-    if [ ${#missing_files[@]} -ne 0 ]; then
+    [ -f "$GENERATED_DIR/generated.cpp" ]       || missing+=("$GENERATED_DIR/generated.cpp")
+    [ -f "$GENERATED_DIR/generated.hpp" ]       || missing+=("$GENERATED_DIR/generated.hpp")
+    [ -f "$GENERATED_DIR/generated_debug.cpp" ] || missing+=("$GENERATED_DIR/generated_debug.cpp")
+    [ -f "$RUNTIME_SHIM" ]                      || missing+=("$RUNTIME_SHIM")
+    [ -d "$RUNTIME_INC" ]                       || missing+=("$RUNTIME_INC (directory)")
+
+    if [ ${#missing[@]} -ne 0 ]; then
         echo "[ERROR] Missing required source files:" >&2
-        printf '  %s\n' "${missing_files[@]}" >&2
+        printf '  %s\n' "${missing[@]}"               >&2
         exit 1
     fi
 }
 
 check_required_files
 
-# Ensure build directory exists
-mkdir -p "$BUILD_PATH"
-if [ ! -d "$BUILD_PATH" ]; then
-    echo "[ERROR] Failed to create build directory: $BUILD_PATH" >&2
-    exit 1
-fi
+CXXFLAGS=(
+    -std=c++17 -O2 -fPIC -Wall -Wno-unknown-pragmas -Wno-deprecated-declarations
+    -I "$GENERATED_DIR" -I "$RUNTIME_INC"
+)
 
-# On Cygwin/MSYS2, TCP/UDP communication blocks are not supported (the PE
-# loader cannot resolve symbols from the host executable at dlopen time).
-# Provide no-op stubs so programs using these blocks still compile and run
-# — the blocks simply return -1 (failure) for every operation.
+# On Cygwin/MSYS2, TCP/UDP communication blocks aren't supported — fall back
+# to no-op stubs so blocks-using programs still compile.
 EXTRA_OBJS=""
 case "$(uname -s)" in
     CYGWIN*|MSYS*|MINGW*)
-        cat > "$BUILD_PATH/comm_stubs.c" << 'STUB'
+        cat > "$BUILD_DIR/comm_stubs.c" << 'STUB'
 #include <stdint.h>
 #include <stddef.h>
 int connect_to_tcp_server(uint8_t *a, uint16_t b, int c) { (void)a; (void)b; (void)c; return -1; }
@@ -61,27 +70,38 @@ int send_tcp_message(uint8_t *a, size_t b, int c) { (void)a; (void)b; (void)c; r
 int receive_tcp_message(uint8_t *a, size_t b, int c) { (void)a; (void)b; (void)c; return -1; }
 int close_tcp_connection(int a) { (void)a; return -1; }
 STUB
-        gcc $FLAGS -c "$BUILD_PATH/comm_stubs.c" -o "$BUILD_PATH/comm_stubs.o"
-        EXTRA_OBJS="$BUILD_PATH/comm_stubs.o"
+        gcc -O2 -fPIC -c "$BUILD_DIR/comm_stubs.c" -o "$BUILD_DIR/comm_stubs.o"
+        EXTRA_OBJS="$BUILD_DIR/comm_stubs.o"
         ;;
 esac
 
-# Compile objects into build/
-echo "[INFO] Compiling Config0.c..."
-gcc $FLAGS -I "$LIB_PATH" -I "$PYTHON_INCLUDE_PATH" -include iec_python.h -c "$SRC_PATH/Config0.c" -o "$BUILD_PATH/Config0.o"
-echo "[INFO] Compiling Res0.c..."
-gcc $FLAGS -I "$LIB_PATH" -I "$PYTHON_INCLUDE_PATH" -include iec_python.h -c "$SRC_PATH/Res0.c" -o "$BUILD_PATH/Res0.o"
-echo "[INFO] Compiling debug.c..."
-gcc $FLAGS -I "$LIB_PATH" -c "$SRC_PATH/debug.c" -o "$BUILD_PATH/debug.o"
-echo "[INFO] Compiling glueVars.c..."
-gcc $FLAGS -I "$LIB_PATH" -DOPENPLC_V4 -c "$SRC_PATH/glueVars.c" -o "$BUILD_PATH/glueVars.o"
-echo "[INFO] Compiling c_blocks_code.cpp..."
-g++ $FLAGS -I "$LIB_PATH" -c "$SRC_PATH/c_blocks_code.cpp" -o "$BUILD_PATH/c_blocks_code.o"
-echo "[INFO] Compiling python_loader.c..."
-gcc $FLAGS -I "core/src/plc_app" -c "$PYTHON_LOADER_SRC" -o "$BUILD_PATH/python_loader.o"
+echo "[INFO] Compiling generated.cpp..."
+g++ "${CXXFLAGS[@]}" -c "$GENERATED_DIR/generated.cpp"        -o "$BUILD_DIR/generated.o"
 
-# Link shared library into build/
-echo "[INFO] Linking shared library..."
-g++ $FLAGS -shared -o "$BUILD_PATH/new_libplc.so" "$BUILD_PATH/Config0.o" \
-    "$BUILD_PATH/Res0.o" "$BUILD_PATH/debug.o" "$BUILD_PATH/glueVars.o" \
-    "$BUILD_PATH/c_blocks_code.o" "$BUILD_PATH/python_loader.o" $EXTRA_OBJS -lpthread -lrt
+echo "[INFO] Compiling generated_debug.cpp..."
+g++ "${CXXFLAGS[@]}" -c "$GENERATED_DIR/generated_debug.cpp"  -o "$BUILD_DIR/generated_debug.o"
+
+echo "[INFO] Compiling runtime_v4_entry.cpp..."
+g++ "${CXXFLAGS[@]}" -c "$RUNTIME_SHIM"                       -o "$BUILD_DIR/runtime_v4_entry.o"
+
+if [ -f "$GENERATED_DIR/c_blocks_code.cpp" ]; then
+    echo "[INFO] Compiling c_blocks_code.cpp..."
+    g++ "${CXXFLAGS[@]}" -c "$GENERATED_DIR/c_blocks_code.cpp" -o "$BUILD_DIR/c_blocks_code.o"
+    EXTRA_OBJS="$EXTRA_OBJS $BUILD_DIR/c_blocks_code.o"
+fi
+
+if [ -f "$PYTHON_LOADER_SRC" ]; then
+    echo "[INFO] Compiling python_loader.c..."
+    gcc -O2 -fPIC -I "core/src/plc_app" -c "$PYTHON_LOADER_SRC" -o "$BUILD_DIR/python_loader.o"
+    EXTRA_OBJS="$EXTRA_OBJS $BUILD_DIR/python_loader.o"
+fi
+
+echo "[INFO] Linking new_libplc.so..."
+g++ -shared -fPIC -o "$BUILD_DIR/new_libplc.so" \
+    "$BUILD_DIR/generated.o" \
+    "$BUILD_DIR/generated_debug.o" \
+    "$BUILD_DIR/runtime_v4_entry.o" \
+    $EXTRA_OBJS \
+    -lpthread -lrt
+
+echo "[INFO] Build complete: $BUILD_DIR/new_libplc.so"

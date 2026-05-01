@@ -1,128 +1,126 @@
 #ifndef IMAGE_TABLES_H
 #define IMAGE_TABLES_H
 
+#include <pthread.h>
+#include <stdbool.h>
+#include <stdint.h>
+
 #include "../lib/iec_types.h"
 #include "plcapp_manager.h"
+
+#ifdef __cplusplus
+extern "C"
+{
+#endif
 
 #define BUFFER_SIZE 1024
 #define libplc_build_dir "./build"
 
-// Internal buffers for I/O and memory.
-// Booleans
-extern IEC_BOOL *bool_input[BUFFER_SIZE][8];
-extern IEC_BOOL *bool_output[BUFFER_SIZE][8];
+    /* -------------------------------------------------------------------------
+     * Image-table buffers (booleans, bytes, ints, dints, lints, memories).
+     *
+     * Populated at program-load time by image_tables_bind_located_vars(),
+     * which walks strucpp::locatedVars[] and points each slot at the
+     * matching IECVar's underlying primitive storage. Plugins read/write
+     * these directly under the image-tables mutex.
+     * --------------------------------------------------------------------- */
 
-// Bytes
-extern IEC_BYTE *byte_input[BUFFER_SIZE];
-extern IEC_BYTE *byte_output[BUFFER_SIZE];
+    extern IEC_BOOL *bool_input[BUFFER_SIZE][8];
+    extern IEC_BOOL *bool_output[BUFFER_SIZE][8];
 
-// Analog I/O
-extern IEC_UINT *int_input[BUFFER_SIZE];
-extern IEC_UINT *int_output[BUFFER_SIZE];
+    extern IEC_BYTE *byte_input[BUFFER_SIZE];
+    extern IEC_BYTE *byte_output[BUFFER_SIZE];
 
-// 32bit I/O
-extern IEC_UDINT *dint_input[BUFFER_SIZE];
-extern IEC_UDINT *dint_output[BUFFER_SIZE];
+    extern IEC_UINT *int_input[BUFFER_SIZE];
+    extern IEC_UINT *int_output[BUFFER_SIZE];
 
-// 64bit I/O
-extern IEC_ULINT *lint_input[BUFFER_SIZE];
-extern IEC_ULINT *lint_output[BUFFER_SIZE];
+    extern IEC_UDINT *dint_input[BUFFER_SIZE];
+    extern IEC_UDINT *dint_output[BUFFER_SIZE];
 
-// Memory
-extern IEC_UINT *int_memory[BUFFER_SIZE];
-extern IEC_UDINT *dint_memory[BUFFER_SIZE];
-extern IEC_ULINT *lint_memory[BUFFER_SIZE];
-extern IEC_BOOL *bool_memory[BUFFER_SIZE][8];
+    extern IEC_ULINT *lint_input[BUFFER_SIZE];
+    extern IEC_ULINT *lint_output[BUFFER_SIZE];
 
-/**
- * @brief Set the buffer pointers for the plugin manager
- *
- * @param[in]  IEC  The IEC data types
- */
-extern void (*ext_setBufferPointers)(
-    IEC_BOOL *input_bool[BUFFER_SIZE][8], IEC_BOOL *output_bool[BUFFER_SIZE][8],
-    IEC_BYTE *input_byte[BUFFER_SIZE], IEC_BYTE *output_byte[BUFFER_SIZE],
-    IEC_UINT *input_int[BUFFER_SIZE], IEC_UINT *output_int[BUFFER_SIZE],
-    IEC_UDINT *input_dint[BUFFER_SIZE], IEC_UDINT *output_dint[BUFFER_SIZE],
-    IEC_ULINT *input_lint[BUFFER_SIZE], IEC_ULINT *output_lint[BUFFER_SIZE],
-    IEC_UINT *int_memory[BUFFER_SIZE], IEC_UDINT *dint_memory[BUFFER_SIZE],
-    IEC_ULINT *lint_memory[BUFFER_SIZE]);
+    extern IEC_UINT  *int_memory[BUFFER_SIZE];
+    extern IEC_UDINT *dint_memory[BUFFER_SIZE];
+    extern IEC_ULINT *lint_memory[BUFFER_SIZE];
+    extern IEC_BOOL  *bool_memory[BUFFER_SIZE][8];
 
-/**
- * @brief Set the buffer pointers for the plugin manager (v4 with bool_memory)
- *
- * This version includes bool_memory support for %MX locations.
- * Only present in programs compiled with -DOPENPLC_V4.
- */
-extern void (*ext_setBufferPointers_v4)(
-    IEC_BOOL *input_bool[BUFFER_SIZE][8], IEC_BOOL *output_bool[BUFFER_SIZE][8],
-    IEC_BYTE *input_byte[BUFFER_SIZE], IEC_BYTE *output_byte[BUFFER_SIZE],
-    IEC_UINT *input_int[BUFFER_SIZE], IEC_UINT *output_int[BUFFER_SIZE],
-    IEC_UDINT *input_dint[BUFFER_SIZE], IEC_UDINT *output_dint[BUFFER_SIZE],
-    IEC_ULINT *input_lint[BUFFER_SIZE], IEC_ULINT *output_lint[BUFFER_SIZE],
-    IEC_UINT *int_memory[BUFFER_SIZE], IEC_UDINT *dint_memory[BUFFER_SIZE],
-    IEC_ULINT *lint_memory[BUFFER_SIZE], IEC_BOOL *memory_bool[BUFFER_SIZE][8]);
+    /* -------------------------------------------------------------------------
+     * Resolved .so symbols (populated by symbols_init).
+     *
+     * Lifecycle / time. config_init__ and updateTime are kept for symmetry
+     * with the strucpp shim's exports; common_ticktime__ and plc_program_md5
+     * are read-only data symbols carried over from MatIEC era for
+     * informational purposes (scan_cycle_manager + debug PDU).
+     * --------------------------------------------------------------------- */
 
-/**
- * @brief Common ticktime variable from the PLC program
- *
- * @param[in]  tick  The current tick value
- */
-extern void (*ext_config_run__)(unsigned long tick);
+    extern void (*ext_config_init__)(void);
+    extern void (*ext_updateTime)(void);
 
-/**
- * @brief Initialize the configuration
- */
-extern void (*ext_config_init__)(void);
+    /* Hierarchical debug PDU shims (defined inside the .so by
+     * debug_dispatch.hpp under STRUCPP_V4_DEBUG_EXPORTS_DEFINE). */
+    extern uint8_t  (*ext_strucpp_debug_array_count)(void);
+    extern uint16_t (*ext_strucpp_debug_elem_count) (uint8_t arr);
+    extern uint16_t (*ext_strucpp_debug_size)       (uint8_t arr, uint16_t elem);
+    extern uint8_t  (*ext_strucpp_debug_set)        (uint8_t arr, uint16_t elem,
+                                                     bool forcing,
+                                                     const uint8_t *bytes,
+                                                     uint16_t len);
+    extern uint16_t (*ext_strucpp_debug_read)       (uint8_t arr, uint16_t elem,
+                                                     uint8_t *dest);
 
-/**
- * @brief Glue variables together
- */
-extern void (*ext_glueVars)(void);
-extern void (*ext_updateTime)(void);
+    /* -------------------------------------------------------------------------
+     * Symbol resolution.
+     *
+     * Resolves all required entry points from the dlopen'd .so, including
+     * the strucpp shim entries (strucpp_get_config / strucpp_set_locks)
+     * the runtime needs to walk the configuration and plumb mutexes.
+     * Initializes runtime-owned image-tables and globals mutexes (recursive
+     * PI) on first call and hands their pointers to the .so.
+     *
+     * Returns 0 on success, -1 if anything required is missing.
+     * --------------------------------------------------------------------- */
+    int symbols_init(PluginManager *pm);
 
-/**
- * @brief Debug functions
- */
-extern void (*ext_set_endianness)(uint8_t value);
-extern uint16_t (*ext_get_var_count)(void);
-extern size_t (*ext_get_var_size)(size_t idx);
-extern void *(*ext_get_var_addr)(size_t idx);
-extern void (*ext_set_trace)(size_t idx, bool forced, void *val);
+    /* -------------------------------------------------------------------------
+     * Walk strucpp::locatedVars[] and point each image-table slot at the
+     * corresponding IECVar's underlying primitive storage. Caller must hold
+     * the image-tables mutex.
+     * --------------------------------------------------------------------- */
+    void image_tables_bind_located_vars(void);
 
-/**
- * @brief Initialize symbols for the plugin manager
- *
- * @param[in]  pm  The plugin manager to initialize symbols for
- * @return 0 on success, -1 on failure
- */
-int symbols_init(PluginManager *pm);
+    /* -------------------------------------------------------------------------
+     * After binding, fill any unbound image-table slots with private
+     * backing buffers so plugins reading those addresses don't dereference
+     * NULL. Caller must hold the image-tables mutex.
+     * --------------------------------------------------------------------- */
+    void image_tables_fill_null_pointers(void);
 
-/**
- * @brief Fill NULL pointers in image tables with temporary backing buffers
- *
- * This function iterates through all image table arrays and points any NULL
- * entries to temporary backing storage. This ensures that plugins accessing
- * addresses not used by the PLC program won't fail due to NULL pointer access.
- *
- * Must be called after ext_glueVars() has mapped the user program's located
- * variables to the image tables.
- *
- * @note This function should be called with buffer_mutex held for thread safety.
- */
-void image_tables_fill_null_pointers(void);
+    /* -------------------------------------------------------------------------
+     * Reset all image-table pointers to NULL before unloading a program.
+     * Caller must hold the image-tables mutex.
+     * --------------------------------------------------------------------- */
+    void image_tables_clear_null_pointers(void);
 
-/**
- * @brief Clear all pointers from image tables
- *
- * This function resets all pointers in the image tables back to NULL.
- * All pointers will be remapped when a new program is loaded via glueVars().
- *
- * Must be called before unloading a PLC program to ensure clean state for
- * the next program load.
- *
- * @note This function should be called with buffer_mutex held for thread safety.
- */
-void image_tables_clear_null_pointers(void);
+    /* -------------------------------------------------------------------------
+     * Resource mutex accessors. Returns pointers to the runtime-owned
+     * recursive PI mutexes that protect the image tables and the globals.
+     * Plugins / the runtime housekeeping use these directly; the codegen
+     * lock guards inside the .so lock the same instances via the pointer
+     * stash plumbed through strucpp_set_locks().
+     * --------------------------------------------------------------------- */
+    pthread_mutex_t *image_tables_mutex(void);
+    pthread_mutex_t *global_vars_mutex(void);
 
-#endif // IMAGE_TABLES_H
+    /* -------------------------------------------------------------------------
+     * Returns the cached strucpp::ConfigurationInstance* (as void* — the
+     * runtime's .cpp callers static_cast to the right type). NULL until
+     * symbols_init() succeeds; reset to NULL on image_tables_clear_null_pointers().
+     * --------------------------------------------------------------------- */
+    void *strucpp_config_handle(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* IMAGE_TABLES_H */

@@ -88,10 +88,11 @@ typedef struct
     int (*mutex_give)(pthread_mutex_t *mutex);
     pthread_mutex_t *buffer_mutex;
 
-    /* Variable access functions */
-    void (*get_var_list)(size_t num_vars, size_t *indexes, void **result);
-    size_t (*get_var_size)(size_t idx);
-    uint16_t (*get_var_count)(void);
+    /* Variable access functions — removed in the STruC++ migration.
+     * The flat-index API (get_var_list / get_var_size / get_var_count)
+     * is replaced by the hierarchical strucpp_debug_* PDU surface.
+     * Plugins consuming variables (OPC UA primarily) must migrate to
+     * the new API; see Phase 9 docs in the editor repo. */
 
     /* Plugin configuration */
     char plugin_specific_config_file_path[256];
