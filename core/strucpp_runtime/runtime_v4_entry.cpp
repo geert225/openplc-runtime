@@ -73,20 +73,14 @@ extern "C" uint32_t strucpp_get_located_var_count(void) {
 // Project MD5. Used by FC 0x45 to let the editor verify it's debugging
 // the program it has the source for. The editor emits
 // core/generated/defines.h next to generated.cpp during compile,
-// defining PROGRAM_MD5 with the actual program hash; we include it via
-// __has_include so the placeholder is used only when no editor-built
-// program has been loaded yet (e.g. raw runtime smoke builds).
+// defining PROGRAM_MD5 with the actual program hash. PROGRAM_MD5 is
+// the same macro name the Arduino sketch's defines.h uses, keeping a
+// single MD5 contract across targets.
 //
-// PROGRAM_MD5 is the same macro name the Arduino sketch's defines.h
-// uses, keeping a single MD5 contract across targets.
-#if defined(__has_include)
-#  if __has_include("defines.h")
-#    include "defines.h"
-#  endif
-#endif
-#ifndef PROGRAM_MD5
-#define PROGRAM_MD5 "00000000000000000000000000000000"
-#endif
+// No fallback: a program loaded without defines.h is broken and must
+// fail to compile (missing file) or link (undefined PROGRAM_MD5). The
+// editor's v4 build path always emits defines.h.
+#include "defines.h"
 
 // Block-form language linkage for the definition. The single-decl form
 // (extern "C" const char *foo = ...;) is parsed by g++ as both
