@@ -459,12 +459,14 @@ static void update_status_snapshot(ecat_master_instance_t *inst)
     snap.exchange_skips = atomic_load(&inst->exchange_skips);
 #endif
 
-    /* Cycle metrics */
+    /* Cycle metrics under status_mutex: pairs with the PLC thread writes. */
+    pthread_mutex_lock(&inst->status_mutex);
     snap.cycle_count = inst->diag.cycle_count;
     snap.wkc_error_count = inst->diag.wkc_error_count;
     snap.max_cycle_us = inst->diag.max_total_ns / 1000;
     snap.max_exchange_us = inst->diag.max_exchange_ns / 1000;
     snap.avg_cycle_us = inst->diag.avg_total_ns / 1000;
+    pthread_mutex_unlock(&inst->status_mutex);
 
     /* Per-slave status */
     for (int i = 0; i < inst->config.slave_count && i < ECAT_MAX_SLAVES; i++) {
@@ -844,19 +846,24 @@ static void stop_single_master(ecat_master_instance_t *inst)
     atomic_store(&inst->soem_paused, false);
 #endif
 
-    /* Log final diagnostics */
-    if (inst->diag.cycle_count > 0 || inst->diag.wkc_error_count > 0) {
-        uint64_t total_cycles = inst->diag.cycle_count + inst->diag.wkc_error_count;
+    /* Log final diagnostics (snapshot under lock; PLC may still be running). */
+    ecat_cycle_diag_t final_diag;
+    pthread_mutex_lock(&inst->status_mutex);
+    final_diag = inst->diag;
+    pthread_mutex_unlock(&inst->status_mutex);
+
+    if (final_diag.cycle_count > 0 || final_diag.wkc_error_count > 0) {
+        uint64_t total_cycles = final_diag.cycle_count + final_diag.wkc_error_count;
         plugin_logger_info(&g_logger,
             "Master '%s': Final cycle stats: %llu total (%llu ok, %llu errors), "
             "avg=%lld us, min=%llu us, max=%llu us",
             inst->name,
             (unsigned long long)total_cycles,
-            (unsigned long long)inst->diag.cycle_count,
-            (unsigned long long)inst->diag.wkc_error_count,
-            (long long)(inst->diag.avg_total_ns / 1000),
-            (unsigned long long)(inst->diag.min_total_ns / 1000),
-            (unsigned long long)(inst->diag.max_total_ns / 1000));
+            (unsigned long long)final_diag.cycle_count,
+            (unsigned long long)final_diag.wkc_error_count,
+            (long long)(final_diag.avg_total_ns / 1000),
+            (unsigned long long)(final_diag.min_total_ns / 1000),
+            (unsigned long long)(final_diag.max_total_ns / 1000));
     }
 
     /* Undo IP-stack isolation only if we applied it -- safe to call always. */
@@ -923,26 +930,58 @@ static void cycle_start_single(ecat_master_instance_t *inst)
     int wkc = ecat_master_exchange_processdata(inst, inst->receive_timeout_us);
     osal_get_monotonic_time(&t1);
 
-    inst->diag.exchange_ns = elapsed_ns(&t0, &t1);
+    uint64_t exchange_ns = elapsed_ns(&t0, &t1);
 
     /* 3. Read received inputs into PLC buffers */
     ecat_io_read_inputs_fast(&inst->transfer_list, iomap);
 
     inst->cycle_counter++;
 
-    /* 4. WKC error tracking (no blocking SOEM calls) */
-    if (wkc < inst->expected_wkc) {
-        int consec = atomic_fetch_add(&inst->consecutive_wkc_errors, 1) + 1;
+    bool wkc_error = (wkc < inst->expected_wkc);
+    bool noframe   = (wkc == EC_NOFRAME);
+
+    /* Mutate diag under status_mutex; snapshot for use after release. */
+    ecat_cycle_diag_t snap;
+    pthread_mutex_lock(&inst->status_mutex);
+
+    inst->diag.exchange_ns = exchange_ns;
+    inst->diag.total_ns    = exchange_ns;
+
+    if (wkc_error) {
         inst->diag.wkc_error_count++;
-        if (wkc == EC_NOFRAME)
+        if (noframe)
             inst->diag.noframe_count++;
+    }
+
+    inst->diag.cycle_count++;
+    inst->diag.avg_total_ns += ((int64_t)inst->diag.total_ns - inst->diag.avg_total_ns)
+                               / (int64_t)inst->diag.cycle_count;
+    inst->diag.avg_exchange_ns += ((int64_t)inst->diag.exchange_ns - inst->diag.avg_exchange_ns)
+                                  / (int64_t)inst->diag.cycle_count;
+
+    if (inst->diag.exchange_ns > inst->diag.max_exchange_ns)
+        inst->diag.max_exchange_ns = inst->diag.exchange_ns;
+    if (inst->diag.exchange_ns < inst->diag.min_exchange_ns)
+        inst->diag.min_exchange_ns = inst->diag.exchange_ns;
+    if (inst->diag.total_ns > inst->diag.max_total_ns)
+        inst->diag.max_total_ns = inst->diag.total_ns;
+    if (inst->diag.total_ns < inst->diag.min_total_ns)
+        inst->diag.min_total_ns = inst->diag.total_ns;
+
+    snap = inst->diag;
+
+    pthread_mutex_unlock(&inst->status_mutex);
+
+    /* 4. WKC error tracking (no blocking SOEM calls, no diag access) */
+    if (wkc_error) {
+        int consec = atomic_fetch_add(&inst->consecutive_wkc_errors, 1) + 1;
 
         if (consec == 1 || (consec % 100) == 0) {
             plugin_logger_warn(&g_logger,
                 "Master '%s': WKC error: expected %d, got %d "
                 "(consecutive: %d, exchange=%llu us)",
                 inst->name, inst->expected_wkc, wkc, consec,
-                (unsigned long long)(inst->diag.exchange_ns / 1000));
+                (unsigned long long)(exchange_ns / 1000));
         }
 
 #if ECAT_ENABLE_MONITOR_THREAD
@@ -960,46 +999,28 @@ static void cycle_start_single(ecat_master_instance_t *inst)
         atomic_store(&inst->consecutive_wkc_errors, 0);
     }
 
-    /* 5. Update diagnostics (no SOEM calls, Welford's incremental average) */
-    inst->diag.total_ns = inst->diag.exchange_ns;
-    inst->diag.cycle_count++;
-
-    inst->diag.avg_total_ns += ((int64_t)inst->diag.total_ns - inst->diag.avg_total_ns)
-                               / (int64_t)inst->diag.cycle_count;
-    inst->diag.avg_exchange_ns += ((int64_t)inst->diag.exchange_ns - inst->diag.avg_exchange_ns)
-                                  / (int64_t)inst->diag.cycle_count;
-
-    if (inst->diag.exchange_ns > inst->diag.max_exchange_ns)
-        inst->diag.max_exchange_ns = inst->diag.exchange_ns;
-    if (inst->diag.exchange_ns < inst->diag.min_exchange_ns)
-        inst->diag.min_exchange_ns = inst->diag.exchange_ns;
-    if (inst->diag.total_ns > inst->diag.max_total_ns)
-        inst->diag.max_total_ns = inst->diag.total_ns;
-    if (inst->diag.total_ns < inst->diag.min_total_ns)
-        inst->diag.min_total_ns = inst->diag.total_ns;
-
-    /* 6. Periodic diagnostic log */
-    if ((inst->diag.cycle_count % ECAT_DIAG_REPORT_INTERVAL) == 0 &&
-        inst->diag.cycle_count > 0) {
-        uint64_t total_cycles = inst->diag.cycle_count + inst->diag.wkc_error_count;
+    /* 5. Periodic diagnostic log (uses snapshot, no lock held). */
+    if ((snap.cycle_count % ECAT_DIAG_REPORT_INTERVAL) == 0 &&
+        snap.cycle_count > 0) {
+        uint64_t total_cycles = snap.cycle_count + snap.wkc_error_count;
         plugin_logger_info(&g_logger,
             "Master '%s': Cycle stats (%llu total): avg=%lld us, min=%llu us, "
             "max=%llu us, exchange avg=%lld us, min=%llu us, max=%llu us",
             inst->name,
             (unsigned long long)total_cycles,
-            (long long)(inst->diag.avg_total_ns / 1000),
-            (unsigned long long)(inst->diag.min_total_ns / 1000),
-            (unsigned long long)(inst->diag.max_total_ns / 1000),
-            (long long)(inst->diag.avg_exchange_ns / 1000),
-            (unsigned long long)(inst->diag.min_exchange_ns / 1000),
-            (unsigned long long)(inst->diag.max_exchange_ns / 1000));
+            (long long)(snap.avg_total_ns / 1000),
+            (unsigned long long)(snap.min_total_ns / 1000),
+            (unsigned long long)(snap.max_total_ns / 1000),
+            (long long)(snap.avg_exchange_ns / 1000),
+            (unsigned long long)(snap.min_exchange_ns / 1000),
+            (unsigned long long)(snap.max_exchange_ns / 1000));
         plugin_logger_info(&g_logger,
             "Master '%s': WKC errors: %llu total, %llu noframe, rate=%.1f%%",
             inst->name,
-            (unsigned long long)inst->diag.wkc_error_count,
-            (unsigned long long)inst->diag.noframe_count,
+            (unsigned long long)snap.wkc_error_count,
+            (unsigned long long)snap.noframe_count,
             total_cycles > 0
-                ? (inst->diag.wkc_error_count * 100.0 / total_cycles) : 0.0);
+                ? (snap.wkc_error_count * 100.0 / total_cycles) : 0.0);
     }
 }
 
