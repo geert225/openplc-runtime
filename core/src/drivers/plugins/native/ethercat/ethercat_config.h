@@ -381,8 +381,11 @@ typedef struct {
     ecat_slave_status_t slaves[ECAT_MAX_SLAVES];
     uint64_t            cycle_count;
     uint64_t            wkc_error_count;
+    uint64_t            noframe_count;
     uint64_t            avg_cycle_us;
+    uint64_t            min_cycle_us;
     uint64_t            max_cycle_us;
+    uint64_t            min_exchange_us;
     uint64_t            max_exchange_us;
     int                 consecutive_wkc_errors;
     int                 recovery_attempts;

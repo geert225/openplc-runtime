@@ -1280,32 +1280,11 @@ const ec_slavet *ecat_master_get_slave(ecat_master_instance_t *inst, int positio
     return &inst->ecx_context.slavelist[position];
 }
 
-int ecat_master_is_operational(ecat_master_instance_t *inst)
-{
-    if (!inst->soem_initialized)
-        return 0;
-    return (inst->ecx_context.slavelist[0].state == EC_STATE_OPERATIONAL) ? 1 : 0;
-}
-
 uint16_t ecat_master_get_slave_state(ecat_master_instance_t *inst, int position)
 {
     if (position < 1 || position > inst->ecx_context.slavecount)
         return 0;
     return inst->ecx_context.slavelist[position].state;
-}
-
-int ecat_master_request_state(ecat_master_instance_t *inst, int position, uint16_t state, plugin_logger_t *logger)
-{
-    if (position < 1 || position > inst->ecx_context.slavecount) {
-        plugin_logger_error(logger, "Invalid slave position %d for state request", position);
-        return -1;
-    }
-
-    inst->ecx_context.slavelist[position].state = state;
-    ecx_writestate(&inst->ecx_context, (uint16)position);
-
-    plugin_logger_debug(logger, "Requested state 0x%04X for slave %d", state, position);
-    return 0;
 }
 
 /*

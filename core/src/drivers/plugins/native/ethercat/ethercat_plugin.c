@@ -443,7 +443,9 @@ static int g_master_count = 0;
  * @brief Build and publish a status snapshot from current state
  *
  * Called by the monitor thread (or from start_loop/stop_loop).
- * The lock hold time is just a memcpy of ~5KB.
+ * Builds the snapshot on the stack first, then publishes it under the
+ * status_mutex with a single memcpy. The PLC thread holds status_mutex
+ * only briefly while updating diag counters, so contention is minimal.
  */
 static void update_status_snapshot(ecat_master_instance_t *inst)
 {
@@ -459,16 +461,8 @@ static void update_status_snapshot(ecat_master_instance_t *inst)
     snap.exchange_skips = atomic_load(&inst->exchange_skips);
 #endif
 
-    /* Cycle metrics under status_mutex: pairs with the PLC thread writes. */
-    pthread_mutex_lock(&inst->status_mutex);
-    snap.cycle_count = inst->diag.cycle_count;
-    snap.wkc_error_count = inst->diag.wkc_error_count;
-    snap.max_cycle_us = inst->diag.max_total_ns / 1000;
-    snap.max_exchange_us = inst->diag.max_exchange_ns / 1000;
-    snap.avg_cycle_us = inst->diag.avg_total_ns / 1000;
-    pthread_mutex_unlock(&inst->status_mutex);
-
-    /* Per-slave status */
+    /* Per-slave status (reads SOEM slavelist; safe because the monitor
+     * only calls this while holding cooperative SOEM access). */
     for (int i = 0; i < inst->config.slave_count && i < ECAT_MAX_SLAVES; i++) {
         const ecat_slave_t *cfg = &inst->config.slaves[i];
         ecat_slave_status_t *ss = &snap.slaves[i];
@@ -484,7 +478,21 @@ static void update_status_snapshot(ecat_master_instance_t *inst)
         }
     }
 
+    /* Single critical section: copy diag counters into snap, then
+     * publish snap to status_snapshot. Pre-cycle min sentinels
+     * (UINT64_MAX) are clamped to 0 so consumers always see plausible
+     * values. */
     pthread_mutex_lock(&inst->status_mutex);
+    snap.cycle_count = inst->diag.cycle_count;
+    snap.wkc_error_count = inst->diag.wkc_error_count;
+    snap.noframe_count = inst->diag.noframe_count;
+    snap.avg_cycle_us = inst->diag.avg_total_ns / 1000;
+    snap.max_cycle_us = inst->diag.max_total_ns / 1000;
+    snap.max_exchange_us = inst->diag.max_exchange_ns / 1000;
+    snap.min_cycle_us = (inst->diag.min_total_ns == UINT64_MAX)
+                            ? 0 : inst->diag.min_total_ns / 1000;
+    snap.min_exchange_us = (inst->diag.min_exchange_ns == UINT64_MAX)
+                               ? 0 : inst->diag.min_exchange_ns / 1000;
     memcpy(&inst->status_snapshot, &snap, sizeof(snap));
     pthread_mutex_unlock(&inst->status_mutex);
 }
@@ -1658,8 +1666,11 @@ static cJSON *build_master_status_json(ecat_master_instance_t *inst)
     cJSON *metrics = cJSON_CreateObject();
     cJSON_AddNumberToObject(metrics, "cycle_count", (double)snap.cycle_count);
     cJSON_AddNumberToObject(metrics, "wkc_error_count", (double)snap.wkc_error_count);
+    cJSON_AddNumberToObject(metrics, "noframe_count", (double)snap.noframe_count);
     cJSON_AddNumberToObject(metrics, "avg_cycle_us", (double)snap.avg_cycle_us);
+    cJSON_AddNumberToObject(metrics, "min_cycle_us", (double)snap.min_cycle_us);
     cJSON_AddNumberToObject(metrics, "max_cycle_us", (double)snap.max_cycle_us);
+    cJSON_AddNumberToObject(metrics, "min_exchange_us", (double)snap.min_exchange_us);
     cJSON_AddNumberToObject(metrics, "max_exchange_us", (double)snap.max_exchange_us);
     cJSON_AddNumberToObject(metrics, "consecutive_wkc_errors", snap.consecutive_wkc_errors);
     cJSON_AddNumberToObject(metrics, "recovery_attempts", snap.recovery_attempts);
@@ -1732,8 +1743,11 @@ static cJSON *build_master_diagnostics_json(ecat_master_instance_t *inst)
     cJSON *timing = cJSON_CreateObject();
     cJSON_AddNumberToObject(timing, "cycle_count", (double)snap.cycle_count);
     cJSON_AddNumberToObject(timing, "wkc_error_count", (double)snap.wkc_error_count);
+    cJSON_AddNumberToObject(timing, "noframe_count", (double)snap.noframe_count);
     cJSON_AddNumberToObject(timing, "avg_cycle_us", (double)snap.avg_cycle_us);
+    cJSON_AddNumberToObject(timing, "min_cycle_us", (double)snap.min_cycle_us);
     cJSON_AddNumberToObject(timing, "max_cycle_us", (double)snap.max_cycle_us);
+    cJSON_AddNumberToObject(timing, "min_exchange_us", (double)snap.min_exchange_us);
     cJSON_AddNumberToObject(timing, "max_exchange_us", (double)snap.max_exchange_us);
     cJSON_AddNumberToObject(timing, "configured_cycle_us",
                             inst->config.master.cycle_time_us);

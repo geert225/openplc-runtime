@@ -9,9 +9,13 @@
  *  1. At startup, ecat_io_build_channel_map() walks every configured channel,
  *     resolves its IOmap pointer via PDO walking, parses its IEC location,
  *     and stores a compact mapping entry.
- *  2. Each PLC scan cycle:
- *     - cycle_start  → ecat_io_read_inputs()  copies IOmap → PLC inputs
- *     - cycle_end    → ecat_io_write_outputs() copies PLC outputs → IOmap
+ *  2. Still at startup, ecat_io_build_transfer_list() pre-resolves each map
+ *     entry into a {plc_ptr, iomap_offset, byte_count} triple.
+ *  3. Each PLC scan cycle (hot path):
+ *     - cycle_start_single() calls ecat_io_write_outputs_fast() to push
+ *       PLC outputs into the IOmap, then ecat_io_read_inputs_fast() to
+ *       pull fresh inputs back. Both operate on the pre-resolved transfer
+ *       list — no PDO walking, no NULL checks.
  */
 
 #include "ethercat_io.h"
@@ -420,112 +424,6 @@ int ecat_io_build_channel_map(const ecat_config_t *config,
         map->input_count, map->output_count, errors);
 
     return (mapped > 0) ? 0 : -1;
-}
-
-/*
- * =============================================================================
- * Per-Cycle I/O Functions
- * =============================================================================
- */
-
-/**
- * @note Thread safety: buffer_mutex must be held by the caller.
- * This is guaranteed by plc_cycle_thread() in plc_state_manager.c
- * which holds buffer_mutex across the entire scan cycle.
- */
-void ecat_io_read_inputs(const ecat_channel_map_t *map,
-                         const uint8_t *iomap_base,
-                         plugin_runtime_args_t *args)
-{
-    for (int i = 0; i < map->input_count; i++) {
-        const ecat_channel_map_entry_t *e = &map->inputs[i];
-        const uint8_t *ptr = iomap_base + e->iomap_offset;
-
-        switch (e->size) {
-        case IEC_SIZE_BIT:
-            if (args->bool_input &&
-                args->bool_input[e->byte_index] &&
-                args->bool_input[e->byte_index][e->bit_index]) {
-                *args->bool_input[e->byte_index][e->bit_index] =
-                    iomap_read_bit(ptr, e->iomap_bit_offset);
-            }
-            break;
-
-        case IEC_SIZE_BYTE:
-            if (args->byte_input && args->byte_input[e->byte_index]) {
-                *args->byte_input[e->byte_index] = *ptr;
-            }
-            break;
-
-        case IEC_SIZE_WORD:
-            if (args->int_input && args->int_input[e->byte_index]) {
-                memcpy(args->int_input[e->byte_index], ptr, 2);
-            }
-            break;
-
-        case IEC_SIZE_DWORD:
-            if (args->dint_input && args->dint_input[e->byte_index]) {
-                memcpy(args->dint_input[e->byte_index], ptr, 4);
-            }
-            break;
-
-        case IEC_SIZE_LWORD:
-            if (args->lint_input && args->lint_input[e->byte_index]) {
-                memcpy(args->lint_input[e->byte_index], ptr, 8);
-            }
-            break;
-        }
-    }
-}
-
-/**
- * @note Thread safety: buffer_mutex must be held by the caller.
- * This is guaranteed by plc_cycle_thread() in plc_state_manager.c
- * which holds buffer_mutex across the entire scan cycle.
- */
-void ecat_io_write_outputs(const ecat_channel_map_t *map,
-                           uint8_t *iomap_base,
-                           plugin_runtime_args_t *args)
-{
-    for (int i = 0; i < map->output_count; i++) {
-        const ecat_channel_map_entry_t *e = &map->outputs[i];
-        uint8_t *ptr = iomap_base + e->iomap_offset;
-
-        switch (e->size) {
-        case IEC_SIZE_BIT:
-            if (args->bool_output &&
-                args->bool_output[e->byte_index] &&
-                args->bool_output[e->byte_index][e->bit_index]) {
-                iomap_write_bit(ptr, e->iomap_bit_offset,
-                                *args->bool_output[e->byte_index][e->bit_index]);
-            }
-            break;
-
-        case IEC_SIZE_BYTE:
-            if (args->byte_output && args->byte_output[e->byte_index]) {
-                *ptr = *args->byte_output[e->byte_index];
-            }
-            break;
-
-        case IEC_SIZE_WORD:
-            if (args->int_output && args->int_output[e->byte_index]) {
-                memcpy(ptr, args->int_output[e->byte_index], 2);
-            }
-            break;
-
-        case IEC_SIZE_DWORD:
-            if (args->dint_output && args->dint_output[e->byte_index]) {
-                memcpy(ptr, args->dint_output[e->byte_index], 4);
-            }
-            break;
-
-        case IEC_SIZE_LWORD:
-            if (args->lint_output && args->lint_output[e->byte_index]) {
-                memcpy(ptr, args->lint_output[e->byte_index], 8);
-            }
-            break;
-        }
-    }
 }
 
 /*

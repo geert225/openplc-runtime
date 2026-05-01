@@ -139,14 +139,6 @@ int ecat_master_get_expected_wkc(ecat_master_instance_t *inst);
 const ec_slavet *ecat_master_get_slave(ecat_master_instance_t *inst, int position);
 
 /**
- * @brief Check if all slaves are in OPERATIONAL state
- *
- * @param inst Per-master instance
- * @return 1 if operational, 0 otherwise
- */
-int ecat_master_is_operational(ecat_master_instance_t *inst);
-
-/**
  * @brief Get the AL state of a specific slave
  *
  * Reads the current state from the SOEM slavelist (cached from last bus read).
@@ -156,17 +148,6 @@ int ecat_master_is_operational(ecat_master_instance_t *inst);
  * @return EC_STATE_* value, or 0 if position is invalid
  */
 uint16_t ecat_master_get_slave_state(ecat_master_instance_t *inst, int position);
-
-/**
- * @brief Request a state transition for a specific slave
- *
- * @param inst     Per-master instance
- * @param position 1-based slave position
- * @param state    Target EC_STATE_* value
- * @param logger   Plugin logger instance
- * @return 0 on success, -1 on failure
- */
-int ecat_master_request_state(ecat_master_instance_t *inst, int position, uint16_t state, plugin_logger_t *logger);
 
 /**
  * @brief Attempt to recover a slave that has left OPERATIONAL state
