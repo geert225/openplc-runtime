@@ -49,9 +49,6 @@
  * =============================================================================
  */
 
-/** Number of cycles between diagnostic log reports */
-#define ECAT_DIAG_REPORT_INTERVAL 10000
-
 /** Minimum timeout for receive in microseconds */
 #define ECAT_MIN_RECEIVE_TIMEOUT_US 200
 
@@ -315,20 +312,31 @@ static int attempt_recovery(ecat_master_instance_t *inst)
  */
 
 /**
- * @brief Background thread for slave state monitoring and recovery
+ * @brief Background thread for slave state monitoring, recovery, and logging.
  *
  * Runs at default (non-RT) priority.  Periodically:
  *   - Acquires inst->soem_lock (PLC trylocks the same mutex; if the
  *     monitor is holding it, the PLC skips one exchange cycle).
- *   - Reads slave states via ecx_readstate().
+ *   - Reads slave states via ecx_readstate() and publishes the slaves
+ *     snapshot.
  *   - Performs recovery if in RECOVERING state.
- *   - Updates status snapshot for execute_command queries.
+ *   - Emits user-facing log messages on state and counter transitions
+ *     so the PLC hot path never calls plugin_logger_* (which serialises
+ *     on a global mutex and writes synchronously to a Unix socket).
  *
  * @param arg Pointer to the ecat_master_instance_t for this master
  */
 static void *ecat_monitor_thread(void *arg)
 {
     ecat_master_instance_t *inst = (ecat_master_instance_t *)arg;
+
+    /* Local state for transition-based logging.  All scoped to this
+     * thread, so no atomics or struct fields needed.  Stats are only
+     * emitted on transitions (state change, WKC errors start/clear) --
+     * continuous metrics are already exposed via the status / diagnostics
+     * commands consumed by the editor. */
+    int last_logged_state = -1;
+    int last_logged_consec_wkc = 0;
 
     plugin_logger_info(&g_logger,
         "Master '%s': monitor thread started (interval=%d ms)",
@@ -363,6 +371,31 @@ static void *ecat_monitor_thread(void *arg)
                     "Master '%s': entered ERROR state after max recovery attempts",
                     inst->name);
             }
+        }
+
+        /* --- Transition-based logging (replaces hot-path PLC logs) --- */
+
+        int curr_state = atomic_load(&inst->plugin_state);
+        if (curr_state != last_logged_state) {
+            if (curr_state == ECAT_STATE_RECOVERING) {
+                plugin_logger_warn(&g_logger,
+                    "Master '%s': WKC error threshold (%d) reached, "
+                    "[state: RECOVERING]",
+                    inst->name, ECAT_WKC_ERROR_THRESHOLD);
+            }
+            last_logged_state = curr_state;
+        }
+
+        int consec = atomic_load(&inst->consecutive_wkc_errors);
+        if (consec > 0 && last_logged_consec_wkc == 0) {
+            plugin_logger_warn(&g_logger,
+                "Master '%s': WKC errors detected (consecutive=%d, expected=%d)",
+                inst->name, consec, inst->expected_wkc);
+            last_logged_consec_wkc = consec;
+        } else if (consec == 0 && last_logged_consec_wkc != 0) {
+            plugin_logger_info(&g_logger,
+                "Master '%s': WKC errors cleared", inst->name);
+            last_logged_consec_wkc = 0;
         }
 
         /* Sleep for the monitor interval */
@@ -669,8 +702,7 @@ static void cycle_start_single(ecat_master_instance_t *inst)
                                       memory_order_relaxed);
     }
 
-    uint64_t cc = atomic_fetch_add_explicit(&inst->diag.cycle_count, 1,
-                                            memory_order_relaxed) + 1;
+    atomic_fetch_add_explicit(&inst->diag.cycle_count, 1, memory_order_relaxed);
 
     /* EWMA: avg += (sample - avg) >> SHIFT.  Tracks recent-window jitter
      * instead of a historical mean (which the previous integer-Welford
@@ -712,66 +744,22 @@ static void cycle_start_single(ecat_master_instance_t *inst)
         atomic_store_explicit(&inst->diag.min_total_ns, exchange_ns,
                               memory_order_relaxed);
 
-    /* WKC error tracking (no blocking SOEM calls, no diag access) */
+    /* WKC error tracking.  No plugin_logger_* calls here -- the runtime
+     * logger does a synchronous mutex+socket write that would inject
+     * jitter in the hot path.  The monitor thread observes these counters
+     * and emits the user-facing log messages. */
     if (wkc_error) {
         int consec = atomic_fetch_add(&inst->consecutive_wkc_errors, 1) + 1;
-
-        if (consec == 1 || (consec % 100) == 0) {
-            plugin_logger_warn(&g_logger,
-                "Master '%s': WKC error: expected %d, got %d "
-                "(consecutive: %d, exchange=%llu us)",
-                inst->name, inst->expected_wkc, wkc, consec,
-                (unsigned long long)(exchange_ns / 1000));
-        }
-
 #if ECAT_ENABLE_MONITOR_THREAD
-        /* Trigger recovery (handled by monitor thread) */
         if (state == ECAT_STATE_OPERATIONAL &&
             consec >= ECAT_WKC_ERROR_THRESHOLD) {
-            plugin_logger_warn(&g_logger,
-                "Master '%s': WKC error threshold (%d) reached, "
-                "switching to RECOVERING",
-                inst->name, ECAT_WKC_ERROR_THRESHOLD);
             atomic_store(&inst->plugin_state, ECAT_STATE_RECOVERING);
         }
+#else
+        (void)consec;
 #endif
     } else {
         atomic_store(&inst->consecutive_wkc_errors, 0);
-    }
-
-    /* Periodic diagnostic log: load values only when about to log. */
-    if ((cc % ECAT_DIAG_REPORT_INTERVAL) == 0 && cc > 0) {
-        uint64_t wkc_errors = atomic_load_explicit(&inst->diag.wkc_error_count,
-                                                   memory_order_relaxed);
-        uint64_t noframes = atomic_load_explicit(&inst->diag.noframe_count,
-                                                 memory_order_relaxed);
-        uint64_t min_total = atomic_load_explicit(&inst->diag.min_total_ns,
-                                                  memory_order_relaxed);
-        uint64_t max_total = atomic_load_explicit(&inst->diag.max_total_ns,
-                                                  memory_order_relaxed);
-        uint64_t min_exch = atomic_load_explicit(&inst->diag.min_exchange_ns,
-                                                 memory_order_relaxed);
-        uint64_t max_exch = atomic_load_explicit(&inst->diag.max_exchange_ns,
-                                                 memory_order_relaxed);
-        uint64_t total_cycles = cc + wkc_errors;
-        plugin_logger_info(&g_logger,
-            "Master '%s': Cycle stats (%llu total): avg=%lld us, min=%llu us, "
-            "max=%llu us, exchange avg=%lld us, min=%llu us, max=%llu us",
-            inst->name,
-            (unsigned long long)total_cycles,
-            (long long)(cur_avg_total / 1000),
-            (unsigned long long)(min_total / 1000),
-            (unsigned long long)(max_total / 1000),
-            (long long)(cur_avg_exch / 1000),
-            (unsigned long long)(min_exch / 1000),
-            (unsigned long long)(max_exch / 1000));
-        plugin_logger_info(&g_logger,
-            "Master '%s': WKC errors: %llu total, %llu noframe, rate=%.1f%%",
-            inst->name,
-            (unsigned long long)wkc_errors,
-            (unsigned long long)noframes,
-            total_cycles > 0
-                ? (wkc_errors * 100.0 / total_cycles) : 0.0);
     }
 }
 
