@@ -137,6 +137,34 @@ static void safe_strcpy_local(char *dest, const char *src, size_t max_len)
 
 /*
  * =============================================================================
+ * Diag Reset Helper
+ * =============================================================================
+ *
+ * Initializes (or re-initializes after a stop/start) every field of the
+ * per-cycle diagnostics struct.  Min sentinels start at UINT64_MAX so the
+ * first cycle's "less-than" comparison wins.  All stores are relaxed: this
+ * runs before the monitor thread is created and before the PLC enters
+ * OPERATIONAL, so no synchronization with other threads is needed yet.
+ */
+static void diag_reset(ecat_cycle_diag_t *d)
+{
+    atomic_store_explicit(&d->cycle_count, 0, memory_order_relaxed);
+    atomic_store_explicit(&d->wkc_error_count, 0, memory_order_relaxed);
+    atomic_store_explicit(&d->noframe_count, 0, memory_order_relaxed);
+    atomic_store_explicit(&d->exchange_ns, 0, memory_order_relaxed);
+    atomic_store_explicit(&d->io_read_ns, 0, memory_order_relaxed);
+    atomic_store_explicit(&d->io_write_ns, 0, memory_order_relaxed);
+    atomic_store_explicit(&d->total_ns, 0, memory_order_relaxed);
+    atomic_store_explicit(&d->max_exchange_ns, 0, memory_order_relaxed);
+    atomic_store_explicit(&d->max_total_ns, 0, memory_order_relaxed);
+    atomic_store_explicit(&d->avg_total_ns, 0, memory_order_relaxed);
+    atomic_store_explicit(&d->avg_exchange_ns, 0, memory_order_relaxed);
+    atomic_store_explicit(&d->min_exchange_ns, UINT64_MAX, memory_order_relaxed);
+    atomic_store_explicit(&d->min_total_ns, UINT64_MAX, memory_order_relaxed);
+}
+
+/*
+ * =============================================================================
  * Mutex Init Helper
  * =============================================================================
  *
@@ -502,21 +530,31 @@ static void update_status_snapshot(ecat_master_instance_t *inst)
         }
     }
 
-    /* Single critical section: copy diag counters into snap, then
-     * publish snap to status_snapshot. Pre-cycle min sentinels
-     * (UINT64_MAX) are clamped to 0 so consumers always see plausible
-     * values. */
+    /* Read diag lock-free via relaxed atomic loads.  Cross-field tearing
+     * is acceptable for diagnostics.  Pre-cycle min sentinels (UINT64_MAX)
+     * are clamped to 0 so consumers always see plausible values. */
+    snap.cycle_count = atomic_load_explicit(&inst->diag.cycle_count,
+                                            memory_order_relaxed);
+    snap.wkc_error_count = atomic_load_explicit(&inst->diag.wkc_error_count,
+                                                memory_order_relaxed);
+    snap.noframe_count = atomic_load_explicit(&inst->diag.noframe_count,
+                                              memory_order_relaxed);
+    snap.avg_cycle_us = atomic_load_explicit(&inst->diag.avg_total_ns,
+                                             memory_order_relaxed) / 1000;
+    snap.max_cycle_us = atomic_load_explicit(&inst->diag.max_total_ns,
+                                             memory_order_relaxed) / 1000;
+    snap.max_exchange_us = atomic_load_explicit(&inst->diag.max_exchange_ns,
+                                                memory_order_relaxed) / 1000;
+    uint64_t min_total = atomic_load_explicit(&inst->diag.min_total_ns,
+                                              memory_order_relaxed);
+    snap.min_cycle_us = (min_total == UINT64_MAX) ? 0 : min_total / 1000;
+    uint64_t min_exch = atomic_load_explicit(&inst->diag.min_exchange_ns,
+                                             memory_order_relaxed);
+    snap.min_exchange_us = (min_exch == UINT64_MAX) ? 0 : min_exch / 1000;
+
+    /* Publish: status_mutex still protects the public snapshot.
+     * status_mutex is removed in sub-phase 2.3. */
     pthread_mutex_lock(&inst->status_mutex);
-    snap.cycle_count = inst->diag.cycle_count;
-    snap.wkc_error_count = inst->diag.wkc_error_count;
-    snap.noframe_count = inst->diag.noframe_count;
-    snap.avg_cycle_us = inst->diag.avg_total_ns / 1000;
-    snap.max_cycle_us = inst->diag.max_total_ns / 1000;
-    snap.max_exchange_us = inst->diag.max_exchange_ns / 1000;
-    snap.min_cycle_us = (inst->diag.min_total_ns == UINT64_MAX)
-                            ? 0 : inst->diag.min_total_ns / 1000;
-    snap.min_exchange_us = (inst->diag.min_exchange_ns == UINT64_MAX)
-                               ? 0 : inst->diag.min_exchange_ns / 1000;
     memcpy(&inst->status_snapshot, &snap, sizeof(snap));
     pthread_mutex_unlock(&inst->status_mutex);
 }
@@ -749,9 +787,7 @@ static int start_single_master(ecat_master_instance_t *inst)
     atomic_store(&inst->consecutive_wkc_errors, 0);
     atomic_store(&inst->recovery_attempts, 0);
     inst->cycle_counter = 0;
-    memset(&inst->diag, 0, sizeof(inst->diag));
-    inst->diag.min_exchange_ns = UINT64_MAX;
-    inst->diag.min_total_ns = UINT64_MAX;
+    diag_reset(&inst->diag);
 
     atomic_store(&inst->plugin_state, ECAT_STATE_OPERATIONAL);
 
@@ -815,24 +851,32 @@ static void stop_single_master(ecat_master_instance_t *inst)
     }
 #endif
 
-    /* Log final diagnostics (snapshot under lock; PLC may still be running). */
-    ecat_cycle_diag_t final_diag;
-    pthread_mutex_lock(&inst->status_mutex);
-    final_diag = inst->diag;
-    pthread_mutex_unlock(&inst->status_mutex);
+    /* Log final diagnostics via relaxed atomic loads.  PLC may still be
+     * running (it stops at the next state check); cross-field tearing is
+     * harmless here. */
+    uint64_t final_cycle_count =
+        atomic_load_explicit(&inst->diag.cycle_count, memory_order_relaxed);
+    uint64_t final_wkc_errors =
+        atomic_load_explicit(&inst->diag.wkc_error_count, memory_order_relaxed);
+    int64_t  final_avg_total =
+        atomic_load_explicit(&inst->diag.avg_total_ns, memory_order_relaxed);
+    uint64_t final_min_total =
+        atomic_load_explicit(&inst->diag.min_total_ns, memory_order_relaxed);
+    uint64_t final_max_total =
+        atomic_load_explicit(&inst->diag.max_total_ns, memory_order_relaxed);
 
-    if (final_diag.cycle_count > 0 || final_diag.wkc_error_count > 0) {
-        uint64_t total_cycles = final_diag.cycle_count + final_diag.wkc_error_count;
+    if (final_cycle_count > 0 || final_wkc_errors > 0) {
+        uint64_t total_cycles = final_cycle_count + final_wkc_errors;
         plugin_logger_info(&g_logger,
             "Master '%s': Final cycle stats: %llu total (%llu ok, %llu errors), "
             "avg=%lld us, min=%llu us, max=%llu us",
             inst->name,
             (unsigned long long)total_cycles,
-            (unsigned long long)final_diag.cycle_count,
-            (unsigned long long)final_diag.wkc_error_count,
-            (long long)(final_diag.avg_total_ns / 1000),
-            (unsigned long long)(final_diag.min_total_ns / 1000),
-            (unsigned long long)(final_diag.max_total_ns / 1000));
+            (unsigned long long)final_cycle_count,
+            (unsigned long long)final_wkc_errors,
+            (long long)(final_avg_total / 1000),
+            (unsigned long long)(final_min_total / 1000),
+            (unsigned long long)(final_max_total / 1000));
     }
 
     /* Undo IP-stack isolation only if we applied it -- safe to call always. */
@@ -914,39 +958,60 @@ static void cycle_start_single(ecat_master_instance_t *inst)
     bool wkc_error = (wkc < inst->expected_wkc);
     bool noframe   = (wkc == EC_NOFRAME);
 
-    /* Mutate diag under status_mutex; snapshot for use after release. */
-    ecat_cycle_diag_t snap;
-    pthread_mutex_lock(&inst->status_mutex);
-
-    inst->diag.exchange_ns = exchange_ns;
-    inst->diag.total_ns    = exchange_ns;
+    /* Update diag lock-free.  Single-writer (PLC) + relaxed atomics; readers
+     * tolerate cross-field tearing because diagnostics never do cross-field
+     * arithmetic. */
+    atomic_store_explicit(&inst->diag.exchange_ns, exchange_ns, memory_order_relaxed);
+    atomic_store_explicit(&inst->diag.total_ns, exchange_ns, memory_order_relaxed);
 
     if (wkc_error) {
-        inst->diag.wkc_error_count++;
+        atomic_fetch_add_explicit(&inst->diag.wkc_error_count, 1,
+                                  memory_order_relaxed);
         if (noframe)
-            inst->diag.noframe_count++;
+            atomic_fetch_add_explicit(&inst->diag.noframe_count, 1,
+                                      memory_order_relaxed);
     }
 
-    inst->diag.cycle_count++;
-    inst->diag.avg_total_ns += ((int64_t)inst->diag.total_ns - inst->diag.avg_total_ns)
-                               / (int64_t)inst->diag.cycle_count;
-    inst->diag.avg_exchange_ns += ((int64_t)inst->diag.exchange_ns - inst->diag.avg_exchange_ns)
-                                  / (int64_t)inst->diag.cycle_count;
+    uint64_t cc = atomic_fetch_add_explicit(&inst->diag.cycle_count, 1,
+                                            memory_order_relaxed) + 1;
 
-    if (inst->diag.exchange_ns > inst->diag.max_exchange_ns)
-        inst->diag.max_exchange_ns = inst->diag.exchange_ns;
-    if (inst->diag.exchange_ns < inst->diag.min_exchange_ns)
-        inst->diag.min_exchange_ns = inst->diag.exchange_ns;
-    if (inst->diag.total_ns > inst->diag.max_total_ns)
-        inst->diag.max_total_ns = inst->diag.total_ns;
-    if (inst->diag.total_ns < inst->diag.min_total_ns)
-        inst->diag.min_total_ns = inst->diag.total_ns;
+    /* Welford running mean (replaced by EWMA in sub-phase 2.2) */
+    int64_t cur_avg_total = atomic_load_explicit(&inst->diag.avg_total_ns,
+                                                 memory_order_relaxed);
+    cur_avg_total += ((int64_t)exchange_ns - cur_avg_total) / (int64_t)cc;
+    atomic_store_explicit(&inst->diag.avg_total_ns, cur_avg_total,
+                          memory_order_relaxed);
 
-    snap = inst->diag;
+    int64_t cur_avg_exch = atomic_load_explicit(&inst->diag.avg_exchange_ns,
+                                                memory_order_relaxed);
+    cur_avg_exch += ((int64_t)exchange_ns - cur_avg_exch) / (int64_t)cc;
+    atomic_store_explicit(&inst->diag.avg_exchange_ns, cur_avg_exch,
+                          memory_order_relaxed);
 
-    pthread_mutex_unlock(&inst->status_mutex);
+    /* Min/max: single-writer, no CAS needed. */
+    uint64_t cur = atomic_load_explicit(&inst->diag.max_exchange_ns,
+                                        memory_order_relaxed);
+    if (exchange_ns > cur)
+        atomic_store_explicit(&inst->diag.max_exchange_ns, exchange_ns,
+                              memory_order_relaxed);
 
-    /* 4. WKC error tracking (no blocking SOEM calls, no diag access) */
+    cur = atomic_load_explicit(&inst->diag.min_exchange_ns,
+                               memory_order_relaxed);
+    if (exchange_ns < cur)
+        atomic_store_explicit(&inst->diag.min_exchange_ns, exchange_ns,
+                              memory_order_relaxed);
+
+    cur = atomic_load_explicit(&inst->diag.max_total_ns, memory_order_relaxed);
+    if (exchange_ns > cur)
+        atomic_store_explicit(&inst->diag.max_total_ns, exchange_ns,
+                              memory_order_relaxed);
+
+    cur = atomic_load_explicit(&inst->diag.min_total_ns, memory_order_relaxed);
+    if (exchange_ns < cur)
+        atomic_store_explicit(&inst->diag.min_total_ns, exchange_ns,
+                              memory_order_relaxed);
+
+    /* WKC error tracking (no blocking SOEM calls, no diag access) */
     if (wkc_error) {
         int consec = atomic_fetch_add(&inst->consecutive_wkc_errors, 1) + 1;
 
@@ -973,28 +1038,39 @@ static void cycle_start_single(ecat_master_instance_t *inst)
         atomic_store(&inst->consecutive_wkc_errors, 0);
     }
 
-    /* 5. Periodic diagnostic log (uses snapshot, no lock held). */
-    if ((snap.cycle_count % ECAT_DIAG_REPORT_INTERVAL) == 0 &&
-        snap.cycle_count > 0) {
-        uint64_t total_cycles = snap.cycle_count + snap.wkc_error_count;
+    /* Periodic diagnostic log: load values only when about to log. */
+    if ((cc % ECAT_DIAG_REPORT_INTERVAL) == 0 && cc > 0) {
+        uint64_t wkc_errors = atomic_load_explicit(&inst->diag.wkc_error_count,
+                                                   memory_order_relaxed);
+        uint64_t noframes = atomic_load_explicit(&inst->diag.noframe_count,
+                                                 memory_order_relaxed);
+        uint64_t min_total = atomic_load_explicit(&inst->diag.min_total_ns,
+                                                  memory_order_relaxed);
+        uint64_t max_total = atomic_load_explicit(&inst->diag.max_total_ns,
+                                                  memory_order_relaxed);
+        uint64_t min_exch = atomic_load_explicit(&inst->diag.min_exchange_ns,
+                                                 memory_order_relaxed);
+        uint64_t max_exch = atomic_load_explicit(&inst->diag.max_exchange_ns,
+                                                 memory_order_relaxed);
+        uint64_t total_cycles = cc + wkc_errors;
         plugin_logger_info(&g_logger,
             "Master '%s': Cycle stats (%llu total): avg=%lld us, min=%llu us, "
             "max=%llu us, exchange avg=%lld us, min=%llu us, max=%llu us",
             inst->name,
             (unsigned long long)total_cycles,
-            (long long)(snap.avg_total_ns / 1000),
-            (unsigned long long)(snap.min_total_ns / 1000),
-            (unsigned long long)(snap.max_total_ns / 1000),
-            (long long)(snap.avg_exchange_ns / 1000),
-            (unsigned long long)(snap.min_exchange_ns / 1000),
-            (unsigned long long)(snap.max_exchange_ns / 1000));
+            (long long)(cur_avg_total / 1000),
+            (unsigned long long)(min_total / 1000),
+            (unsigned long long)(max_total / 1000),
+            (long long)(cur_avg_exch / 1000),
+            (unsigned long long)(min_exch / 1000),
+            (unsigned long long)(max_exch / 1000));
         plugin_logger_info(&g_logger,
             "Master '%s': WKC errors: %llu total, %llu noframe, rate=%.1f%%",
             inst->name,
-            (unsigned long long)snap.wkc_error_count,
-            (unsigned long long)snap.noframe_count,
+            (unsigned long long)wkc_errors,
+            (unsigned long long)noframes,
             total_cycles > 0
-                ? (snap.wkc_error_count * 100.0 / total_cycles) : 0.0);
+                ? (wkc_errors * 100.0 / total_cycles) : 0.0);
     }
 }
 
@@ -1067,9 +1143,7 @@ int init(void *args)
         ecat_master_instance_t *inst = &g_masters[i];
 
         memset(&inst->status_snapshot, 0, sizeof(inst->status_snapshot));
-        memset(&inst->diag, 0, sizeof(inst->diag));
-        inst->diag.min_exchange_ns = UINT64_MAX;
-        inst->diag.min_total_ns = UINT64_MAX;
+        diag_reset(&inst->diag);
         if (ecat_mutex_init_pi(&inst->status_mutex) != 0) {
             plugin_logger_error(&g_logger,
                 "Master[%d] '%s': Failed to initialize status mutex", i, inst->name);

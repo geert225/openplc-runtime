@@ -399,23 +399,28 @@ typedef struct {
 /**
  * @brief Per-cycle timing diagnostics
  *
- * Updated by cycle_start() in the PLC thread.
+ * Updated lock-free by cycle_start_single() in the PLC thread.
+ * Single-writer (PLC), multi-reader (monitor thread, execute_command
+ * handlers).  All fields are _Atomic so the writer never holds a mutex
+ * on the hot path; readers tolerate cross-field tearing because these
+ * are diagnostics, not values used in cross-field arithmetic.
+ *
  * Uses Welford's incremental algorithm for moving averages.
  */
 typedef struct {
-    uint64_t cycle_count;         /* total cycles executed              */
-    uint64_t wkc_error_count;     /* total WKC errors (wkc < expected)  */
-    uint64_t noframe_count;       /* total EC_NOFRAME (-1) errors       */
-    uint64_t exchange_ns;         /* last send+receive duration (ns)    */
-    uint64_t io_read_ns;          /* last read_inputs duration (ns)     */
-    uint64_t io_write_ns;         /* last write_outputs duration (ns)   */
-    uint64_t total_ns;            /* last full cycle total (ns)         */
-    uint64_t max_exchange_ns;     /* worst-case send+receive            */
-    uint64_t max_total_ns;        /* worst-case total                   */
-    int64_t  avg_total_ns;        /* incremental moving average (Welford) */
-    int64_t  avg_exchange_ns;     /* incremental moving average (Welford) */
-    uint64_t min_exchange_ns;     /* best-case send+receive             */
-    uint64_t min_total_ns;        /* best-case total                    */
+    _Atomic(uint64_t) cycle_count;       /* total cycles executed              */
+    _Atomic(uint64_t) wkc_error_count;   /* total WKC errors (wkc < expected)  */
+    _Atomic(uint64_t) noframe_count;     /* total EC_NOFRAME (-1) errors       */
+    _Atomic(uint64_t) exchange_ns;       /* last send+receive duration (ns)    */
+    _Atomic(uint64_t) io_read_ns;        /* last read_inputs duration (ns)     */
+    _Atomic(uint64_t) io_write_ns;       /* last write_outputs duration (ns)   */
+    _Atomic(uint64_t) total_ns;          /* last full cycle total (ns)         */
+    _Atomic(uint64_t) max_exchange_ns;   /* worst-case send+receive            */
+    _Atomic(uint64_t) max_total_ns;      /* worst-case total                   */
+    _Atomic(int64_t)  avg_total_ns;      /* incremental moving average (Welford) */
+    _Atomic(int64_t)  avg_exchange_ns;   /* incremental moving average (Welford) */
+    _Atomic(uint64_t) min_exchange_ns;   /* best-case send+receive             */
+    _Atomic(uint64_t) min_total_ns;      /* best-case total                    */
 } ecat_cycle_diag_t;
 
 /*
