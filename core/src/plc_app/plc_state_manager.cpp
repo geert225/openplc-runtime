@@ -159,10 +159,8 @@ static void *plc_task_thread(void *arg)
         ctx->holding_mutex = 1;
         pthread_mutex_lock(image_tables_mutex());
 
-        /* Fastest task drives the housekeeping window — same calls and
-         * same order as the MatIEC-era single-thread runtime, just
-         * anchored on whichever task ticks fastest. Other task threads
-         * skip the housekeeping and just run their bodies. */
+        /* Fastest task drives the per-cycle housekeeping window. Other
+         * task threads skip the housekeeping and just run their bodies. */
         if (ctx->is_fastest_task)
         {
             scan_cycle_time_start();
@@ -225,10 +223,9 @@ void *plc_cycle_thread(void *arg)
         log_error("PLC State: ERROR (failed to resolve .so symbols)");
         return NULL;
     }
-    ext_config_init__();
 
-    /* Bind located variables — replaces the MatIEC-era glueVars/setBufferPointers.
-     * Then fill any unbound image-table slots with backing buffers. */
+    /* Bind located variables to image-table slots, then fill any
+     * unbound slots with private backing buffers. */
     pthread_mutex_t *itm = image_tables_mutex();
     pthread_mutex_lock(itm);
     image_tables_bind_located_vars();

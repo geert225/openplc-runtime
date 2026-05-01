@@ -8,10 +8,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
-// Stub: ext_common_ticktime__ (utils.c) -- the runtime publishes the PLC
-// scan tick interval here. Plugin drivers (plugin_driver.c) read it during
-// arg construction, so a NULL stub is enough for the unit tests.
-unsigned long long *ext_common_ticktime__ = NULL;
+// Stub: base_tick_ns (utils.c) -- the runtime stores the PLC scan tick
+// interval here (GCD of declared task intervals). Plugin drivers
+// (plugin_driver.c) read it during arg construction, so a default
+// stub value is enough for the unit tests.
+uint64_t base_tick_ns = 0;
 
 // Stub implementations for external buffer variables (image_tables.c)
 IEC_BOOL *bool_input[BUFFER_SIZE][8];

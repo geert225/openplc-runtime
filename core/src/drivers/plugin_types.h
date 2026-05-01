@@ -114,8 +114,10 @@ typedef struct
     plugin_journal_write_dint_func_t journal_write_dint;
     plugin_journal_write_lint_func_t journal_write_lint;
 
-    /* PLC base tick time in nanoseconds (GCD of all IEC task intervals) */
-    unsigned long long common_ticktime_ns;
+    /* PLC base tick time in nanoseconds (GCD of all IEC task intervals).
+     * Populated when the runtime initializes the plugin; may be 0 if
+     * symbols are not yet resolved (plugin must guard against zero). */
+    unsigned long long base_tick_ns;
 } plugin_runtime_args_t;
 
 #endif /* PLUGIN_TYPES_H */

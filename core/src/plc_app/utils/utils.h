@@ -14,9 +14,18 @@
 extern "C" {
 #endif
 
-extern unsigned long long *ext_common_ticktime__;
-extern unsigned long tick__;
-extern char *ext_plc_program_md5;
+/* Base tick interval in nanoseconds — GCD of declared task intervals.
+ * Computed runtime-side after the .so loads (see image_tables.cpp's
+ * compute_base_tick_from_config). Default 20 ms before computation. */
+extern uint64_t base_tick_ns;
+
+/* Scan counter — incremented once per scan cycle by plc_run_io_cycle_post.
+ * Reported in DEBUG_GET / DEBUG_GET_LIST responses so the editor can
+ * detect cycle boundaries. */
+extern unsigned long scan_counter;
+
+/* Project MD5 string (resolved from the .so at load time). */
+extern char *ext_strucpp_program_md5;
 
 
 /**

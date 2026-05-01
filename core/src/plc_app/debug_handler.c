@@ -196,7 +196,7 @@ static void debugGetTrace(uint8_t *frame, size_t *frame_len, size_t length)
     frame[0] = MB_FC_DEBUG_GET;
     frame[1] = MB_DEBUG_SUCCESS;
     write_u16_be(&frame[2], last_elem);
-    write_u32_be(&frame[4], (uint32_t)tick__);
+    write_u32_be(&frame[4], (uint32_t)scan_counter);
     write_u16_be(&frame[8], (uint16_t)response_sz);
     *frame_len = HDR + response_sz;
 }
@@ -271,7 +271,7 @@ static void debugGetTraceList(uint8_t *frame, size_t *frame_len, size_t length)
     frame[0] = MB_FC_DEBUG_GET_LIST;
     frame[1] = MB_DEBUG_SUCCESS;
     write_u16_be(&frame[2], last_req_idx);
-    write_u32_be(&frame[4], (uint32_t)tick__);
+    write_u32_be(&frame[4], (uint32_t)scan_counter);
     write_u16_be(&frame[8], (uint16_t)response_sz);
     *frame_len = HDR + response_sz;
 }
@@ -279,7 +279,7 @@ static void debugGetTraceList(uint8_t *frame, size_t *frame_len, size_t length)
 /* FC 0x45 — DEBUG_GET_MD5 (with endianness probe echo) */
 static void debugGetMd5(uint8_t *frame, size_t *frame_len, size_t length)
 {
-    if (length < 3 || ext_plc_program_md5 == NULL)
+    if (length < 3 || ext_strucpp_program_md5 == NULL)
     {
         respond_short(frame, frame_len, MB_FC_DEBUG_GET_MD5, MB_DEBUG_ERROR_NOT_LOADED);
         return;
@@ -292,9 +292,9 @@ static void debugGetMd5(uint8_t *frame, size_t *frame_len, size_t length)
     frame[1] = MB_DEBUG_SUCCESS;
 
     size_t pos = 2;
-    for (size_t i = 0; ext_plc_program_md5[i] != '\0' && pos < MAX_DEBUG_FRAME - 2; ++i)
+    for (size_t i = 0; ext_strucpp_program_md5[i] != '\0' && pos < MAX_DEBUG_FRAME - 2; ++i)
     {
-        frame[pos++] = (uint8_t)ext_plc_program_md5[i];
+        frame[pos++] = (uint8_t)ext_strucpp_program_md5[i];
     }
     if (pos + 2 <= MAX_DEBUG_FRAME)
     {

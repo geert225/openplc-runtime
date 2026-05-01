@@ -2,8 +2,7 @@
 //                    around the fastest IEC task's body.
 //
 // Decoupled from plc_state_manager.cpp so the housekeeping is in one
-// place — same call list the MatIEC-era single-thread runtime made
-// once per scan.
+// place. Both halves run inside the image-tables critical section.
 
 #include <atomic>
 #include <ctime>
@@ -28,8 +27,8 @@ extern "C" void plc_run_io_cycle_pre(void)
 
 extern "C" void plc_run_io_cycle_post(void)
 {
-    if (ext_updateTime) ext_updateTime();
+    if (ext_strucpp_advance_time) ext_strucpp_advance_time(base_tick_ns);
     if (plugin_driver) plugin_driver_cycle_end(plugin_driver);
     plc_heartbeat.store((long)time(nullptr));
-    ++tick__;
+    ++scan_counter;
 }

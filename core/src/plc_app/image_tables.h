@@ -48,14 +48,13 @@ extern "C"
     /* -------------------------------------------------------------------------
      * Resolved .so symbols (populated by symbols_init).
      *
-     * Lifecycle / time. config_init__ and updateTime are kept for symmetry
-     * with the strucpp shim's exports; common_ticktime__ and plc_program_md5
-     * are read-only data symbols carried over from MatIEC era for
-     * informational purposes (scan_cycle_manager + debug PDU).
+     * strucpp_advance_time is called once per scan cycle by
+     * plc_run_io_cycle_post; it bumps the per-.so __CURRENT_TIME_NS by the
+     * runtime-supplied tick. base_tick_ns is owned runtime-side (utils.c)
+     * and computed in symbols_init by walking the loaded configuration.
      * --------------------------------------------------------------------- */
 
-    extern void (*ext_config_init__)(void);
-    extern void (*ext_updateTime)(void);
+    extern void (*ext_strucpp_advance_time)(uint64_t tick_ns);
 
     /* Hierarchical debug PDU shims (defined inside the .so by
      * debug_dispatch.hpp under STRUCPP_V4_DEBUG_EXPORTS_DEFINE). */

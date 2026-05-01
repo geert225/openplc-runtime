@@ -43,7 +43,7 @@ void scan_cycle_time_start(void)
     if (plc_timing_stats.scan_count == 0)
     {
         // Ignore full calculations for the first cycle
-        expected_start_us = now_us + *ext_common_ticktime__ / 1000; // Convert ns to us
+        expected_start_us = now_us + base_tick_ns / 1000; // Convert ns to us
         last_start_us     = now_us;
         plc_timing_stats.scan_count++;
 
@@ -78,7 +78,7 @@ void scan_cycle_time_start(void)
         (latency_us - plc_timing_stats.cycle_latency_avg) / plc_timing_stats.scan_count;
 
     last_start_us = now_us;
-    expected_start_us += *ext_common_ticktime__ / 1000; // Convert ns to us
+    expected_start_us += base_tick_ns / 1000; // Convert ns to us
 
     plc_timing_stats.scan_count++;
 

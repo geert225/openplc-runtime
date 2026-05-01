@@ -21,9 +21,11 @@
 #define HAS_REALTIME_FEATURES 0
 #endif
 
-unsigned long long *ext_common_ticktime__ = NULL;
-unsigned long tick__                      = 0;
-char *ext_plc_program_md5                 = NULL;
+/* Default 20 ms; overridden by compute_base_tick_from_config() once the
+ * .so is loaded and g_config is reachable. */
+uint64_t base_tick_ns         = 20000000ULL;
+unsigned long scan_counter    = 0;
+char *ext_strucpp_program_md5 = NULL;
 
 void normalize_timespec(struct timespec *ts)
 {

@@ -678,8 +678,10 @@ void *generate_structured_args_with_driver(plugin_type_t type, plugin_driver_t *
     args->journal_write_dint = plugin_journal_write_dint;
     args->journal_write_lint = plugin_journal_write_lint;
 
-    // PLC base tick time
-    args->common_ticktime_ns = ext_common_ticktime__ ? *ext_common_ticktime__ : 0;
+    // PLC base tick time. Runtime owns base_tick_ns; on first plugin init
+    // (before symbols_init) it carries the 20 ms default, so plugins must
+    // guard against the value being smaller than their needed resolution.
+    args->base_tick_ns = base_tick_ns;
 
     // printf("[PLUGIN]: Runtime args initialized:\n");
     // printf("[PLUGIN]:   buffer_size = %d\n", args->buffer_size);

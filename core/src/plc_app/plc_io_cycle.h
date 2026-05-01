@@ -16,7 +16,7 @@ extern "C" {
  *
  *   plc_run_io_cycle_post()  — runs AFTER the task body
  *     advance __CURRENT_TIME, fire plugin cycle_end, update heartbeat,
- *     increment tick__
+ *     increment scan_counter
  *
  * Both are called inside the image-tables critical section. The
  * fastest task's thread (Phase 6 picks it; ctx->is_fastest_task) calls

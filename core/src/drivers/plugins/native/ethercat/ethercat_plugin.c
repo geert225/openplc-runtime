@@ -1091,17 +1091,17 @@ int init(void *args)
          * A divisor of 1 means "execute every cycle" (the default). */
         inst->tick_divisor = 1;
         if (inst->config.master.task_cycle_time_us > 0 &&
-            g_runtime_args.common_ticktime_ns > 0) {
+            g_runtime_args.base_tick_ns > 0) {
             unsigned long long task_ns =
                 (unsigned long long)inst->config.master.task_cycle_time_us * 1000ULL;
-            unsigned int divisor = (unsigned int)(task_ns / g_runtime_args.common_ticktime_ns);
+            unsigned int divisor = (unsigned int)(task_ns / g_runtime_args.base_tick_ns);
             if (divisor > 1)
                 inst->tick_divisor = divisor;
             plugin_logger_info(&g_logger,
                 "Master[%d] '%s': task=%s, task_cycle=%d us, base_tick=%llu ns, divisor=%u",
                 i, inst->name, inst->config.master.task_name,
                 inst->config.master.task_cycle_time_us,
-                (unsigned long long)g_runtime_args.common_ticktime_ns,
+                (unsigned long long)g_runtime_args.base_tick_ns,
                 inst->tick_divisor);
         }
 

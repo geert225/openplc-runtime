@@ -65,8 +65,7 @@ namespace {
 // ---------------------------------------------------------------------------
 // Resolved .so symbols
 // ---------------------------------------------------------------------------
-void (*ext_config_init__)(void) = nullptr;
-void (*ext_updateTime)(void)    = nullptr;
+void (*ext_strucpp_advance_time)(uint64_t) = nullptr;
 
 uint8_t  (*ext_strucpp_debug_array_count)(void)                          = nullptr;
 uint16_t (*ext_strucpp_debug_elem_count) (uint8_t)                       = nullptr;
@@ -125,13 +124,42 @@ extern "C" void *strucpp_config_handle(void)
     return g_config_ptr;
 }
 
+// Walk the loaded configuration's tasks and store the GCD of declared
+// intervals into base_tick_ns. Falls back to the 20 ms default if the
+// configuration has no tasks (defensive — symbols_init returns success
+// only after g_config_ptr is non-null).
+static uint64_t gcd_u64(uint64_t a, uint64_t b)
+{
+    while (b)
+    {
+        uint64_t t = b;
+        b = a % b;
+        a = t;
+    }
+    return a;
+}
+
+static void compute_base_tick_from_config(strucpp::ConfigurationInstance *cfg)
+{
+    uint64_t gcd_ns = 0;
+    auto *resources = cfg->get_resources();
+    for (size_t r = 0; r < cfg->get_resource_count(); ++r)
+    {
+        for (size_t t = 0; t < resources[r].task_count; ++t)
+        {
+            uint64_t ivl = (uint64_t)resources[r].tasks[t].interval_ns;
+            if (ivl == 0) ivl = 20000000ULL;
+            gcd_ns = (gcd_ns == 0) ? ivl : gcd_u64(gcd_ns, ivl);
+        }
+    }
+    if (gcd_ns != 0) base_tick_ns = gcd_ns;
+}
+
 extern "C" int symbols_init(PluginManager *pm)
 {
-    *(void **)&ext_config_init__ = resolve(pm, "config_init__", true);
-    *(void **)&ext_updateTime    = resolve(pm, "updateTime",    true);
+    *(void **)&ext_strucpp_advance_time = resolve(pm, "strucpp_advance_time", true);
 
-    *(void **)&ext_common_ticktime__ = plugin_manager_get_symbol(pm, "common_ticktime__");
-    *(void **)&ext_plc_program_md5   = plugin_manager_get_symbol(pm, "plc_program_md5");
+    *(void **)&ext_strucpp_program_md5 = plugin_manager_get_symbol(pm, "strucpp_program_md5");
 
     *(void **)&ext_strucpp_get_config = resolve(pm, "strucpp_get_config", true);
     *(void **)&ext_strucpp_set_locks  = resolve(pm, "strucpp_set_locks",  true);
@@ -145,7 +173,7 @@ extern "C" int symbols_init(PluginManager *pm)
     *(void **)&ext_strucpp_debug_set         = resolve(pm, "strucpp_debug_set",         true);
     *(void **)&ext_strucpp_debug_read        = resolve(pm, "strucpp_debug_read",        true);
 
-    if (!ext_config_init__ || !ext_updateTime ||
+    if (!ext_strucpp_advance_time ||
         !ext_strucpp_get_config || !ext_strucpp_set_locks ||
         !ext_strucpp_get_located_vars || !ext_strucpp_get_located_var_count ||
         !ext_strucpp_debug_array_count || !ext_strucpp_debug_elem_count ||
@@ -175,6 +203,10 @@ extern "C" int symbols_init(PluginManager *pm)
         log_error("[strucpp] strucpp_get_config returned NULL");
         return -1;
     }
+
+    /* Compute base_tick_ns from the loaded configuration. Replaces the
+     * old config_init__ shim entry — runtime owns the tick now. */
+    compute_base_tick_from_config(g_config_ptr);
 
     void (*ext_python_loader_set_loggers)(void (*)(const char *, ...),
                                           void (*)(const char *, ...));
@@ -373,11 +405,9 @@ void image_tables_clear_null_pointers(void)
     std::memset(lint_memory,  0, sizeof(lint_memory));
     std::memset(bool_memory,  0, sizeof(bool_memory));
 
-    ext_config_init__ = nullptr;
-    ext_updateTime    = nullptr;
-    ext_common_ticktime__ = nullptr;
-    ext_plc_program_md5   = nullptr;
-    ext_strucpp_get_config = nullptr;
+    ext_strucpp_advance_time = nullptr;
+    ext_strucpp_program_md5  = nullptr;
+    ext_strucpp_get_config   = nullptr;
     ext_strucpp_set_locks  = nullptr;
     ext_strucpp_debug_array_count = nullptr;
     ext_strucpp_debug_elem_count  = nullptr;
