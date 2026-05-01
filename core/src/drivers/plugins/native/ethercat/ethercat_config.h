@@ -386,6 +386,33 @@ typedef struct {
 #define ECAT_AVG_EWMA_SHIFT 5
 
 /**
+ * @brief Per-interface external state captured by ecat_iface_state_apply().
+ *
+ * Combines NIC-tuning save/restore (ethtool coalescing + offloads) and
+ * IP-stack isolation (iptables INPUT DROP, IPv6 sysctl) into a single
+ * struct, embedded in each ecat_master_instance_t.  See
+ * ethercat_iface_state.h for the apply/revert API.
+ */
+typedef struct {
+    char iface[ECAT_IFNAME_MAX];
+
+    /* IP-stack isolation */
+    bool ipv6_disabled_by_us;
+    bool iptables_added;
+
+    /* NIC tuning -- ethtool -C (coalescing) */
+    bool coalescing_saved;
+    int  rx_usecs;
+    int  tx_usecs;
+
+    /* NIC tuning -- ethtool -K (offloads) */
+    bool offloads_saved;
+    bool gro;
+    bool gso;
+    bool tso;
+} ecat_iface_state_t;
+
+/**
  * @brief Per-cycle timing diagnostics
  *
  * Updated lock-free by cycle_start_single() in the PLC thread.
@@ -575,9 +602,11 @@ typedef struct {
     _Atomic(uint64_t) exchange_skips;
 #endif
 
-    /* Iface isolation: true means we applied this setting and must revert. */
-    bool iface_iptables_added;
-    bool iface_ipv6_disabled_by_us;
+    /* Per-iface external state (NIC tuning + IP-stack isolation).
+     * Populated by ecat_iface_state_apply(); consumed by
+     * ecat_iface_state_revert().  Includes its own iface name copy so
+     * revert can run after config has been freed. */
+    ecat_iface_state_t iface_state;
 } ecat_master_instance_t;
 
 /**
