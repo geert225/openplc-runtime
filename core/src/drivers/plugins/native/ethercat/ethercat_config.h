@@ -366,30 +366,6 @@ typedef struct {
     uint32_t error_count;
 } ecat_slave_status_t;
 
-/**
- * @brief Master-level status snapshot for monitoring and diagnostics
- *
- * Updated periodically by the PLC scan cycle under g_status_mutex.
- * Read by execute_command handlers for the "status" and "diagnostics" commands.
- */
-typedef struct {
-    ecat_plugin_state_t plugin_state;
-    int                 slave_count;
-    ecat_slave_status_t slaves[ECAT_MAX_SLAVES];
-    uint64_t            cycle_count;
-    uint64_t            wkc_error_count;
-    uint64_t            noframe_count;
-    uint64_t            avg_cycle_us;
-    uint64_t            min_cycle_us;
-    uint64_t            max_cycle_us;
-    uint64_t            min_exchange_us;
-    uint64_t            max_exchange_us;
-    int                 consecutive_wkc_errors;
-    int                 recovery_attempts;
-    int                 expected_wkc;
-    uint64_t            exchange_skips;
-} ecat_master_status_t;
-
 /*
  * =============================================================================
  * Cycle Diagnostics
@@ -569,9 +545,20 @@ typedef struct {
     uint64_t cycle_counter;
     unsigned int tick_divisor;
 
-    /* Status snapshot for queries via execute_command */
-    ecat_master_status_t status_snapshot;
-    pthread_mutex_t status_mutex;
+    /* Per-slave snapshot for queries via execute_command.
+     *
+     * The slave AL state lives in ecx_context.slavelist[], which is mutated
+     * by the monitor thread during recovery.  Letting the JSON handlers read
+     * slavelist[] directly would force them to take soem_lock, which the PLC
+     * also tries to take on every cycle -- so each query would risk skipping
+     * a PLC cycle.
+     *
+     * Instead the monitor publishes a small snapshot of the slave fields it
+     * needs into slaves_snapshot[] under slaves_mutex (PRIO_INHERIT).  JSON
+     * handlers take that mutex briefly; the PLC never touches it. */
+    ecat_slave_status_t slaves_snapshot[ECAT_MAX_SLAVES];
+    int                 slaves_snapshot_count;
+    pthread_mutex_t     slaves_mutex;
 
 #if ECAT_ENABLE_MONITOR_THREAD
     /* Monitor thread — per-instance.

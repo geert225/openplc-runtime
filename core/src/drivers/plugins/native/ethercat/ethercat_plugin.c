@@ -487,37 +487,33 @@ static int g_master_count = 0;
 
 /*
  * =============================================================================
- * Per-Instance Status Snapshot
+ * Per-Instance Slaves Snapshot
  * =============================================================================
  */
 
 /**
- * @brief Build and publish a status snapshot from current state
+ * @brief Build and publish a snapshot of per-slave AL state.
  *
- * Called by the monitor thread (or from start_loop/stop_loop).
- * Builds the snapshot on the stack first, then publishes it under the
- * status_mutex with a single memcpy. The PLC thread holds status_mutex
- * only briefly while updating diag counters, so contention is minimal.
+ * Reads from ecx_context.slavelist[] and config.slaves[] into a stack
+ * array, then memcpy-publishes under slaves_mutex.  The caller must
+ * hold soem_lock when calling this (the read of slavelist[] races with
+ * monitor recovery otherwise).
+ *
+ * Counters/timing are NOT cached here -- consumers (build_master_*_json)
+ * read them lock-free via atomic_load directly from inst->diag.
  */
-static void update_status_snapshot(ecat_master_instance_t *inst)
+static void publish_slaves_snapshot(ecat_master_instance_t *inst)
 {
-    ecat_master_status_t snap;
-    memset(&snap, 0, sizeof(snap));
+    ecat_slave_status_t local[ECAT_MAX_SLAVES];
+    memset(local, 0, sizeof(local));
 
-    snap.plugin_state = (ecat_plugin_state_t)atomic_load(&inst->plugin_state);
-    snap.slave_count = inst->config.slave_count;
-    snap.expected_wkc = inst->expected_wkc;
-    snap.consecutive_wkc_errors = atomic_load(&inst->consecutive_wkc_errors);
-    snap.recovery_attempts = atomic_load(&inst->recovery_attempts);
-#if ECAT_ENABLE_MONITOR_THREAD
-    snap.exchange_skips = atomic_load(&inst->exchange_skips);
-#endif
+    int n = inst->config.slave_count;
+    if (n > ECAT_MAX_SLAVES)
+        n = ECAT_MAX_SLAVES;
 
-    /* Per-slave status (reads SOEM slavelist; safe because the monitor
-     * only calls this while holding cooperative SOEM access). */
-    for (int i = 0; i < inst->config.slave_count && i < ECAT_MAX_SLAVES; i++) {
+    for (int i = 0; i < n; i++) {
         const ecat_slave_t *cfg = &inst->config.slaves[i];
-        ecat_slave_status_t *ss = &snap.slaves[i];
+        ecat_slave_status_t *ss = &local[i];
 
         ss->position = cfg->position;
         strncpy(ss->name, cfg->name, ECAT_MAX_NAME_LEN - 1);
@@ -530,33 +526,10 @@ static void update_status_snapshot(ecat_master_instance_t *inst)
         }
     }
 
-    /* Read diag lock-free via relaxed atomic loads.  Cross-field tearing
-     * is acceptable for diagnostics.  Pre-cycle min sentinels (UINT64_MAX)
-     * are clamped to 0 so consumers always see plausible values. */
-    snap.cycle_count = atomic_load_explicit(&inst->diag.cycle_count,
-                                            memory_order_relaxed);
-    snap.wkc_error_count = atomic_load_explicit(&inst->diag.wkc_error_count,
-                                                memory_order_relaxed);
-    snap.noframe_count = atomic_load_explicit(&inst->diag.noframe_count,
-                                              memory_order_relaxed);
-    snap.avg_cycle_us = atomic_load_explicit(&inst->diag.avg_total_ns,
-                                             memory_order_relaxed) / 1000;
-    snap.max_cycle_us = atomic_load_explicit(&inst->diag.max_total_ns,
-                                             memory_order_relaxed) / 1000;
-    snap.max_exchange_us = atomic_load_explicit(&inst->diag.max_exchange_ns,
-                                                memory_order_relaxed) / 1000;
-    uint64_t min_total = atomic_load_explicit(&inst->diag.min_total_ns,
-                                              memory_order_relaxed);
-    snap.min_cycle_us = (min_total == UINT64_MAX) ? 0 : min_total / 1000;
-    uint64_t min_exch = atomic_load_explicit(&inst->diag.min_exchange_ns,
-                                             memory_order_relaxed);
-    snap.min_exchange_us = (min_exch == UINT64_MAX) ? 0 : min_exch / 1000;
-
-    /* Publish: status_mutex still protects the public snapshot.
-     * status_mutex is removed in sub-phase 2.3. */
-    pthread_mutex_lock(&inst->status_mutex);
-    memcpy(&inst->status_snapshot, &snap, sizeof(snap));
-    pthread_mutex_unlock(&inst->status_mutex);
+    pthread_mutex_lock(&inst->slaves_mutex);
+    memcpy(inst->slaves_snapshot, local, sizeof(local));
+    inst->slaves_snapshot_count = n;
+    pthread_mutex_unlock(&inst->slaves_mutex);
 }
 
 #if ECAT_ENABLE_MONITOR_THREAD
@@ -651,16 +624,18 @@ static void *ecat_monitor_thread(void *arg)
         int state = atomic_load(&inst->plugin_state);
 
         if (state == ECAT_STATE_OPERATIONAL) {
-            /* Periodic state check */
+            /* Periodic state check.  Publish slaves snapshot while still
+             * holding the lock, so the read of slavelist[] is consistent. */
             pthread_mutex_lock(&inst->soem_lock);
             ecat_master_read_states(inst);
+            publish_slaves_snapshot(inst);
             pthread_mutex_unlock(&inst->soem_lock);
-            update_status_snapshot(inst);
 
         } else if (state == ECAT_STATE_RECOVERING) {
             /* Recovery holds the lock for longer; PLC will skip cycles. */
             pthread_mutex_lock(&inst->soem_lock);
             int result = attempt_recovery(inst);
+            publish_slaves_snapshot(inst);
             pthread_mutex_unlock(&inst->soem_lock);
 
             if (result == 1) {
@@ -674,7 +649,6 @@ static void *ecat_monitor_thread(void *arg)
                     "Master '%s': entered ERROR state after max recovery attempts",
                     inst->name);
             }
-            update_status_snapshot(inst);
         }
 
         /* Sleep for the monitor interval */
@@ -794,7 +768,10 @@ static int start_single_master(ecat_master_instance_t *inst)
     /* Send one initial exchange to populate the IOmap with slave data */
     ecat_master_exchange_processdata(inst, inst->receive_timeout_us);
 
-    update_status_snapshot(inst);
+    /* Initial publish before the monitor thread starts.  No concurrency
+     * yet: PLC has not entered cycle_start_single and the monitor does
+     * not exist. */
+    publish_slaves_snapshot(inst);
 
 #if ECAT_ENABLE_MONITOR_THREAD
     /* Start background monitor thread for state checks and recovery.
@@ -891,7 +868,13 @@ static void stop_single_master(ecat_master_instance_t *inst)
     ecat_master_close(inst, &g_logger);
     atomic_store(&inst->plugin_state, ECAT_STATE_STOPPED);
 
-    update_status_snapshot(inst);
+    /* Reset slaves snapshot: the bus is closed, AL states from the prior
+     * run are no longer meaningful.  Monitor is already joined. */
+    pthread_mutex_lock(&inst->slaves_mutex);
+    memset(inst->slaves_snapshot, 0, sizeof(inst->slaves_snapshot));
+    inst->slaves_snapshot_count = 0;
+    pthread_mutex_unlock(&inst->slaves_mutex);
+
     plugin_logger_info(&g_logger,
         "Master '%s': [state: STOPPED] EtherCAT master stopped", inst->name);
 }
@@ -1146,14 +1129,15 @@ int init(void *args)
     for (int i = 0; i < g_master_count; i++) {
         ecat_master_instance_t *inst = &g_masters[i];
 
-        memset(&inst->status_snapshot, 0, sizeof(inst->status_snapshot));
+        memset(inst->slaves_snapshot, 0, sizeof(inst->slaves_snapshot));
+        inst->slaves_snapshot_count = 0;
         diag_reset(&inst->diag);
-        if (ecat_mutex_init_pi(&inst->status_mutex) != 0) {
+        if (ecat_mutex_init_pi(&inst->slaves_mutex) != 0) {
             plugin_logger_error(&g_logger,
-                "Master[%d] '%s': Failed to initialize status mutex", i, inst->name);
+                "Master[%d] '%s': Failed to initialize slaves mutex", i, inst->name);
             /* Destroy mutexes that were already initialized */
             for (int j = 0; j < i; j++) {
-                pthread_mutex_destroy(&g_masters[j].status_mutex);
+                pthread_mutex_destroy(&g_masters[j].slaves_mutex);
 #if ECAT_ENABLE_MONITOR_THREAD
                 pthread_mutex_destroy(&g_masters[j].soem_lock);
 #endif
@@ -1167,9 +1151,9 @@ int init(void *args)
         if (ecat_mutex_init_pi(&inst->soem_lock) != 0) {
             plugin_logger_error(&g_logger,
                 "Master[%d] '%s': Failed to initialize SOEM lock", i, inst->name);
-            pthread_mutex_destroy(&inst->status_mutex);
+            pthread_mutex_destroy(&inst->slaves_mutex);
             for (int j = 0; j < i; j++) {
-                pthread_mutex_destroy(&g_masters[j].status_mutex);
+                pthread_mutex_destroy(&g_masters[j].slaves_mutex);
                 pthread_mutex_destroy(&g_masters[j].soem_lock);
             }
             free(g_masters);
@@ -1383,7 +1367,7 @@ void cleanup(void)
         if (state != ECAT_STATE_STOPPED && state != ECAT_STATE_IDLE) {
             stop_single_master(inst);
         }
-        pthread_mutex_destroy(&inst->status_mutex);
+        pthread_mutex_destroy(&inst->slaves_mutex);
 #if ECAT_ENABLE_MONITOR_THREAD
         pthread_mutex_destroy(&inst->soem_lock);
 #endif
@@ -1695,31 +1679,78 @@ static int handle_test_command(cJSON *root, char *response, size_t response_size
 }
 
 /**
- * @brief Build a JSON object for a single master's status snapshot
+ * @brief Local view of cycle diag values, already converted ns -> us.
+ *
+ * Used only by the JSON builders to avoid repeating the same atomic_load
+ * sequence twice.  Cross-field tearing is acceptable for diagnostics.
  */
-static cJSON *build_master_status_json(ecat_master_instance_t *inst)
+typedef struct {
+    uint64_t cycle_count;
+    uint64_t wkc_error_count;
+    uint64_t noframe_count;
+    uint64_t avg_cycle_us;
+    uint64_t min_cycle_us;
+    uint64_t max_cycle_us;
+    uint64_t min_exchange_us;
+    uint64_t max_exchange_us;
+} ecat_diag_view_t;
+
+static void load_diag_view(const ecat_master_instance_t *inst,
+                           ecat_diag_view_t *out)
 {
-    ecat_master_status_t snap;
+    out->cycle_count = atomic_load_explicit(&inst->diag.cycle_count,
+                                            memory_order_relaxed);
+    out->wkc_error_count = atomic_load_explicit(&inst->diag.wkc_error_count,
+                                                memory_order_relaxed);
+    out->noframe_count = atomic_load_explicit(&inst->diag.noframe_count,
+                                              memory_order_relaxed);
 
-    pthread_mutex_lock(&inst->status_mutex);
-    memcpy(&snap, &inst->status_snapshot, sizeof(snap));
-    pthread_mutex_unlock(&inst->status_mutex);
+    int64_t avg_t = atomic_load_explicit(&inst->diag.avg_total_ns,
+                                         memory_order_relaxed);
+    out->avg_cycle_us = (uint64_t)(avg_t / 1000);
 
-    cJSON *master = cJSON_CreateObject();
-    cJSON_AddStringToObject(master, "name", inst->name);
-    cJSON_AddStringToObject(master, "plugin_state",
-                            ecat_state_to_string(snap.plugin_state));
-    cJSON_AddNumberToObject(master, "slave_count", snap.slave_count);
-    cJSON_AddNumberToObject(master, "expected_wkc", snap.expected_wkc);
+    uint64_t min_t = atomic_load_explicit(&inst->diag.min_total_ns,
+                                          memory_order_relaxed);
+    out->min_cycle_us = (min_t == UINT64_MAX) ? 0 : min_t / 1000;
+    out->max_cycle_us = atomic_load_explicit(&inst->diag.max_total_ns,
+                                             memory_order_relaxed) / 1000;
 
-    /* Per-slave status */
+    uint64_t min_e = atomic_load_explicit(&inst->diag.min_exchange_ns,
+                                          memory_order_relaxed);
+    out->min_exchange_us = (min_e == UINT64_MAX) ? 0 : min_e / 1000;
+    out->max_exchange_us = atomic_load_explicit(&inst->diag.max_exchange_ns,
+                                                memory_order_relaxed) / 1000;
+}
+
+/**
+ * @brief Add a "slaves" JSON array using the published slaves_snapshot.
+ *
+ * @param diagnostics Include extra fields (al_state_raw) when true.
+ */
+static void add_slaves_json(ecat_master_instance_t *inst, cJSON *master,
+                            int *out_count, bool diagnostics)
+{
+    ecat_slave_status_t local[ECAT_MAX_SLAVES];
+    int n;
+
+    pthread_mutex_lock(&inst->slaves_mutex);
+    n = inst->slaves_snapshot_count;
+    if (n > ECAT_MAX_SLAVES)
+        n = ECAT_MAX_SLAVES;
+    memcpy(local, inst->slaves_snapshot, sizeof(local));
+    pthread_mutex_unlock(&inst->slaves_mutex);
+
+    *out_count = n;
+
     cJSON *slaves = cJSON_AddArrayToObject(master, "slaves");
-    for (int i = 0; i < snap.slave_count && i < ECAT_MAX_SLAVES; i++) {
-        const ecat_slave_status_t *ss = &snap.slaves[i];
+    for (int i = 0; i < n; i++) {
+        const ecat_slave_status_t *ss = &local[i];
         cJSON *slave = cJSON_CreateObject();
         cJSON_AddNumberToObject(slave, "position", ss->position);
         cJSON_AddStringToObject(slave, "name", ss->name);
         cJSON_AddStringToObject(slave, "state", al_state_to_string(ss->al_state));
+        if (diagnostics)
+            cJSON_AddNumberToObject(slave, "al_state_raw", ss->al_state);
         cJSON_AddNumberToObject(slave, "al_status_code", ss->al_status_code);
         cJSON_AddNumberToObject(slave, "error_count", ss->error_count);
         cJSON_AddBoolToObject(slave, "has_error",
@@ -1727,20 +1758,52 @@ static cJSON *build_master_status_json(ecat_master_instance_t *inst)
                               ss->al_state != EC_STATE_OPERATIONAL);
         cJSON_AddItemToArray(slaves, slave);
     }
+}
+
+/**
+ * @brief Build a JSON object for a single master's status.
+ *
+ * Reads counters/timing lock-free from inst->diag (atomic), and the
+ * per-slave snapshot under slaves_mutex.  No interaction with the PLC
+ * thread's hot path.
+ */
+static cJSON *build_master_status_json(ecat_master_instance_t *inst)
+{
+    ecat_plugin_state_t state =
+        (ecat_plugin_state_t)atomic_load(&inst->plugin_state);
+    int consecutive_wkc = atomic_load(&inst->consecutive_wkc_errors);
+    int recovery_attempts = atomic_load(&inst->recovery_attempts);
+#if ECAT_ENABLE_MONITOR_THREAD
+    uint64_t exchange_skips = atomic_load(&inst->exchange_skips);
+#else
+    uint64_t exchange_skips = 0;
+#endif
+
+    ecat_diag_view_t diag;
+    load_diag_view(inst, &diag);
+
+    cJSON *master = cJSON_CreateObject();
+    cJSON_AddStringToObject(master, "name", inst->name);
+    cJSON_AddStringToObject(master, "plugin_state", ecat_state_to_string(state));
+    cJSON_AddNumberToObject(master, "expected_wkc", inst->expected_wkc);
+
+    int slave_count = 0;
+    add_slaves_json(inst, master, &slave_count, false);
+    cJSON_AddNumberToObject(master, "slave_count", slave_count);
 
     /* Cycle metrics */
     cJSON *metrics = cJSON_CreateObject();
-    cJSON_AddNumberToObject(metrics, "cycle_count", (double)snap.cycle_count);
-    cJSON_AddNumberToObject(metrics, "wkc_error_count", (double)snap.wkc_error_count);
-    cJSON_AddNumberToObject(metrics, "noframe_count", (double)snap.noframe_count);
-    cJSON_AddNumberToObject(metrics, "avg_cycle_us", (double)snap.avg_cycle_us);
-    cJSON_AddNumberToObject(metrics, "min_cycle_us", (double)snap.min_cycle_us);
-    cJSON_AddNumberToObject(metrics, "max_cycle_us", (double)snap.max_cycle_us);
-    cJSON_AddNumberToObject(metrics, "min_exchange_us", (double)snap.min_exchange_us);
-    cJSON_AddNumberToObject(metrics, "max_exchange_us", (double)snap.max_exchange_us);
-    cJSON_AddNumberToObject(metrics, "consecutive_wkc_errors", snap.consecutive_wkc_errors);
-    cJSON_AddNumberToObject(metrics, "recovery_attempts", snap.recovery_attempts);
-    cJSON_AddNumberToObject(metrics, "exchange_skips", (double)snap.exchange_skips);
+    cJSON_AddNumberToObject(metrics, "cycle_count", (double)diag.cycle_count);
+    cJSON_AddNumberToObject(metrics, "wkc_error_count", (double)diag.wkc_error_count);
+    cJSON_AddNumberToObject(metrics, "noframe_count", (double)diag.noframe_count);
+    cJSON_AddNumberToObject(metrics, "avg_cycle_us", (double)diag.avg_cycle_us);
+    cJSON_AddNumberToObject(metrics, "min_cycle_us", (double)diag.min_cycle_us);
+    cJSON_AddNumberToObject(metrics, "max_cycle_us", (double)diag.max_cycle_us);
+    cJSON_AddNumberToObject(metrics, "min_exchange_us", (double)diag.min_exchange_us);
+    cJSON_AddNumberToObject(metrics, "max_exchange_us", (double)diag.max_exchange_us);
+    cJSON_AddNumberToObject(metrics, "consecutive_wkc_errors", consecutive_wkc);
+    cJSON_AddNumberToObject(metrics, "recovery_attempts", recovery_attempts);
+    cJSON_AddNumberToObject(metrics, "exchange_skips", (double)exchange_skips);
     cJSON_AddItemToObject(master, "metrics", metrics);
 
     return master;
@@ -1771,50 +1834,42 @@ static int handle_status_command(char *response, size_t response_size)
 }
 
 /**
- * @brief Build a JSON object for a single master's diagnostics
+ * @brief Build a JSON object for a single master's diagnostics.
  */
 static cJSON *build_master_diagnostics_json(ecat_master_instance_t *inst)
 {
-    ecat_master_status_t snap;
+    ecat_plugin_state_t state =
+        (ecat_plugin_state_t)atomic_load(&inst->plugin_state);
+    int consecutive_wkc = atomic_load(&inst->consecutive_wkc_errors);
+    int recovery_attempts = atomic_load(&inst->recovery_attempts);
+#if ECAT_ENABLE_MONITOR_THREAD
+    uint64_t exchange_skips = atomic_load(&inst->exchange_skips);
+#else
+    uint64_t exchange_skips = 0;
+#endif
 
-    pthread_mutex_lock(&inst->status_mutex);
-    memcpy(&snap, &inst->status_snapshot, sizeof(snap));
-    pthread_mutex_unlock(&inst->status_mutex);
+    ecat_diag_view_t diag;
+    load_diag_view(inst, &diag);
 
     cJSON *master = cJSON_CreateObject();
     cJSON_AddStringToObject(master, "name", inst->name);
-    cJSON_AddStringToObject(master, "plugin_state",
-                            ecat_state_to_string(snap.plugin_state));
-    cJSON_AddNumberToObject(master, "slave_count", snap.slave_count);
-    cJSON_AddNumberToObject(master, "expected_wkc", snap.expected_wkc);
+    cJSON_AddStringToObject(master, "plugin_state", ecat_state_to_string(state));
+    cJSON_AddNumberToObject(master, "expected_wkc", inst->expected_wkc);
 
-    /* Per-slave detailed status */
-    cJSON *slaves = cJSON_AddArrayToObject(master, "slaves");
-    for (int i = 0; i < snap.slave_count && i < ECAT_MAX_SLAVES; i++) {
-        const ecat_slave_status_t *ss = &snap.slaves[i];
-        cJSON *slave = cJSON_CreateObject();
-        cJSON_AddNumberToObject(slave, "position", ss->position);
-        cJSON_AddStringToObject(slave, "name", ss->name);
-        cJSON_AddStringToObject(slave, "state", al_state_to_string(ss->al_state));
-        cJSON_AddNumberToObject(slave, "al_state_raw", ss->al_state);
-        cJSON_AddNumberToObject(slave, "al_status_code", ss->al_status_code);
-        cJSON_AddNumberToObject(slave, "error_count", ss->error_count);
-        cJSON_AddBoolToObject(slave, "has_error",
-                              (ss->al_state & EC_STATE_ERROR) != 0 ||
-                              ss->al_state != EC_STATE_OPERATIONAL);
-        cJSON_AddItemToArray(slaves, slave);
-    }
+    int slave_count = 0;
+    add_slaves_json(inst, master, &slave_count, true);
+    cJSON_AddNumberToObject(master, "slave_count", slave_count);
 
     /* Extended timing metrics */
     cJSON *timing = cJSON_CreateObject();
-    cJSON_AddNumberToObject(timing, "cycle_count", (double)snap.cycle_count);
-    cJSON_AddNumberToObject(timing, "wkc_error_count", (double)snap.wkc_error_count);
-    cJSON_AddNumberToObject(timing, "noframe_count", (double)snap.noframe_count);
-    cJSON_AddNumberToObject(timing, "avg_cycle_us", (double)snap.avg_cycle_us);
-    cJSON_AddNumberToObject(timing, "min_cycle_us", (double)snap.min_cycle_us);
-    cJSON_AddNumberToObject(timing, "max_cycle_us", (double)snap.max_cycle_us);
-    cJSON_AddNumberToObject(timing, "min_exchange_us", (double)snap.min_exchange_us);
-    cJSON_AddNumberToObject(timing, "max_exchange_us", (double)snap.max_exchange_us);
+    cJSON_AddNumberToObject(timing, "cycle_count", (double)diag.cycle_count);
+    cJSON_AddNumberToObject(timing, "wkc_error_count", (double)diag.wkc_error_count);
+    cJSON_AddNumberToObject(timing, "noframe_count", (double)diag.noframe_count);
+    cJSON_AddNumberToObject(timing, "avg_cycle_us", (double)diag.avg_cycle_us);
+    cJSON_AddNumberToObject(timing, "min_cycle_us", (double)diag.min_cycle_us);
+    cJSON_AddNumberToObject(timing, "max_cycle_us", (double)diag.max_cycle_us);
+    cJSON_AddNumberToObject(timing, "min_exchange_us", (double)diag.min_exchange_us);
+    cJSON_AddNumberToObject(timing, "max_exchange_us", (double)diag.max_exchange_us);
     cJSON_AddNumberToObject(timing, "configured_cycle_us",
                             inst->config.master.cycle_time_us);
     cJSON_AddNumberToObject(timing, "receive_timeout_us", inst->receive_timeout_us);
@@ -1822,11 +1877,11 @@ static cJSON *build_master_diagnostics_json(ecat_master_instance_t *inst)
 
     /* Recovery info */
     cJSON *recovery = cJSON_CreateObject();
-    cJSON_AddNumberToObject(recovery, "consecutive_wkc_errors", snap.consecutive_wkc_errors);
-    cJSON_AddNumberToObject(recovery, "recovery_attempts", snap.recovery_attempts);
+    cJSON_AddNumberToObject(recovery, "consecutive_wkc_errors", consecutive_wkc);
+    cJSON_AddNumberToObject(recovery, "recovery_attempts", recovery_attempts);
     cJSON_AddNumberToObject(recovery, "max_recovery_attempts", ECAT_MAX_RECOVERY_ATTEMPTS);
     cJSON_AddNumberToObject(recovery, "wkc_error_threshold", ECAT_WKC_ERROR_THRESHOLD);
-    cJSON_AddNumberToObject(recovery, "exchange_skips", (double)snap.exchange_skips);
+    cJSON_AddNumberToObject(recovery, "exchange_skips", (double)exchange_skips);
     cJSON_AddItemToObject(master, "recovery", recovery);
 
     /* Master configuration */
