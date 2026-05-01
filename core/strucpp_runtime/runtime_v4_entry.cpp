@@ -82,19 +82,20 @@ extern "C" uint32_t strucpp_get_located_var_count(void) {
 // editor's v4 build path always emits defines.h.
 #include "defines.h"
 
-// Block-form language linkage for the definition. The single-decl form
-// (extern "C" const char foo[] = ...;) is parsed by g++ as both
-// "extern" storage class and an initializer, triggering a warning;
-// the block form expresses C linkage without that ambiguity.
+// Define as a non-const char array so:
+//   1. The symbol has external linkage (in C++, namespace-scope
+//      `const` gives INTERNAL linkage, which would hide the symbol
+//      from dlsym → runtime sees NULL → FC 0x45 returns NOT_LOADED).
+//   2. The symbol's address is the start of the string itself, not a
+//      pointer variable. The runtime's symbols_init does
+//      `*(void**)&ext_strucpp_program_md5 = dlsym(...)` and indexes
+//      ext_strucpp_program_md5[i] directly — a `const char *foo = "..."`
+//      definition would surface the raw pointer bytes as garbage.
 //
-// Define as a char array (not a pointer-to-char) so dlsym returns the
-// address of the string itself. The runtime treats
-// ext_strucpp_program_md5 as char* and indexes it directly — if this
-// were `const char *strucpp_program_md5 = ...`, dlsym would return
-// the address of the pointer variable instead, and the indexed reads
-// would surface the raw pointer bytes as garbage.
+// extern "C" block expresses C language linkage without the
+// "extern initialized" g++ warning that the single-decl form triggers.
 extern "C" {
-const char strucpp_program_md5[] = PROGRAM_MD5;
+char strucpp_program_md5[] = PROGRAM_MD5;
 }
 
 // Advances the strucpp runtime's scan-cycle clock. Called by the runtime
