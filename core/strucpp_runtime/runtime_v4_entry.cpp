@@ -71,14 +71,28 @@ extern "C" uint32_t strucpp_get_located_var_count(void) {
 }
 
 // Project MD5. Used by FC 0x45 to let the editor verify it's debugging
-// the program it has the source for. Default placeholder — the editor
-// can override at .so build time by emitting a small core/generated/
-// header that #defines STRUCPP_PLC_PROGRAM_MD5 (TODO: wire this through
-// scripts/compile.sh).
+// the program it has the source for. The editor emits
+// core/generated/strucpp_program_md5.h next to generated.cpp during
+// compile, defining STRUCPP_PLC_PROGRAM_MD5 with the actual program
+// hash; we include it via __has_include so the placeholder is used
+// only when no editor-built program has been loaded yet (e.g. raw
+// runtime smoke builds).
+#if defined(__has_include)
+#  if __has_include("strucpp_program_md5.h")
+#    include "strucpp_program_md5.h"
+#  endif
+#endif
 #ifndef STRUCPP_PLC_PROGRAM_MD5
 #define STRUCPP_PLC_PROGRAM_MD5 "00000000000000000000000000000000"
 #endif
-extern "C" const char *strucpp_program_md5 = STRUCPP_PLC_PROGRAM_MD5;
+
+// Block-form language linkage for the definition. The single-decl form
+// (extern "C" const char *foo = ...;) is parsed by g++ as both
+// "extern" storage class and an initializer, triggering a warning;
+// the block form expresses C linkage without that ambiguity.
+extern "C" {
+const char *strucpp_program_md5 = STRUCPP_PLC_PROGRAM_MD5;
+}
 
 // Advances the strucpp runtime's scan-cycle clock. Called by the runtime
 // once per cycle (the fastest task's housekeeping window invokes it via
