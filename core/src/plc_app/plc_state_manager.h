@@ -2,10 +2,25 @@
 #define PLC_STATE_MANAGER_H
 
 #include "plcapp_manager.h"
+#include <pthread.h>
+#include <setjmp.h>
+#include <signal.h>
 #include <stdbool.h>
+#include <stdint.h>
 
+/* Dual-language atomic types: C uses <stdatomic.h>'s _Atomic-typedef
+ * forms; C++ uses std::atomic<T>. Both have the same memory layout, so
+ * a struct that contains plc_atomic_long_t compiles in both languages
+ * and the linker treats it as the same storage. */
 #ifdef __cplusplus
+#include <atomic>
+typedef std::atomic<long>               plc_atomic_long_t;
+typedef std::atomic<uint_least64_t>     plc_atomic_u64_t;
 extern "C" {
+#else
+#include <stdatomic.h>
+typedef atomic_long                     plc_atomic_long_t;
+typedef atomic_uint_least64_t           plc_atomic_u64_t;
 #endif
 
 typedef enum
@@ -16,6 +31,40 @@ typedef enum
     PLC_STATE_ERROR,
     PLC_STATE_EMPTY
 } PLCState;
+
+/* -----------------------------------------------------------------------
+ * Per-IEC-task execution context.
+ *
+ * One PlcTaskCtx per task declared in the user's CONFIGURATION. Lives
+ * for the duration of a loaded program; freed on stop.
+ *
+ * Per-thread state — crash_jmp, crash_sig, holding_mutex — must NOT be
+ * shared across threads. Each task thread owns its own context
+ * exclusively once spawned; the runtime stashes a __thread pointer to
+ * the active ctx so the signal handler can siglongjmp to the right
+ * recovery point.
+ * --------------------------------------------------------------------- */
+typedef struct PlcTaskCtx
+{
+    size_t                idx;                /* index into plc_tasks[] */
+    int64_t               interval_ns;
+    int                   priority;           /* IEC TASK priority, mapped to SCHED_FIFO */
+    uint64_t              cpu_affinity_mask;  /* 0 = no pinning, kernel decides */
+    bool                  is_fastest_task;    /* anchor for housekeeping (Phase 7) */
+    void                 *task_handle;        /* opaque strucpp::TaskInstance* */
+    pthread_t             thread;
+    char                  name[32];
+
+    sigjmp_buf            crash_jmp;
+    volatile sig_atomic_t crash_sig;
+    volatile sig_atomic_t holding_mutex;
+
+    plc_atomic_long_t     heartbeat;
+    plc_atomic_u64_t      local_tick;
+} PlcTaskCtx;
+
+extern PlcTaskCtx *plc_tasks;
+extern size_t      plc_task_count;
 
 /**
  * @brief Get the current PLC state.

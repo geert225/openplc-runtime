@@ -41,35 +41,165 @@ pthread_t        plc_thread;
 PluginManager   *plc_program = NULL;
 
 extern plc_timing_stats_t plc_timing_stats;
-// plc_heartbeat is `atomic_long` (C11 _Atomic long) in watchdog.c. We
-// access it as std::atomic<long> here — bit-compatible storage, same
-// linker symbol; the type just needs to be expressed differently in C++.
 extern std::atomic<long>  plc_heartbeat;
 extern plugin_driver_t   *plugin_driver;
 
-static sigjmp_buf            plc_crash_jmp;
-static pthread_t             plc_thread_id;
-static volatile sig_atomic_t plc_crash_signal     = 0;
-static volatile sig_atomic_t holding_buffer_mutex = 0;
+/* -----------------------------------------------------------------------
+ * Per-task storage. Allocated when a program loads, freed on stop.
+ * --------------------------------------------------------------------- */
+PlcTaskCtx *plc_tasks      = nullptr;
+size_t      plc_task_count = 0;
+
+/* The bootstrap thread doesn't run any IEC task body — it does setup,
+ * spawns task threads, waits, and joins. We still want crash recovery
+ * on it via a separate jmp pair. The active task's ctx is in __thread
+ * storage so the signal handler knows which siglongjmp target to use. */
+static __thread PlcTaskCtx  *current_task_ctx        = nullptr;
+static sigjmp_buf            bootstrap_crash_jmp;
+static volatile sig_atomic_t bootstrap_crash_sig     = 0;
+static volatile sig_atomic_t bootstrap_holding_mutex = 0;
+static volatile sig_atomic_t plc_crash_signal        = 0;
+
+/* SIGUSR1 wakes blocked clock_nanosleep so task threads can observe
+ * the STOPPED state and exit. The handler is a no-op — EINTR is the
+ * actual mechanism. */
+static void sigusr1_noop(int sig) { (void)sig; }
 
 static void plc_crash_handler(int sig)
 {
-    if (!pthread_equal(pthread_self(), plc_thread_id))
+    if (current_task_ctx)
     {
-        signal(sig, SIG_DFL);
-        raise(sig);
-        return;
+        current_task_ctx->crash_sig = sig;
+        plc_crash_signal            = sig;
+        siglongjmp(current_task_ctx->crash_jmp, sig);
     }
-    plc_crash_signal = sig;
-    siglongjmp(plc_crash_jmp, sig);
+    if (pthread_equal(pthread_self(), plc_thread))
+    {
+        bootstrap_crash_sig = sig;
+        plc_crash_signal    = sig;
+        siglongjmp(bootstrap_crash_jmp, sig);
+    }
+    /* Unknown thread — restore default and re-raise so we don't
+     * silently eat fatal signals from webserver / plugin threads. */
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+/* -----------------------------------------------------------------------
+ * Per-task thread function.
+ *
+ * Phase 6 keeps this minimal: SCHED_FIFO priority elevation, optional
+ * CPU affinity, per-thread crash recovery, then a clock_nanosleep loop
+ * that calls task->programs[]->run() under the image-tables lock.
+ * Phase 7 specializes the fastest task by adding housekeeping pre/post.
+ * --------------------------------------------------------------------- */
+static void *plc_task_thread(void *arg)
+{
+    PlcTaskCtx *ctx = static_cast<PlcTaskCtx *>(arg);
+    current_task_ctx = ctx;
+
+#if defined(__linux__)
+    pthread_setname_np(pthread_self(), ctx->name);
+
+    int rt = ctx->priority;
+    if (rt < 1)  rt = 1;
+    if (rt > 99) rt = 99;
+    sched_param sp{};
+    sp.sched_priority = rt;
+    if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0)
+    {
+        log_warn("[task %s] SCHED_FIFO(%d) failed: %s — running default scheduling",
+                 ctx->name, rt, strerror(errno));
+    }
+    else
+    {
+        log_info("[task %s] SCHED_FIFO priority %d", ctx->name, rt);
+    }
+
+    if (ctx->cpu_affinity_mask != 0)
+    {
+        cpu_set_t cs;
+        CPU_ZERO(&cs);
+        for (int cpu = 0; cpu < 64 && cpu < CPU_SETSIZE; ++cpu)
+        {
+            if (ctx->cpu_affinity_mask & (1ULL << cpu)) CPU_SET(cpu, &cs);
+        }
+        if (pthread_setaffinity_np(pthread_self(), sizeof cs, &cs) != 0)
+        {
+            log_warn("[task %s] pthread_setaffinity_np failed: %s",
+                     ctx->name, strerror(errno));
+        }
+    }
+#endif
+
+    if (sigsetjmp(ctx->crash_jmp, 1) != 0)
+    {
+        if (ctx->holding_mutex)
+        {
+            ctx->holding_mutex = 0;
+            pthread_mutex_unlock(image_tables_mutex());
+        }
+        log_error("[task %s] crashed (signal %d) — entering ERROR state",
+                  ctx->name, ctx->crash_sig);
+        plc_force_error_state();
+        return nullptr;
+    }
+
+    auto *task = static_cast<strucpp::TaskInstance *>(ctx->task_handle);
+
+    timespec next_wakeup;
+    clock_gettime(CLOCK_MONOTONIC, &next_wakeup);
+
+    while (plc_get_state() == PLC_STATE_RUNNING)
+    {
+        ctx->holding_mutex = 1;
+        pthread_mutex_lock(image_tables_mutex());
+
+        /* Phase 7 will inject housekeeping pre/post when ctx->is_fastest_task.
+         * Phase 6: just run the task body. */
+        for (size_t p = 0; p < task->program_count; ++p)
+        {
+            task->programs[p]->run();
+        }
+
+        pthread_mutex_unlock(image_tables_mutex());
+        ctx->holding_mutex = 0;
+
+        ctx->heartbeat.store((long)time(nullptr), std::memory_order_relaxed);
+        ctx->local_tick.fetch_add(1, std::memory_order_relaxed);
+
+        next_wakeup.tv_nsec += (long)(ctx->interval_ns % 1000000000LL);
+        next_wakeup.tv_sec  += (time_t)(ctx->interval_ns / 1000000000LL);
+        if (next_wakeup.tv_nsec >= 1000000000L)
+        {
+            next_wakeup.tv_nsec -= 1000000000L;
+            next_wakeup.tv_sec  += 1;
+        }
+#if defined(__linux__)
+        int rc = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_wakeup, nullptr);
+        if (rc == EINTR) continue;
+#else
+        timespec now, rel;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        rel.tv_sec  = next_wakeup.tv_sec  - now.tv_sec;
+        rel.tv_nsec = next_wakeup.tv_nsec - now.tv_nsec;
+        if (rel.tv_nsec < 0) { rel.tv_sec--; rel.tv_nsec += 1000000000L; }
+        if (rel.tv_sec >= 0) nanosleep(&rel, nullptr);
+#endif
+    }
+
+    log_info("[task %s] stopped after %llu ticks", ctx->name,
+             (unsigned long long)ctx->local_tick.load());
+    return nullptr;
 }
 
 void *plc_cycle_thread(void *arg)
 {
     PluginManager *pm = (PluginManager *)arg;
 
-    plc_thread_id    = pthread_self();
-    plc_crash_signal = 0;
+    plc_crash_signal        = 0;
+    bootstrap_crash_sig     = 0;
+    bootstrap_holding_mutex = 0;
 
     if (scan_cycle_manager_init() != 0)
     {
@@ -139,6 +269,15 @@ void *plc_cycle_thread(void *arg)
     sigaction(SIGFPE,  &crash_sa, NULL);
     sigaction(SIGSEGV, &crash_sa, NULL);
 
+    /* SIGUSR1 is used by stop_plc_program() to wake task threads
+     * blocked in clock_nanosleep so they observe the STOPPED state. */
+    struct sigaction wake_sa;
+    std::memset(&wake_sa, 0, sizeof(wake_sa));
+    wake_sa.sa_handler = sigusr1_noop;
+    sigemptyset(&wake_sa.sa_mask);
+    wake_sa.sa_flags = 0;
+    sigaction(SIGUSR1, &wake_sa, NULL);
+
     log_info("Starting main loop");
 
     pthread_mutex_lock(&state_mutex);
@@ -149,20 +288,18 @@ void *plc_cycle_thread(void *arg)
     plc_timing_stats.scan_count = 0;
     clock_gettime(CLOCK_MONOTONIC, &timer_start);
 
-    int crash_sig = sigsetjmp(plc_crash_jmp, 1);
+    int crash_sig = sigsetjmp(bootstrap_crash_jmp, 1);
     if (crash_sig != 0)
     {
-        if (holding_buffer_mutex)
+        if (bootstrap_holding_mutex)
         {
-            holding_buffer_mutex = 0;
+            bootstrap_holding_mutex = 0;
             pthread_mutex_unlock(itm);
         }
         const char *sig_name = (crash_sig == SIGFPE)
                                    ? "SIGFPE (arithmetic error, e.g. division by zero)"
                                    : "SIGSEGV (memory access violation)";
-        log_error("PLC program crashed with signal %d: %s", crash_sig, sig_name);
-        log_error("The loaded PLC program contains a fatal error. "
-                  "Upload a corrected program to recover.");
+        log_error("PLC bootstrap thread crashed with signal %d: %s", crash_sig, sig_name);
 
         signal(SIGFPE,  SIG_DFL);
         signal(SIGSEGV, SIG_DFL);
@@ -222,47 +359,102 @@ void *plc_cycle_thread(void *arg)
     log_info("PLC base tick: %llu ns across %zu task(s)",
              (unsigned long long)base_ns, total_tasks);
 
-    while (plc_state == PLC_STATE_RUNNING)
+    /* Allocate per-task contexts and spawn one thread per IEC task. */
+    plc_tasks = static_cast<PlcTaskCtx *>(std::calloc(total_tasks, sizeof(PlcTaskCtx)));
+    if (!plc_tasks)
     {
-        scan_cycle_time_start();
-        holding_buffer_mutex = 1;
-        pthread_mutex_lock(itm);
+        log_error("Failed to allocate plc_tasks array");
+        pthread_mutex_lock(&state_mutex);
+        plc_state = PLC_STATE_ERROR;
+        pthread_mutex_unlock(&state_mutex);
+        return NULL;
+    }
+    plc_task_count = total_tasks;
 
-        journal_apply_and_clear();
-        plugin_driver_cycle_start(plugin_driver);
-
-        /* Round-robin: each task runs every (interval / base) ticks. */
+    {
+        size_t flat_idx = 0;
+        long   now_t    = (long)time(nullptr);
         for (size_t r = 0; r < cfg->get_resource_count(); ++r)
         {
             for (size_t t = 0; t < resources[r].task_count; ++t)
             {
-                auto &task = resources[r].tasks[t];
-                int64_t ivl = task.interval_ns > 0 ? task.interval_ns : (int64_t)base_ns;
-                uint64_t divisor = (uint64_t)ivl / base_ns;
-                if (divisor == 0 || (tick__ % divisor) == 0)
-                {
-                    for (size_t p = 0; p < task.program_count; ++p)
-                    {
-                        task.programs[p]->run();
-                    }
-                }
+                PlcTaskCtx *ctx = &plc_tasks[flat_idx];
+                auto       &tk  = resources[r].tasks[t];
+                ctx->idx               = flat_idx;
+                ctx->interval_ns       = tk.interval_ns > 0 ? tk.interval_ns : (int64_t)base_ns;
+                ctx->priority          = tk.priority;
+                ctx->cpu_affinity_mask = 0;       /* Phase 8 will plumb this from CPU_AFFINITY */
+                ctx->is_fastest_task   = false;   /* set below */
+                ctx->task_handle       = &tk;
+                std::snprintf(ctx->name, sizeof ctx->name, "plc-task-%zu", flat_idx);
+                ctx->heartbeat.store(now_t, std::memory_order_relaxed);
+                ctx->local_tick.store(0,    std::memory_order_relaxed);
+                ++flat_idx;
             }
         }
-        ext_updateTime();
-
-        plugin_driver_cycle_end(plugin_driver);
-        plc_heartbeat.store((long)time(NULL));
-
-        pthread_mutex_unlock(itm);
-        holding_buffer_mutex = 0;
-        scan_cycle_time_end();
-
-        ++tick__;
-
-        timer_start.tv_nsec += (long)base_ns;
-        normalize_timespec(&timer_start);
-        sleep_until(&timer_start);
     }
+
+    /* Pick the fastest task: smallest interval, tie-break by priority,
+     * then by declaration order (which is the iteration order above). */
+    {
+        size_t fastest_idx = 0;
+        for (size_t i = 1; i < plc_task_count; ++i)
+        {
+            PlcTaskCtx *c = &plc_tasks[i];
+            PlcTaskCtx *f = &plc_tasks[fastest_idx];
+            if (c->interval_ns < f->interval_ns ||
+                (c->interval_ns == f->interval_ns && c->priority > f->priority))
+            {
+                fastest_idx = i;
+            }
+        }
+        plc_tasks[fastest_idx].is_fastest_task = true;
+        log_info("PLC: anchoring housekeeping on task %s "
+                 "(interval=%lld ns, priority=%d)",
+                 plc_tasks[fastest_idx].name,
+                 (long long)plc_tasks[fastest_idx].interval_ns,
+                 plc_tasks[fastest_idx].priority);
+    }
+
+    /* Spawn task threads. */
+    for (size_t i = 0; i < plc_task_count; ++i)
+    {
+        if (pthread_create(&plc_tasks[i].thread, NULL,
+                           plc_task_thread, &plc_tasks[i]) != 0)
+        {
+            log_error("Failed to spawn task %zu thread: %s",
+                      i, strerror(errno));
+            pthread_mutex_lock(&state_mutex);
+            plc_state = PLC_STATE_ERROR;
+            pthread_mutex_unlock(&state_mutex);
+            return NULL;
+        }
+    }
+    log_info("Spawned %zu PLC task thread(s)", plc_task_count);
+
+    /* Bootstrap thread: wait for state change, then signal+join the
+     * task threads. Phase 7 may add the housekeeping window onto the
+     * fastest task's thread; Phase 6 keeps the bootstrap quiet. */
+    while (plc_get_state() == PLC_STATE_RUNNING)
+    {
+        timespec poll_sleep;
+        poll_sleep.tv_sec  = 1;
+        poll_sleep.tv_nsec = 0;
+        nanosleep(&poll_sleep, nullptr);
+    }
+
+    log_info("Stopping %zu PLC task thread(s)", plc_task_count);
+    for (size_t i = 0; i < plc_task_count; ++i)
+    {
+        pthread_kill(plc_tasks[i].thread, SIGUSR1);
+    }
+    for (size_t i = 0; i < plc_task_count; ++i)
+    {
+        pthread_join(plc_tasks[i].thread, nullptr);
+    }
+    std::free(plc_tasks);
+    plc_tasks      = nullptr;
+    plc_task_count = 0;
 
     signal(SIGFPE,  SIG_DFL);
     signal(SIGSEGV, SIG_DFL);
