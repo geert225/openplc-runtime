@@ -20,7 +20,7 @@ extern "C" {
 // these mirrors; the actual strucpp runtime headers ship with the user
 // program upload (under core/generated/strucpp_runtime/include/) and
 // are consumed only by scripts/compile.sh when building the .so.
-#include "strucpp_abi.hpp"
+#include "../lib/strucpp_abi.hpp"
 
 #include "image_tables.h"
 #include "plcapp_manager.h"

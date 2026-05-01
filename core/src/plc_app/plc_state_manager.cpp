@@ -27,8 +27,8 @@ extern "C" {
 #include "../drivers/plugin_driver.h"
 }
 
-// Runtime-side strucpp ABI mirror — see core/include/strucpp_abi.hpp
-#include "strucpp_abi.hpp"
+// Runtime-side strucpp ABI mirror — see core/src/lib/strucpp_abi.hpp
+#include "../lib/strucpp_abi.hpp"
 
 #include "image_tables.h"
 #include "journal_buffer.h"
