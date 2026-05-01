@@ -975,16 +975,20 @@ static void cycle_start_single(ecat_master_instance_t *inst)
     uint64_t cc = atomic_fetch_add_explicit(&inst->diag.cycle_count, 1,
                                             memory_order_relaxed) + 1;
 
-    /* Welford running mean (replaced by EWMA in sub-phase 2.2) */
+    /* EWMA: avg += (sample - avg) >> SHIFT.  Tracks recent-window jitter
+     * instead of a historical mean (which the previous integer-Welford
+     * loop stalled at once cycle_count grew large).  Signed right shift
+     * is implementation-defined in C but is arithmetic on GCC/Clang,
+     * which the runtime already depends on. */
     int64_t cur_avg_total = atomic_load_explicit(&inst->diag.avg_total_ns,
                                                  memory_order_relaxed);
-    cur_avg_total += ((int64_t)exchange_ns - cur_avg_total) / (int64_t)cc;
+    cur_avg_total += ((int64_t)exchange_ns - cur_avg_total) >> ECAT_AVG_EWMA_SHIFT;
     atomic_store_explicit(&inst->diag.avg_total_ns, cur_avg_total,
                           memory_order_relaxed);
 
     int64_t cur_avg_exch = atomic_load_explicit(&inst->diag.avg_exchange_ns,
                                                 memory_order_relaxed);
-    cur_avg_exch += ((int64_t)exchange_ns - cur_avg_exch) / (int64_t)cc;
+    cur_avg_exch += ((int64_t)exchange_ns - cur_avg_exch) >> ECAT_AVG_EWMA_SHIFT;
     atomic_store_explicit(&inst->diag.avg_exchange_ns, cur_avg_exch,
                           memory_order_relaxed);
 

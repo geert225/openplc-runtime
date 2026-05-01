@@ -397,6 +397,19 @@ typedef struct {
  */
 
 /**
+ * @brief EWMA shift for the avg_*_ns counters in ecat_cycle_diag_t.
+ *
+ * The moving average update is:  avg += (sample - avg) >> SHIFT
+ * which is equivalent to an exponentially-weighted moving average with
+ * weight 1 / 2^SHIFT.  SHIFT=5 gives an effective window of ~32 samples
+ * (a few ms at 250us cycles, tens of ms at 1ms cycles).
+ *
+ * This replaces the integer Welford running mean previously used, which
+ * stalls under integer division once cycle_count grows past ~10^7.
+ */
+#define ECAT_AVG_EWMA_SHIFT 5
+
+/**
  * @brief Per-cycle timing diagnostics
  *
  * Updated lock-free by cycle_start_single() in the PLC thread.
@@ -405,7 +418,8 @@ typedef struct {
  * on the hot path; readers tolerate cross-field tearing because these
  * are diagnostics, not values used in cross-field arithmetic.
  *
- * Uses Welford's incremental algorithm for moving averages.
+ * avg_*_ns are EWMA tracking values (see ECAT_AVG_EWMA_SHIFT), not
+ * historical means.
  */
 typedef struct {
     _Atomic(uint64_t) cycle_count;       /* total cycles executed              */
@@ -417,8 +431,8 @@ typedef struct {
     _Atomic(uint64_t) total_ns;          /* last full cycle total (ns)         */
     _Atomic(uint64_t) max_exchange_ns;   /* worst-case send+receive            */
     _Atomic(uint64_t) max_total_ns;      /* worst-case total                   */
-    _Atomic(int64_t)  avg_total_ns;      /* incremental moving average (Welford) */
-    _Atomic(int64_t)  avg_exchange_ns;   /* incremental moving average (Welford) */
+    _Atomic(int64_t)  avg_total_ns;      /* EWMA of total_ns (see SHIFT above) */
+    _Atomic(int64_t)  avg_exchange_ns;   /* EWMA of exchange_ns                */
     _Atomic(uint64_t) min_exchange_ns;   /* best-case send+receive             */
     _Atomic(uint64_t) min_total_ns;      /* best-case total                    */
 } ecat_cycle_diag_t;
