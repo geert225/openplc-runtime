@@ -137,6 +137,30 @@ static void safe_strcpy_local(char *dest, const char *src, size_t max_len)
 
 /*
  * =============================================================================
+ * Mutex Init Helper
+ * =============================================================================
+ *
+ * Initializes a mutex with PTHREAD_PRIO_INHERIT so that the SCHED_FIFO PLC
+ * thread does not get blocked behind a normal-priority thread that holds
+ * the same lock (priority inversion).  Falls back gracefully on platforms
+ * that do not support the protocol attribute.
+ */
+static int ecat_mutex_init_pi(pthread_mutex_t *m)
+{
+    pthread_mutexattr_t attr;
+    if (pthread_mutexattr_init(&attr) != 0)
+        return -1;
+#if !defined(__CYGWIN__) && !defined(_WIN32)
+    /* Best-effort: ignore failure (some libcs return ENOTSUP) */
+    (void)pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_INHERIT);
+#endif
+    int rc = pthread_mutex_init(m, &attr);
+    pthread_mutexattr_destroy(&attr);
+    return rc;
+}
+
+/*
+ * =============================================================================
  * Network Interface Isolation (per-master, lifecycle-bound)
  * =============================================================================
  *
@@ -507,9 +531,9 @@ static void update_status_snapshot(ecat_master_instance_t *inst)
 /**
  * @brief Attempt to recover all slaves that are not in OP
  *
- * MUST be called only when the PLC thread has yielded SOEM access
- * (inst->soem_paused == true), because these SOEM calls are blocking and
- * not thread-safe.
+ * MUST be called with inst->soem_lock held (the monitor thread takes it
+ * before calling), because these SOEM calls are blocking and not
+ * thread-safe versus the PLC's exchange.
  *
  * @param inst Per-master instance
  * @return 1 if all slaves back in OP, 0 if some still recovering, -1 on max attempts
@@ -561,61 +585,6 @@ static int attempt_recovery(ecat_master_instance_t *inst)
 
 /*
  * =============================================================================
- * Cooperative SOEM Access Helpers
- * =============================================================================
- */
-
-/**
- * @brief Request exclusive SOEM access from the PLC thread
- *
- * Sets the pause request flag and waits for the PLC thread to acknowledge.
- * The PLC thread checks this flag at the top of cycle_start() and, when set,
- * skips the SOEM exchange and signals soem_paused.
- *
- * The paused flag is cleared before requesting to prevent a stale
- * acknowledgment from a previous release/request window from being
- * misinterpreted as a fresh yield.
- *
- * @param inst       Per-master instance
- * @param timeout_ms Maximum time to wait for PLC thread acknowledgment
- * @return true if SOEM access was granted, false on timeout
- */
-static bool request_soem_access(ecat_master_instance_t *inst, int timeout_ms)
-{
-    /* Clear any stale acknowledgment before raising a new request */
-    atomic_store(&inst->soem_paused, false);
-    atomic_store(&inst->soem_pause_requested, true);
-
-    struct timespec ts = { 0, 1000000 }; /* 1 ms poll interval */
-    int waited_ms = 0;
-    while (!atomic_load(&inst->soem_paused) && waited_ms < timeout_ms) {
-        nanosleep(&ts, NULL);
-        waited_ms++;
-    }
-
-    if (!atomic_load(&inst->soem_paused)) {
-        atomic_store(&inst->soem_pause_requested, false);
-        return false;
-    }
-    return true;
-}
-
-/**
- * @brief Release exclusive SOEM access, allowing PLC thread to resume exchange
- *
- * The request flag is cleared first so that the PLC thread stops yielding
- * before the acknowledgment flag is reset.
- *
- * @param inst Per-master instance
- */
-static void release_soem_access(ecat_master_instance_t *inst)
-{
-    atomic_store(&inst->soem_pause_requested, false);
-    atomic_store(&inst->soem_paused, false);
-}
-
-/*
- * =============================================================================
  * Background Monitor Thread (per-instance)
  * =============================================================================
  */
@@ -623,11 +592,12 @@ static void release_soem_access(ecat_master_instance_t *inst)
 /**
  * @brief Background thread for slave state monitoring and recovery
  *
- * Runs at default (non-RT) priority. Periodically:
- *   - Requests exclusive SOEM access (PLC skips 1 exchange cycle)
- *   - Reads slave states via ecx_readstate()
- *   - Performs recovery if in RECOVERING state
- *   - Updates status snapshot for execute_command queries
+ * Runs at default (non-RT) priority.  Periodically:
+ *   - Acquires inst->soem_lock (PLC trylocks the same mutex; if the
+ *     monitor is holding it, the PLC skips one exchange cycle).
+ *   - Reads slave states via ecx_readstate().
+ *   - Performs recovery if in RECOVERING state.
+ *   - Updates status snapshot for execute_command queries.
  *
  * @param arg Pointer to the ecat_master_instance_t for this master
  */
@@ -644,35 +614,29 @@ static void *ecat_monitor_thread(void *arg)
 
         if (state == ECAT_STATE_OPERATIONAL) {
             /* Periodic state check */
-            if (request_soem_access(inst, ECAT_SOEM_ACCESS_TIMEOUT_MS)) {
-                ecat_master_read_states(inst);
-                release_soem_access(inst);
-                update_status_snapshot(inst);
-            }
+            pthread_mutex_lock(&inst->soem_lock);
+            ecat_master_read_states(inst);
+            pthread_mutex_unlock(&inst->soem_lock);
+            update_status_snapshot(inst);
 
         } else if (state == ECAT_STATE_RECOVERING) {
-            /* Recovery needs extended SOEM access */
-            if (request_soem_access(inst, ECAT_SOEM_ACCESS_TIMEOUT_MS)) {
-                int result = attempt_recovery(inst);
-                release_soem_access(inst);
+            /* Recovery holds the lock for longer; PLC will skip cycles. */
+            pthread_mutex_lock(&inst->soem_lock);
+            int result = attempt_recovery(inst);
+            pthread_mutex_unlock(&inst->soem_lock);
 
-                if (result == 1) {
-                    atomic_store(&inst->plugin_state, ECAT_STATE_OPERATIONAL);
-                    plugin_logger_info(&g_logger,
-                        "Master '%s': [state: OPERATIONAL] Recovered from error",
-                        inst->name);
-                } else if (result == -1) {
-                    atomic_store(&inst->plugin_state, ECAT_STATE_ERROR);
-                    plugin_logger_error(&g_logger,
-                        "Master '%s': entered ERROR state after max recovery attempts",
-                        inst->name);
-                }
-                update_status_snapshot(inst);
-            } else {
-                plugin_logger_warn(&g_logger,
-                    "Master '%s': Could not acquire SOEM access for recovery "
-                    "(PLC not responding?)", inst->name);
+            if (result == 1) {
+                atomic_store(&inst->plugin_state, ECAT_STATE_OPERATIONAL);
+                plugin_logger_info(&g_logger,
+                    "Master '%s': [state: OPERATIONAL] Recovered from error",
+                    inst->name);
+            } else if (result == -1) {
+                atomic_store(&inst->plugin_state, ECAT_STATE_ERROR);
+                plugin_logger_error(&g_logger,
+                    "Master '%s': entered ERROR state after max recovery attempts",
+                    inst->name);
             }
+            update_status_snapshot(inst);
         }
 
         /* Sleep for the monitor interval */
@@ -797,9 +761,8 @@ static int start_single_master(ecat_master_instance_t *inst)
     update_status_snapshot(inst);
 
 #if ECAT_ENABLE_MONITOR_THREAD
-    /* Start background monitor thread for state checks and recovery */
-    atomic_store(&inst->soem_pause_requested, false);
-    atomic_store(&inst->soem_paused, false);
+    /* Start background monitor thread for state checks and recovery.
+     * soem_lock is initialized in init() once per instance. */
     atomic_store(&inst->exchange_skips, 0);
     atomic_store(&inst->monitor_running, true);
 
@@ -850,8 +813,6 @@ static void stop_single_master(ecat_master_instance_t *inst)
         plugin_logger_debug(&g_logger,
             "Master '%s': Monitor thread joined", inst->name);
     }
-    atomic_store(&inst->soem_pause_requested, false);
-    atomic_store(&inst->soem_paused, false);
 #endif
 
     /* Log final diagnostics (snapshot under lock; PLC may still be running). */
@@ -920,10 +881,11 @@ static void cycle_start_single(ecat_master_instance_t *inst)
         return;
 
 #if ECAT_ENABLE_MONITOR_THREAD
-    /* If the monitor thread needs exclusive SOEM access, yield this cycle.
-     * The PLC keeps running with stale I/O data for one cycle (~us). */
-    if (atomic_load(&inst->soem_pause_requested)) {
-        atomic_store(&inst->soem_paused, true);
+    /* If the monitor thread is holding soem_lock (state check or recovery),
+     * yield this cycle.  The PLC keeps running with stale I/O data for one
+     * cycle.  Trylock is non-blocking; in contention it costs only a futex
+     * read and returns immediately. */
+    if (pthread_mutex_trylock(&inst->soem_lock) != 0) {
         atomic_fetch_add(&inst->exchange_skips, 1);
         return;
     }
@@ -942,6 +904,10 @@ static void cycle_start_single(ecat_master_instance_t *inst)
 
     /* 3. Read received inputs into PLC buffers */
     ecat_io_read_inputs_fast(&inst->transfer_list, iomap);
+
+#if ECAT_ENABLE_MONITOR_THREAD
+    pthread_mutex_unlock(&inst->soem_lock);
+#endif
 
     inst->cycle_counter++;
 
@@ -1104,17 +1070,36 @@ int init(void *args)
         memset(&inst->diag, 0, sizeof(inst->diag));
         inst->diag.min_exchange_ns = UINT64_MAX;
         inst->diag.min_total_ns = UINT64_MAX;
-        if (pthread_mutex_init(&inst->status_mutex, NULL) != 0) {
+        if (ecat_mutex_init_pi(&inst->status_mutex) != 0) {
             plugin_logger_error(&g_logger,
                 "Master[%d] '%s': Failed to initialize status mutex", i, inst->name);
             /* Destroy mutexes that were already initialized */
-            for (int j = 0; j < i; j++)
+            for (int j = 0; j < i; j++) {
                 pthread_mutex_destroy(&g_masters[j].status_mutex);
+#if ECAT_ENABLE_MONITOR_THREAD
+                pthread_mutex_destroy(&g_masters[j].soem_lock);
+#endif
+            }
             free(g_masters);
             g_masters = NULL;
             g_master_count = 0;
             return -1;
         }
+#if ECAT_ENABLE_MONITOR_THREAD
+        if (ecat_mutex_init_pi(&inst->soem_lock) != 0) {
+            plugin_logger_error(&g_logger,
+                "Master[%d] '%s': Failed to initialize SOEM lock", i, inst->name);
+            pthread_mutex_destroy(&inst->status_mutex);
+            for (int j = 0; j < i; j++) {
+                pthread_mutex_destroy(&g_masters[j].status_mutex);
+                pthread_mutex_destroy(&g_masters[j].soem_lock);
+            }
+            free(g_masters);
+            g_masters = NULL;
+            g_master_count = 0;
+            return -1;
+        }
+#endif
 
         /* Calculate tick divisor for task-based scheduling.
          * A divisor of 1 means "execute every cycle" (the default). */
@@ -1321,6 +1306,9 @@ void cleanup(void)
             stop_single_master(inst);
         }
         pthread_mutex_destroy(&inst->status_mutex);
+#if ECAT_ENABLE_MONITOR_THREAD
+        pthread_mutex_destroy(&inst->soem_lock);
+#endif
     }
 
     free(g_masters);

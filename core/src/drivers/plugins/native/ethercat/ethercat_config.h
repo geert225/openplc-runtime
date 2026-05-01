@@ -335,9 +335,6 @@ ecat_data_type_t ecat_parse_data_type(const char *str);
 /** Background monitor thread polling interval in milliseconds */
 #define ECAT_MONITOR_INTERVAL_MS    500
 
-/** Timeout in ms to wait for PLC thread to yield SOEM access */
-#define ECAT_SOEM_ACCESS_TIMEOUT_MS 200
-
 /**
  * @brief EtherCAT plugin state machine states
  *
@@ -558,11 +555,17 @@ typedef struct {
     pthread_mutex_t status_mutex;
 
 #if ECAT_ENABLE_MONITOR_THREAD
-    /* Monitor thread — per-instance for cooperative SOEM access */
+    /* Monitor thread — per-instance.
+     *
+     * soem_lock serializes SOEM access between the PLC thread (cycle_start)
+     * and the monitor thread (state checks, recovery).  The PLC thread uses
+     * pthread_mutex_trylock and skips the cycle if the monitor is holding
+     * the lock; the monitor takes the lock blockingly.  The lock is
+     * initialized with PRIO_INHERIT to avoid priority inversion.
+     */
     pthread_t monitor_thread;
     _Atomic(bool) monitor_running;
-    _Atomic(bool) soem_pause_requested;
-    _Atomic(bool) soem_paused;
+    pthread_mutex_t soem_lock;
     _Atomic(uint64_t) exchange_skips;
 #endif
 
