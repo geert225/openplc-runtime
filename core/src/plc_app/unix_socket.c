@@ -229,8 +229,6 @@ void handle_unix_socket_commands(const char *command, char *response, size_t res
 
             const char *json_payload = colon + 1;
 
-            log_info("Executing plugin command: plugin='%s'", plugin_name);
-
             // Stack-allocated buffer for plugin output.
             // MAX_RESPONSE_SIZE is 64KB; this leaves 256 bytes for the
             // "PLUGIN_CMD:OK:" prefix. Fits comfortably in the default
