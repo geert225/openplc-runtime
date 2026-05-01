@@ -694,11 +694,12 @@ int ecat_config_parse_all(const char *config_path,
         return result;
     }
 
-    /* Iterate all entries in the array */
+    /* Iterate all entries in the array.  Loop runs to the end (not stops
+     * at max_masters) so we can warn about entries that exceed the cap. */
     int count = 0;
     int array_size = cJSON_GetArraySize(root);
 
-    for (int i = 0; i < array_size && count < max_masters; i++) {
+    for (int i = 0; i < array_size; i++) {
         const cJSON *entry = cJSON_GetArrayItem(root, i);
         if (entry == NULL) continue;
 
@@ -709,11 +710,23 @@ int ecat_config_parse_all(const char *config_path,
         const cJSON *config_obj = cJSON_GetObjectItemCaseSensitive(entry, "config");
         if (config_obj == NULL) continue;
 
+        const char *name = get_string(entry, "name", "master");
+
+        /* Refuse to parse beyond max_masters but make the rejection
+         * visible -- the editor lets the operator add an arbitrary
+         * number of entries; silent truncation here surprises users. */
+        if (count >= max_masters) {
+            fprintf(stderr, "ETHERCAT CONFIG: skipping entry[%d] '%s' -- "
+                    "max_masters=%d reached. Increase ECAT_MAX_MASTERS "
+                    "or remove extra ETHERCAT entries.\n",
+                    i, name, max_masters);
+            continue;
+        }
+
         /* Initialize this instance's config with defaults */
         ecat_config_init_defaults(&instances[count].config);
 
         /* Extract master name */
-        const char *name = get_string(entry, "name", "master");
         safe_strcpy(instances[count].name, name, sizeof(instances[count].name));
 
         /* Parse configuration sections */
@@ -735,6 +748,27 @@ int ecat_config_parse_all(const char *config_path,
     }
 
     cJSON_Delete(root);
+
+    /* Refuse configs where two masters share the same network interface.
+     * Per-iface external state (NIC tuning + iptables + ipv6) in
+     * ethercat_iface_state.c is single-owner; two masters on the same iface
+     * produce corrupted persistence on crash recovery. */
+    for (int i = 0; i < count; i++) {
+        for (int j = i + 1; j < count; j++) {
+            if (strcmp(instances[i].config.master.interface,
+                       instances[j].config.master.interface) == 0) {
+                fprintf(stderr,
+                    "ETHERCAT CONFIG: masters '%s' and '%s' share "
+                    "interface '%s' -- not supported. Use a distinct "
+                    "interface per master.\n",
+                    instances[i].name, instances[j].name,
+                    instances[i].config.master.interface);
+                *out_count = 0;
+                return ECAT_CONFIG_ERR_INVALID;
+            }
+        }
+    }
+
     *out_count = count;
 
     return (count > 0) ? ECAT_CONFIG_OK : ECAT_CONFIG_ERR_MISSING;
