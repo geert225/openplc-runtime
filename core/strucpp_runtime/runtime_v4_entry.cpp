@@ -72,18 +72,20 @@ extern "C" uint32_t strucpp_get_located_var_count(void) {
 
 // Project MD5. Used by FC 0x45 to let the editor verify it's debugging
 // the program it has the source for. The editor emits
-// core/generated/strucpp_program_md5.h next to generated.cpp during
-// compile, defining STRUCPP_PLC_PROGRAM_MD5 with the actual program
-// hash; we include it via __has_include so the placeholder is used
-// only when no editor-built program has been loaded yet (e.g. raw
-// runtime smoke builds).
+// core/generated/defines.h next to generated.cpp during compile,
+// defining PROGRAM_MD5 with the actual program hash; we include it via
+// __has_include so the placeholder is used only when no editor-built
+// program has been loaded yet (e.g. raw runtime smoke builds).
+//
+// PROGRAM_MD5 is the same macro name the Arduino sketch's defines.h
+// uses, keeping a single MD5 contract across targets.
 #if defined(__has_include)
-#  if __has_include("strucpp_program_md5.h")
-#    include "strucpp_program_md5.h"
+#  if __has_include("defines.h")
+#    include "defines.h"
 #  endif
 #endif
-#ifndef STRUCPP_PLC_PROGRAM_MD5
-#define STRUCPP_PLC_PROGRAM_MD5 "00000000000000000000000000000000"
+#ifndef PROGRAM_MD5
+#define PROGRAM_MD5 "00000000000000000000000000000000"
 #endif
 
 // Block-form language linkage for the definition. The single-decl form
@@ -91,7 +93,7 @@ extern "C" uint32_t strucpp_get_located_var_count(void) {
 // "extern" storage class and an initializer, triggering a warning;
 // the block form expresses C linkage without that ambiguity.
 extern "C" {
-const char *strucpp_program_md5 = STRUCPP_PLC_PROGRAM_MD5;
+const char *strucpp_program_md5 = PROGRAM_MD5;
 }
 
 // Advances the strucpp runtime's scan-cycle clock. Called by the runtime
