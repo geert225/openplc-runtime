@@ -27,6 +27,7 @@ extern "C" {
 
 #include "image_tables.h"
 #include "journal_buffer.h"
+#include "plc_io_cycle.h"
 #include "plc_state_manager.h"
 #include "plcapp_manager.h"
 #include "scan_cycle_manager.h"
@@ -155,11 +156,25 @@ static void *plc_task_thread(void *arg)
         ctx->holding_mutex = 1;
         pthread_mutex_lock(image_tables_mutex());
 
-        /* Phase 7 will inject housekeeping pre/post when ctx->is_fastest_task.
-         * Phase 6: just run the task body. */
+        /* Fastest task drives the housekeeping window — same calls and
+         * same order as the MatIEC-era single-thread runtime, just
+         * anchored on whichever task ticks fastest. Other task threads
+         * skip the housekeeping and just run their bodies. */
+        if (ctx->is_fastest_task)
+        {
+            scan_cycle_time_start();
+            plc_run_io_cycle_pre();
+        }
+
         for (size_t p = 0; p < task->program_count; ++p)
         {
             task->programs[p]->run();
+        }
+
+        if (ctx->is_fastest_task)
+        {
+            plc_run_io_cycle_post();
+            scan_cycle_time_end();
         }
 
         pthread_mutex_unlock(image_tables_mutex());
