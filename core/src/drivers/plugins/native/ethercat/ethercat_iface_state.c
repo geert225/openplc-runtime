@@ -14,7 +14,7 @@
 
 #include "ethercat_iface_state.h"
 #include "ethercat_proc.h"
-#include "ethercat_config.h"   /* ecat_is_valid_iface_name */
+#include "ethercat_config.h"   /* ecat_iface_validate */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -495,9 +495,11 @@ void ecat_iface_state_apply(ecat_iface_state_t *state, const char *iface,
 
     memset(state, 0, sizeof(*state));
 
-    if (!ecat_is_valid_iface_name(iface)) {
+    if (!ecat_iface_validate(iface, ECAT_IFACE_LINUX_STRICT)) {
         plugin_logger_warn(logger,
-            "iface '%s' not a valid Linux interface name -- skipping iface state apply",
+            "iface '%s' not a valid Linux interface name -- "
+            "NIC tuning (ethtool) and IP-stack isolation (iptables, IPv6) "
+            "are disabled for this master.  Jitter may be higher.",
             iface);
         return;
     }

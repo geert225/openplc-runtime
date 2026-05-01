@@ -276,11 +276,33 @@ int ecat_config_parse(const char *config_path, ecat_config_t *config);
 int ecat_config_validate(const ecat_config_t *config);
 
 /**
+ * @brief Validation mode for interface names.
+ *
+ * Different callers need different rules: NIC tuning / iptables paths must
+ * receive Linux-only names safe for /proc and external binaries; the scan
+ * and test commands accept any name the underlying socket layer accepts,
+ * including Windows NPF device paths like "\Device\NPF_{GUID}".
+ */
+typedef enum {
+    ECAT_IFACE_LINUX_STRICT,   /* alfanum + '_' '-', starts alpha, len 1..15 */
+    ECAT_IFACE_ANY_PLATFORM    /* Linux + Windows NPF chars '\' '{' '}' '.' */
+} ecat_iface_validate_mode_t;
+
+/**
+ * @brief Validate an interface name against the requested mode.
+ *
+ * @param iface NUL-terminated interface name (may be NULL — returns false).
+ * @param mode  ECAT_IFACE_LINUX_STRICT or ECAT_IFACE_ANY_PLATFORM.
+ * @return true if @p iface is a valid identifier under @p mode, false otherwise.
+ */
+bool ecat_iface_validate(const char *iface, ecat_iface_validate_mode_t mode);
+
+/**
  * @brief Check whether an interface name is a safe Linux iface identifier.
  *
- * Accepts only alphanumeric characters plus '_' and '-', must start with an
- * alpha, length 1..IFNAMSIZ-1 (15). Used as a precondition before passing
- * the name to external binaries (ethtool, iptables) or kernel /proc paths.
+ * Thin wrapper kept for backward compatibility — equivalent to
+ * ecat_iface_validate(iface, ECAT_IFACE_LINUX_STRICT).  Prefer the
+ * explicit form in new code.
  *
  * @return true if safe, false otherwise.
  */
@@ -421,23 +443,26 @@ typedef struct {
  * on the hot path; readers tolerate cross-field tearing because these
  * are diagnostics, not values used in cross-field arithmetic.
  *
- * avg_*_ns are EWMA tracking values (see ECAT_AVG_EWMA_SHIFT), not
- * historical means.
+ * Measures the EtherCAT bus exchange (ecx_send_processdata +
+ * ecx_receive_processdata).  The memcpy work in
+ * ecat_io_write_outputs_fast / ecat_io_read_inputs_fast is intentionally
+ * not measured: it is dozens of nanoseconds for typical channel maps and
+ * dwarfed by the bus exchange itself.  The JSON exposed to the Editor
+ * keeps the legacy field names (avg_cycle_us, max_cycle_us,
+ * max_exchange_us, etc.) — they all reflect this same bus_cycle_ns
+ * measurement.
+ *
+ * avg_bus_cycle_ns is an EWMA tracking value (see ECAT_AVG_EWMA_SHIFT),
+ * not a historical mean.
  */
 typedef struct {
     _Atomic(uint64_t) cycle_count;       /* total cycles executed              */
     _Atomic(uint64_t) wkc_error_count;   /* total WKC errors (wkc < expected)  */
     _Atomic(uint64_t) noframe_count;     /* total EC_NOFRAME (-1) errors       */
-    _Atomic(uint64_t) exchange_ns;       /* last send+receive duration (ns)    */
-    _Atomic(uint64_t) io_read_ns;        /* last read_inputs duration (ns)     */
-    _Atomic(uint64_t) io_write_ns;       /* last write_outputs duration (ns)   */
-    _Atomic(uint64_t) total_ns;          /* last full cycle total (ns)         */
-    _Atomic(uint64_t) max_exchange_ns;   /* worst-case send+receive            */
-    _Atomic(uint64_t) max_total_ns;      /* worst-case total                   */
-    _Atomic(int64_t)  avg_total_ns;      /* EWMA of total_ns (see SHIFT above) */
-    _Atomic(int64_t)  avg_exchange_ns;   /* EWMA of exchange_ns                */
-    _Atomic(uint64_t) min_exchange_ns;   /* best-case send+receive             */
-    _Atomic(uint64_t) min_total_ns;      /* best-case total                    */
+    _Atomic(uint64_t) bus_cycle_ns;      /* last send+receive duration (ns)    */
+    _Atomic(uint64_t) max_bus_cycle_ns;  /* worst-case send+receive            */
+    _Atomic(uint64_t) min_bus_cycle_ns;  /* best-case send+receive             */
+    _Atomic(int64_t)  avg_bus_cycle_ns;  /* EWMA (see ECAT_AVG_EWMA_SHIFT)     */
 } ecat_cycle_diag_t;
 
 /*

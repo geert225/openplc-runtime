@@ -18,21 +18,42 @@
 /** Linux IFNAMSIZ is 16; valid iface names are 1..15 chars. */
 #define ECAT_LINUX_IFNAME_MAX 16
 
-bool ecat_is_valid_iface_name(const char *iface)
+bool ecat_iface_validate(const char *iface, ecat_iface_validate_mode_t mode)
 {
     if (iface == NULL)
         return false;
     size_t len = strlen(iface);
-    if (len == 0 || len >= ECAT_LINUX_IFNAME_MAX)
+    if (len == 0)
         return false;
-    if (!isalpha((unsigned char)iface[0]))
+
+    if (mode == ECAT_IFACE_LINUX_STRICT) {
+        if (len >= ECAT_LINUX_IFNAME_MAX)
+            return false;
+        if (!isalpha((unsigned char)iface[0]))
+            return false;
+        for (size_t i = 0; i < len; i++) {
+            unsigned char c = (unsigned char)iface[i];
+            if (!isalnum(c) && c != '_' && c != '-')
+                return false;
+        }
+        return true;
+    }
+
+    /* ECAT_IFACE_ANY_PLATFORM: Linux names + Windows NPF device paths */
+    if (len >= ECAT_IFNAME_MAX)
         return false;
     for (size_t i = 0; i < len; i++) {
         unsigned char c = (unsigned char)iface[i];
-        if (!isalnum(c) && c != '_' && c != '-')
+        if (!isalnum(c) && c != '_' && c != '-' &&
+            c != '\\' && c != '{' && c != '}' && c != '.')
             return false;
     }
     return true;
+}
+
+bool ecat_is_valid_iface_name(const char *iface)
+{
+    return ecat_iface_validate(iface, ECAT_IFACE_LINUX_STRICT);
 }
 
 /*

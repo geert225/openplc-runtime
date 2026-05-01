@@ -134,27 +134,15 @@ static void safe_strcpy_local(char *dest, const char *src, size_t max_len)
  * Diag Reset Helper
  * =============================================================================
  *
- * Initializes (or re-initializes after a stop/start) every field of the
- * per-cycle diagnostics struct.  Min sentinels start at UINT64_MAX so the
- * first cycle's "less-than" comparison wins.  All stores are relaxed: this
- * runs before the monitor thread is created and before the PLC enters
- * OPERATIONAL, so no synchronization with other threads is needed yet.
+ * Runs before the monitor thread is created and before the PLC enters
+ * OPERATIONAL — no concurrency yet, so memset is sufficient to zero the
+ * atomic fields.  The min sentinel starts at UINT64_MAX so the first
+ * cycle's "less-than" comparison wins.
  */
 static void diag_reset(ecat_cycle_diag_t *d)
 {
-    atomic_store_explicit(&d->cycle_count, 0, memory_order_relaxed);
-    atomic_store_explicit(&d->wkc_error_count, 0, memory_order_relaxed);
-    atomic_store_explicit(&d->noframe_count, 0, memory_order_relaxed);
-    atomic_store_explicit(&d->exchange_ns, 0, memory_order_relaxed);
-    atomic_store_explicit(&d->io_read_ns, 0, memory_order_relaxed);
-    atomic_store_explicit(&d->io_write_ns, 0, memory_order_relaxed);
-    atomic_store_explicit(&d->total_ns, 0, memory_order_relaxed);
-    atomic_store_explicit(&d->max_exchange_ns, 0, memory_order_relaxed);
-    atomic_store_explicit(&d->max_total_ns, 0, memory_order_relaxed);
-    atomic_store_explicit(&d->avg_total_ns, 0, memory_order_relaxed);
-    atomic_store_explicit(&d->avg_exchange_ns, 0, memory_order_relaxed);
-    atomic_store_explicit(&d->min_exchange_ns, UINT64_MAX, memory_order_relaxed);
-    atomic_store_explicit(&d->min_total_ns, UINT64_MAX, memory_order_relaxed);
+    memset(d, 0, sizeof(*d));
+    atomic_store_explicit(&d->min_bus_cycle_ns, UINT64_MAX, memory_order_relaxed);
 }
 
 /*
@@ -290,7 +278,12 @@ static int attempt_recovery(ecat_master_instance_t *inst)
         return 1;
     }
 
-    int attempts = atomic_fetch_add(&inst->recovery_attempts, 1) + 1;
+    /* Single-writer (monitor thread) — fetch_add not needed; load+store is
+     * sufficient and communicates the ownership model. */
+    int attempts = atomic_load_explicit(&inst->recovery_attempts,
+                                        memory_order_relaxed) + 1;
+    atomic_store_explicit(&inst->recovery_attempts, attempts,
+                          memory_order_relaxed);
 
     if (attempts >= ECAT_MAX_RECOVERY_ATTEMPTS) {
         plugin_logger_error(&g_logger,
@@ -583,15 +576,18 @@ static void stop_single_master(ecat_master_instance_t *inst)
         atomic_load_explicit(&inst->diag.cycle_count, memory_order_relaxed);
     uint64_t final_wkc_errors =
         atomic_load_explicit(&inst->diag.wkc_error_count, memory_order_relaxed);
-    int64_t  final_avg_total =
-        atomic_load_explicit(&inst->diag.avg_total_ns, memory_order_relaxed);
-    uint64_t final_min_total =
-        atomic_load_explicit(&inst->diag.min_total_ns, memory_order_relaxed);
-    uint64_t final_max_total =
-        atomic_load_explicit(&inst->diag.max_total_ns, memory_order_relaxed);
+    int64_t  final_avg =
+        atomic_load_explicit(&inst->diag.avg_bus_cycle_ns, memory_order_relaxed);
+    uint64_t final_min =
+        atomic_load_explicit(&inst->diag.min_bus_cycle_ns, memory_order_relaxed);
+    uint64_t final_max =
+        atomic_load_explicit(&inst->diag.max_bus_cycle_ns, memory_order_relaxed);
 
     if (final_cycle_count > 0 || final_wkc_errors > 0) {
         uint64_t total_cycles = final_cycle_count + final_wkc_errors;
+        /* min sentinel UINT64_MAX -> "n/a" */
+        unsigned long long min_us = (final_min == UINT64_MAX) ? 0
+                                  : (unsigned long long)(final_min / 1000);
         plugin_logger_info(&g_logger,
             "Master '%s': Final cycle stats: %llu total (%llu ok, %llu errors), "
             "avg=%lld us, min=%llu us, max=%llu us",
@@ -599,9 +595,9 @@ static void stop_single_master(ecat_master_instance_t *inst)
             (unsigned long long)total_cycles,
             (unsigned long long)final_cycle_count,
             (unsigned long long)final_wkc_errors,
-            (long long)(final_avg_total / 1000),
-            (unsigned long long)(final_min_total / 1000),
-            (unsigned long long)(final_max_total / 1000));
+            (long long)(final_avg / 1000),
+            min_us,
+            (unsigned long long)(final_max / 1000));
     }
 
     /* IP-stack isolation revert happens inside ecat_master_close(). */
@@ -640,6 +636,8 @@ static void stop_single_master(ecat_master_instance_t *inst)
 static void cycle_start_single(ecat_master_instance_t *inst)
 {
     int state = atomic_load(&inst->plugin_state);
+    /* RECOVERING is allowed: opportunistic exchange in the gaps between
+     * monitor recovery attempts.  exchange_skips counts trylock misses. */
     if (state != ECAT_STATE_OPERATIONAL && state != ECAT_STATE_RECOVERING)
         return;
 
@@ -690,9 +688,10 @@ static void cycle_start_single(ecat_master_instance_t *inst)
 
     /* Update diag lock-free.  Single-writer (PLC) + relaxed atomics; readers
      * tolerate cross-field tearing because diagnostics never do cross-field
-     * arithmetic. */
-    atomic_store_explicit(&inst->diag.exchange_ns, exchange_ns, memory_order_relaxed);
-    atomic_store_explicit(&inst->diag.total_ns, exchange_ns, memory_order_relaxed);
+     * arithmetic.  bus_cycle_ns measures the bus exchange (send+receive); the
+     * memcpy work in read/write_inputs_fast is dwarfed by it and intentionally
+     * not measured. */
+    atomic_store_explicit(&inst->diag.bus_cycle_ns, exchange_ns, memory_order_relaxed);
 
     if (wkc_error) {
         atomic_fetch_add_explicit(&inst->diag.wkc_error_count, 1,
@@ -709,39 +708,23 @@ static void cycle_start_single(ecat_master_instance_t *inst)
      * loop stalled at once cycle_count grew large).  Signed right shift
      * is implementation-defined in C but is arithmetic on GCC/Clang,
      * which the runtime already depends on. */
-    int64_t cur_avg_total = atomic_load_explicit(&inst->diag.avg_total_ns,
-                                                 memory_order_relaxed);
-    cur_avg_total += ((int64_t)exchange_ns - cur_avg_total) >> ECAT_AVG_EWMA_SHIFT;
-    atomic_store_explicit(&inst->diag.avg_total_ns, cur_avg_total,
-                          memory_order_relaxed);
-
-    int64_t cur_avg_exch = atomic_load_explicit(&inst->diag.avg_exchange_ns,
-                                                memory_order_relaxed);
-    cur_avg_exch += ((int64_t)exchange_ns - cur_avg_exch) >> ECAT_AVG_EWMA_SHIFT;
-    atomic_store_explicit(&inst->diag.avg_exchange_ns, cur_avg_exch,
+    int64_t cur_avg = atomic_load_explicit(&inst->diag.avg_bus_cycle_ns,
+                                           memory_order_relaxed);
+    cur_avg += ((int64_t)exchange_ns - cur_avg) >> ECAT_AVG_EWMA_SHIFT;
+    atomic_store_explicit(&inst->diag.avg_bus_cycle_ns, cur_avg,
                           memory_order_relaxed);
 
     /* Min/max: single-writer, no CAS needed. */
-    uint64_t cur = atomic_load_explicit(&inst->diag.max_exchange_ns,
+    uint64_t cur = atomic_load_explicit(&inst->diag.max_bus_cycle_ns,
                                         memory_order_relaxed);
     if (exchange_ns > cur)
-        atomic_store_explicit(&inst->diag.max_exchange_ns, exchange_ns,
+        atomic_store_explicit(&inst->diag.max_bus_cycle_ns, exchange_ns,
                               memory_order_relaxed);
 
-    cur = atomic_load_explicit(&inst->diag.min_exchange_ns,
+    cur = atomic_load_explicit(&inst->diag.min_bus_cycle_ns,
                                memory_order_relaxed);
     if (exchange_ns < cur)
-        atomic_store_explicit(&inst->diag.min_exchange_ns, exchange_ns,
-                              memory_order_relaxed);
-
-    cur = atomic_load_explicit(&inst->diag.max_total_ns, memory_order_relaxed);
-    if (exchange_ns > cur)
-        atomic_store_explicit(&inst->diag.max_total_ns, exchange_ns,
-                              memory_order_relaxed);
-
-    cur = atomic_load_explicit(&inst->diag.min_total_ns, memory_order_relaxed);
-    if (exchange_ns < cur)
-        atomic_store_explicit(&inst->diag.min_total_ns, exchange_ns,
+        atomic_store_explicit(&inst->diag.min_bus_cycle_ns, exchange_ns,
                               memory_order_relaxed);
 
     /* WKC error tracking.  No plugin_logger_* calls here -- the runtime
@@ -1129,12 +1112,9 @@ static int validate_interface_name(const char *ifname, char *response, size_t re
         snprintf(response, response_size, "{\"error\":\"invalid interface name length\"}");
         return -1;
     }
-    for (size_t i = 0; i < ifname_len; i++) {
-        unsigned char c = (unsigned char)ifname[i];
-        if (!isalnum(c) && c != '_' && c != '-' && c != '\\' && c != '{' && c != '}' && c != '.') {
-            snprintf(response, response_size, "{\"error\":\"invalid interface name format\"}");
-            return -1;
-        }
+    if (!ecat_iface_validate(ifname, ECAT_IFACE_ANY_PLATFORM)) {
+        snprintf(response, response_size, "{\"error\":\"invalid interface name format\"}");
+        return -1;
     }
     return 0;
 }
@@ -1407,21 +1387,26 @@ static void load_diag_view(const ecat_master_instance_t *inst,
     out->noframe_count = atomic_load_explicit(&inst->diag.noframe_count,
                                               memory_order_relaxed);
 
-    int64_t avg_t = atomic_load_explicit(&inst->diag.avg_total_ns,
-                                         memory_order_relaxed);
-    out->avg_cycle_us = (uint64_t)(avg_t / 1000);
+    /* Single bus_cycle_ns measurement is exposed under both legacy names
+     * (avg/min/max_cycle_us and min/max_exchange_us) for JSON compatibility
+     * with the Editor.  Both pairs reflect the same exchange (send+receive)
+     * timing — the duplicated naming is preserved to avoid breaking the
+     * existing JSON contract. */
+    int64_t avg = atomic_load_explicit(&inst->diag.avg_bus_cycle_ns,
+                                       memory_order_relaxed);
+    out->avg_cycle_us = (uint64_t)(avg / 1000);
 
-    uint64_t min_t = atomic_load_explicit(&inst->diag.min_total_ns,
-                                          memory_order_relaxed);
-    out->min_cycle_us = (min_t == UINT64_MAX) ? 0 : min_t / 1000;
-    out->max_cycle_us = atomic_load_explicit(&inst->diag.max_total_ns,
-                                             memory_order_relaxed) / 1000;
+    uint64_t min_bcn = atomic_load_explicit(&inst->diag.min_bus_cycle_ns,
+                                            memory_order_relaxed);
+    uint64_t max_bcn = atomic_load_explicit(&inst->diag.max_bus_cycle_ns,
+                                            memory_order_relaxed);
+    uint64_t min_us = (min_bcn == UINT64_MAX) ? 0 : min_bcn / 1000;
+    uint64_t max_us = max_bcn / 1000;
 
-    uint64_t min_e = atomic_load_explicit(&inst->diag.min_exchange_ns,
-                                          memory_order_relaxed);
-    out->min_exchange_us = (min_e == UINT64_MAX) ? 0 : min_e / 1000;
-    out->max_exchange_us = atomic_load_explicit(&inst->diag.max_exchange_ns,
-                                                memory_order_relaxed) / 1000;
+    out->min_cycle_us    = min_us;
+    out->max_cycle_us    = max_us;
+    out->min_exchange_us = min_us;
+    out->max_exchange_us = max_us;
 }
 
 /**
