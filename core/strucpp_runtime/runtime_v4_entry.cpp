@@ -15,8 +15,16 @@
 //   3. Export strucpp_set_locks() — runtime-side image-tables / globals
 //      mutex pointers handed in right after dlopen, stored where
 //      iec_threading.hpp's lock guards (Phase 8) can find them.
-//   4. Activate STRUCPP_V4_DEBUG_EXPORTS_DEFINE — emits the C-linkage
+//   4. Export strucpp_get_located_vars / strucpp_get_located_var_count
+//      — re-expose strucpp::locatedVars[] (a per-project namespaced
+//      symbol) under stable C linkage.
+//   5. Activate STRUCPP_V4_DEBUG_EXPORTS_DEFINE — emits the C-linkage
 //      strucpp_debug_* PDU helpers from debug_dispatch.hpp.
+//   6. Define the MatIEC-era lifecycle / time / md5 globals the runtime
+//      still dlsyms for symmetry with v3 host expectations:
+//      common_ticktime__, plc_program_md5, config_init__, updateTime.
+//      strucpp itself does not emit these — the Arduino sketch defines
+//      them too (in StrucppBaremetal/Baremetal.ino).
 //
 // The shim is small by design. See docs/strucpp-migration/05 in the
 // editor repo for the full reasoning.
@@ -24,8 +32,10 @@
 #define STRUCPP_V4_DEBUG_EXPORTS_DEFINE
 #include "debug_dispatch.hpp"
 #include "iec_located.hpp"
+#include "iec_std_lib.hpp"   // ConfigurationInstance + __CURRENT_TIME_NS
 #include "generated.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <pthread.h>
 
@@ -60,4 +70,67 @@ extern "C" const strucpp::LocatedVar *strucpp_get_located_vars(void) {
 
 extern "C" uint32_t strucpp_get_located_var_count(void) {
     return strucpp::locatedVarsCount;
+}
+
+// ---------------------------------------------------------------------------
+// MatIEC-era lifecycle / time / MD5 symbols.
+//
+// strucpp's generated.{cpp,hpp} does NOT emit these — they were Config0.c's
+// job in the MatIEC pipeline. The runtime still dlsyms them for symmetry,
+// so the shim defines them here. The Arduino integration does the
+// equivalent inside Baremetal.ino.
+// ---------------------------------------------------------------------------
+
+// Cycle period in ns. Default 20 ms; overwritten by config_init__ to the
+// GCD of declared task intervals so scan_cycle_manager sees a meaningful
+// base tick. Plain extern "C" variable — the runtime takes its address
+// via dlsym and dereferences each cycle.
+extern "C" unsigned long long common_ticktime__ = 20000000ULL;
+
+// Project MD5. Used by FC 0x45 to let the editor verify it's debugging
+// the program it has the source for. Default placeholder — the editor
+// can override at .so build time by emitting a small core/generated/
+// header that #defines STRUCPP_PLC_PROGRAM_MD5 (TODO: wire this through
+// scripts/compile.sh).
+#ifndef STRUCPP_PLC_PROGRAM_MD5
+#define STRUCPP_PLC_PROGRAM_MD5 "00000000000000000000000000000000"
+#endif
+extern "C" const char *plc_program_md5 = STRUCPP_PLC_PROGRAM_MD5;
+
+namespace {
+    unsigned long long gcd_u64(unsigned long long a, unsigned long long b) {
+        while (b) {
+            unsigned long long t = b;
+            b = a % b;
+            a = t;
+        }
+        return a;
+    }
+}
+
+// Called by the runtime once per program load, after all static
+// initializers have run (Configuration_CONFIG0 g_config; is fully
+// constructed by then). We use it to compute the GCD of declared task
+// intervals into common_ticktime__ — the scan_cycle stats expect a
+// meaningful value there.
+extern "C" void config_init__(void) {
+    unsigned long long gcd_ns = 0;
+    auto *resources = g_config.get_resources();
+    for (size_t r = 0; r < g_config.get_resource_count(); ++r) {
+        for (size_t t = 0; t < resources[r].task_count; ++t) {
+            unsigned long long ivl =
+                (unsigned long long)resources[r].tasks[t].interval_ns;
+            if (ivl == 0) ivl = 20000000ULL;
+            gcd_ns = (gcd_ns == 0) ? ivl : gcd_u64(gcd_ns, ivl);
+        }
+    }
+    if (gcd_ns != 0) common_ticktime__ = gcd_ns;
+}
+
+// Advances the strucpp runtime's scan-cycle clock by one base tick.
+// Called by the runtime once per cycle (the fastest task's housekeeping
+// window invokes it via plc_run_io_cycle_post). CODESYS semantics:
+// TIME() returns the same value for the duration of a cycle.
+extern "C" void updateTime(void) {
+    strucpp::__CURRENT_TIME_NS += static_cast<int64_t>(common_ticktime__);
 }
