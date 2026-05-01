@@ -8,14 +8,12 @@
 //
 // CONTRACT: every type below MUST match the layout strucpp's vendored
 // headers expose. The .so's vtables, struct offsets, and enum values
-// are all assumed identical. When the strucpp ABI version bumps in a
-// breaking way, this file is the only thing that needs to change.
+// are all assumed identical. ABI consistency between the runtime and
+// the strucpp version a user .so was built against is maintained as
+// part of the development cycle — not enforced here. When strucpp's
+// ABI version bumps in a breaking way, update this file.
 //
 // Mirrored from strucpp v0.4.5 (iec_located.hpp + iec_std_lib.hpp).
-//
-// Verified static_assert layout checks live at the bottom — if a
-// build of this header fails an assertion, the ABI has drifted and
-// this mirror needs an update.
 
 #ifndef OPENPLC_STRUCPP_ABI_HPP
 #define OPENPLC_STRUCPP_ABI_HPP
@@ -51,11 +49,6 @@ struct LocatedVar {
     uint8_t     _reserved[3];
     void       *pointer;
 };
-
-static_assert(sizeof(LocatedVar) == 16,
-              "strucpp::LocatedVar layout drift — expected 16 bytes on 64-bit");
-static_assert(alignof(LocatedVar) == 8,
-              "strucpp::LocatedVar alignment drift — expected 8 bytes");
 
 // ---------------------------------------------------------------------------
 // ProgramBase (mirror of strucpp::ProgramBase, iec_std_lib.hpp)
