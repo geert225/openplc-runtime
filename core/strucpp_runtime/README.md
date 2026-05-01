@@ -1,20 +1,23 @@
 # strucpp_runtime
 
-Runtime-side STruC++ assets:
+Runtime-side asset:
 
-- `include/` — vendored snapshot of strucpp's runtime headers (the
-  `iec_*.hpp` set + `debug_dispatch.hpp`). The version they were taken
-  from is in `include/VERSION`. The runtime executable AND every user
-  `.so` built by `scripts/compile.sh` include from this single copy, so
-  ABI is automatically consistent.
+- `runtime_v4_entry.cpp` — small static C-linkage shim (~50 lines)
+  compiled into every user `.so` by `scripts/compile.sh`. Defines
+  `g_config`, exports `strucpp_get_config()` / `strucpp_set_locks()` /
+  `strucpp_get_located_vars()` / `strucpp_get_located_var_count()`,
+  and activates the C-linkage debug PDU exports from
+  `debug_dispatch.hpp` (`STRUCPP_V4_DEBUG_EXPORTS_DEFINE`).
+  Identical for every project — no per-project codegen.
 
-- `runtime_v4_entry.cpp` — tiny static shim compiled into every user
-  `.so`. Defines `g_config`, exports `strucpp_get_config()` /
-  `strucpp_set_locks()`, activates the C-linkage debug PDU exports from
-  `debug_dispatch.hpp` (`STRUCPP_V4_DEBUG_EXPORTS_DEFINE`). Does NOT
-  ship from the editor — it's purely a runtime-side build asset.
+The strucpp runtime headers are NOT vendored here. They ship with
+each user-program upload under `core/generated/strucpp_runtime/include/`,
+and `compile.sh` references them from there when compiling the `.so`.
+The runtime executable (`plc_main`) does not include strucpp's full
+header set — it uses a small layout-mirror at
+`core/include/strucpp_abi.hpp` to walk the configuration via virtual
+dispatch.
 
-When updating the strucpp version, replace `include/` wholesale and
-update `include/VERSION`. Editors must be on a STruC++ release with a
-compatible runtime ABI (same `ConfigurationInstance` /
-`LocatedVar` / `Entry` layouts).
+ABI contract: `core/include/strucpp_abi.hpp` must match the strucpp
+runtime ABI used by the `.so`. When strucpp's ABI version bumps in a
+breaking way, that file is the only thing that needs to update.

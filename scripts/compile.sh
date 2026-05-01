@@ -20,7 +20,9 @@ set -euo pipefail
 
 GENERATED_DIR="core/generated"
 RUNTIME_SHIM="core/strucpp_runtime/runtime_v4_entry.cpp"
-RUNTIME_INC="core/strucpp_runtime/include"
+# strucpp runtime headers ship with the user-program upload — the
+# runtime itself does NOT vendor a copy.
+RUNTIME_INC="$GENERATED_DIR/strucpp_runtime/include"
 PYTHON_INCLUDE_PATH="core/src/plc_app/include"
 PYTHON_LOADER_SRC="core/src/plc_app/python_loader.c"
 BUILD_DIR="build"

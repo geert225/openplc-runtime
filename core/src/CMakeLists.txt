@@ -9,10 +9,15 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PYTHON REQUIRED python3-embed)
 
-# Include directories
+# Include directories.
+#
+# core/include/ holds the runtime-side strucpp ABI mirror
+# (strucpp_abi.hpp). We do NOT vendor strucpp's full runtime headers
+# into the runtime — those ship with each user-program upload and are
+# only consumed by scripts/compile.sh when building the .so.
 include_directories(${CMAKE_SOURCE_DIR}/core/src/plc_app
                     ${CMAKE_SOURCE_DIR}/core/src/plc_app/utils
-                    ${CMAKE_SOURCE_DIR}/core/strucpp_runtime/include
+                    ${CMAKE_SOURCE_DIR}/core/include
                     ${CMAKE_SOURCE_DIR}/core/generated/plc_lib
                     ${CMAKE_SOURCE_DIR}/core/generated/plc_lib/lib
                     ${PYTHON_INCLUDE_DIRS})

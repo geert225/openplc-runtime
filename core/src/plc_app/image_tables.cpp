@@ -15,13 +15,12 @@ extern "C" {
 #include "include/iec_python.h"
 }
 
-// strucpp runtime headers (vendored in core/strucpp_runtime/include/)
-// The locatedVars[] descriptor is per-project and lives in the loaded
-// .so; the runtime accesses it via C-linkage shim accessors
-// (strucpp_get_located_vars / strucpp_get_located_var_count) rather than
-// reaching into the strucpp namespace directly.
-#include "iec_located.hpp"
-#include "iec_std_lib.hpp"  // ConfigurationInstance, ResourceInstance, TaskInstance
+// Layout-compatible mirror of the strucpp ABI. The runtime executable
+// is built once and walks ConfigurationInstance / LocatedVar through
+// these mirrors; the actual strucpp runtime headers ship with the user
+// program upload (under core/generated/strucpp_runtime/include/) and
+// are consumed only by scripts/compile.sh when building the .so.
+#include "strucpp_abi.hpp"
 
 #include "image_tables.h"
 #include "plcapp_manager.h"
@@ -93,10 +92,7 @@ namespace {
     {
         pthread_mutexattr_t attr;
         if (pthread_mutexattr_init(&attr) != 0) return -1;
-#if !defined(__CYGWIN__) && !defined(__MSYS__) && !defined(__APPLE__)
-        // PI is Linux-only; macOS dev builds get plain recursive mutex.
         pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_INHERIT);
-#endif
         pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
         int rc = pthread_mutex_init(m, &attr);
         pthread_mutexattr_destroy(&attr);

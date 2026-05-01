@@ -1,7 +1,11 @@
 // plc_state_manager.cpp
 //
-// Phase 5 implementation — single-thread cycle, walks ConfigurationInstance
-// via virtual dispatch. Phase 6 will replace the cycle loop with thread-per-task.
+// Walks the loaded program's ConfigurationInstance via virtual dispatch
+// (Phase 5), spawns one SCHED_FIFO pthread per IEC TASK (Phase 6), and
+// anchors the per-cycle housekeeping window on the fastest task's
+// thread (Phase 7).
+//
+// Linux-only (the runtime targets Linux).
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -17,13 +21,14 @@
 #include <ctime>
 
 #include <pthread.h>
+#include <sched.h>
 
 extern "C" {
 #include "../drivers/plugin_driver.h"
 }
 
-// strucpp runtime headers (vendored)
-#include "iec_std_lib.hpp"
+// Runtime-side strucpp ABI mirror — see core/include/strucpp_abi.hpp
+#include "strucpp_abi.hpp"
 
 #include "image_tables.h"
 #include "journal_buffer.h"
@@ -99,7 +104,6 @@ static void *plc_task_thread(void *arg)
     PlcTaskCtx *ctx = static_cast<PlcTaskCtx *>(arg);
     current_task_ctx = ctx;
 
-#if defined(__linux__)
     pthread_setname_np(pthread_self(), ctx->name);
 
     int rt = ctx->priority;
@@ -131,7 +135,6 @@ static void *plc_task_thread(void *arg)
                      ctx->name, strerror(errno));
         }
     }
-#endif
 
     if (sigsetjmp(ctx->crash_jmp, 1) != 0)
     {
@@ -190,17 +193,8 @@ static void *plc_task_thread(void *arg)
             next_wakeup.tv_nsec -= 1000000000L;
             next_wakeup.tv_sec  += 1;
         }
-#if defined(__linux__)
         int rc = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_wakeup, nullptr);
         if (rc == EINTR) continue;
-#else
-        timespec now, rel;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        rel.tv_sec  = next_wakeup.tv_sec  - now.tv_sec;
-        rel.tv_nsec = next_wakeup.tv_nsec - now.tv_nsec;
-        if (rel.tv_nsec < 0) { rel.tv_sec--; rel.tv_nsec += 1000000000L; }
-        if (rel.tv_sec >= 0) nanosleep(&rel, nullptr);
-#endif
     }
 
     log_info("[task %s] stopped after %llu ticks", ctx->name,
