@@ -83,11 +83,18 @@ extern "C" uint32_t strucpp_get_located_var_count(void) {
 #include "defines.h"
 
 // Block-form language linkage for the definition. The single-decl form
-// (extern "C" const char *foo = ...;) is parsed by g++ as both
+// (extern "C" const char foo[] = ...;) is parsed by g++ as both
 // "extern" storage class and an initializer, triggering a warning;
 // the block form expresses C linkage without that ambiguity.
+//
+// Define as a char array (not a pointer-to-char) so dlsym returns the
+// address of the string itself. The runtime treats
+// ext_strucpp_program_md5 as char* and indexes it directly — if this
+// were `const char *strucpp_program_md5 = ...`, dlsym would return
+// the address of the pointer variable instead, and the indexed reads
+// would surface the raw pointer bytes as garbage.
 extern "C" {
-const char *strucpp_program_md5 = PROGRAM_MD5;
+const char strucpp_program_md5[] = PROGRAM_MD5;
 }
 
 // Advances the strucpp runtime's scan-cycle clock. Called by the runtime
