@@ -772,6 +772,10 @@ int init(void *args)
     /* Re-initialize logger with runtime_args for central logging */
     plugin_logger_init(&g_logger, "ETHERCAT", args);
 
+    /* Share the logger with the config parser so its diagnostic messages
+     * land in the runtime journal instead of stderr. */
+    ecat_config_set_logger(&g_logger);
+
     plugin_logger_info(&g_logger, "Buffer size: %d", g_runtime_args.buffer_size);
 
     /* Parse ALL master configurations from the JSON file */

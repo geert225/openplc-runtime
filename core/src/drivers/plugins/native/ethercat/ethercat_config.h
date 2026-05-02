@@ -15,6 +15,7 @@
 #include <stdatomic.h>
 #include <pthread.h>
 
+#include "plugin_logger.h"
 #include "soem/soem.h"
 
 /* Maximum sizes */
@@ -274,6 +275,15 @@ int ecat_config_parse(const char *config_path, ecat_config_t *config);
  * @return ECAT_CONFIG_OK on success, negative error code on failure
  */
 int ecat_config_validate(const ecat_config_t *config);
+
+/**
+ * @brief Provide a logger for the config parser to use for diagnostic messages.
+ *
+ * Optional — when not set, the parser falls back to stderr.  Idempotent.
+ * The pointer must remain valid for the lifetime of any subsequent
+ * ecat_config_parse* call (typically the lifetime of the plugin).
+ */
+void ecat_config_set_logger(plugin_logger_t *logger);
 
 /**
  * @brief Validation mode for interface names.

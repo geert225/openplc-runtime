@@ -11,9 +11,26 @@
 #include "cJSON.h"
 
 #include <ctype.h>
+#include <float.h>
+#include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* ------------------------------------------------------------------ */
+/*  Diagnostic logging                                                 */
+/* ------------------------------------------------------------------ */
+
+/* Shared plugin logger.  Must be set via ecat_config_set_logger() in
+ * plugin init() before any ecat_config_parse* call.  Read-only after
+ * setup, no concurrency. */
+static plugin_logger_t *g_config_logger = NULL;
+
+void ecat_config_set_logger(plugin_logger_t *logger)
+{
+    g_config_logger = logger;
+}
 
 /** Linux IFNAMSIZ is 16; valid iface names are 1..15 chars. */
 #define ECAT_LINUX_IFNAME_MAX 16
@@ -382,21 +399,98 @@ static int parse_pdo_array(const cJSON *pdo_array, ecat_pdo_t *pdos, int *pdo_co
 }
 
 /**
- * @brief Parse a single SDO configuration from JSON
+ * @brief Check whether a JSON-derived double value fits the wire type.
+ *
+ * Catches NaN/Inf and out-of-range values that would silently wrap or
+ * trigger UB during the cast in ecat_master_write_sdos.  For INT64/UINT64
+ * the bound is the largest magnitude that double can represent; values
+ * above that lose precision before reaching the parser, so the check is
+ * grosso modo by design.
+ */
+static bool sdo_value_in_range(ecat_data_type_t dt, double v)
+{
+    if (isnan(v) || isinf(v))
+        return false;
+    switch (dt) {
+    case ECAT_DTYPE_BOOL:   return v == 0.0 || v == 1.0;
+    case ECAT_DTYPE_INT8:   return v >= INT8_MIN  && v <= INT8_MAX;
+    case ECAT_DTYPE_UINT8:  return v >= 0         && v <= UINT8_MAX;
+    case ECAT_DTYPE_INT16:  return v >= INT16_MIN && v <= INT16_MAX;
+    case ECAT_DTYPE_UINT16: return v >= 0         && v <= UINT16_MAX;
+    case ECAT_DTYPE_INT32:  return v >= INT32_MIN && v <= INT32_MAX;
+    case ECAT_DTYPE_UINT32: return v >= 0         && v <= UINT32_MAX;
+    case ECAT_DTYPE_INT64:  return v >= -9.223372036854776e18 && v <= 9.223372036854776e18;
+    case ECAT_DTYPE_UINT64: return v >= 0 && v <= 1.844674407370955e19;
+    case ECAT_DTYPE_REAL32: return v >= -FLT_MAX && v <= FLT_MAX;
+    case ECAT_DTYPE_REAL64: return true;
+    case ECAT_DTYPE_UNKNOWN:
+    case ECAT_DTYPE_PAD:    return false;
+    }
+    return false;
+}
+
+/**
+ * @brief Parse a single SDO configuration from JSON.
+ *
+ * Strict: malformed entries are rejected with a contextual error message
+ * (index, subindex, type) so the operator can locate the bad SDO without
+ * grepping warnings during bus open.
+ *
+ * @return ECAT_CONFIG_OK on success, error code otherwise.
  */
 static int parse_sdo(const cJSON *sdo_json, ecat_sdo_config_t *sdo)
 {
-    if (sdo_json == NULL || sdo == NULL) {
+    if (sdo_json == NULL || sdo == NULL)
+        return ECAT_CONFIG_ERR_INVALID;
+
+    /* index: required, accepts hex (0x...) or decimal via base 0; range 0x0001..0xFFFF */
+    const char *idx_str = get_string(sdo_json, "index", NULL);
+    if (idx_str == NULL || idx_str[0] == '\0') {
+        plugin_logger_error(g_config_logger, "SDO entry missing 'index'");
+        return ECAT_CONFIG_ERR_MISSING;
+    }
+    char *endptr = NULL;
+    unsigned long idx = strtoul(idx_str, &endptr, 0);
+    if (endptr == idx_str || *endptr != '\0' || idx == 0 || idx > 0xFFFF) {
+        plugin_logger_error(g_config_logger,
+            "SDO 'index' invalid: '%s' (must be hex 0x0001..0xFFFF)", idx_str);
+        return ECAT_CONFIG_ERR_INVALID;
+    }
+    snprintf(sdo->index, sizeof(sdo->index), "0x%04lX", idx);
+
+    /* subindex: optional, default 0 (single-entry SDOs).  When present must be 0..255 */
+    const cJSON *si = cJSON_GetObjectItemCaseSensitive(sdo_json, "subindex");
+    if (si == NULL) {
+        sdo->subindex = 0;
+    } else if (cJSON_IsNumber(si) && si->valueint >= 0 && si->valueint <= 255) {
+        sdo->subindex = (uint8_t)si->valueint;
+    } else {
+        plugin_logger_error(g_config_logger,
+            "SDO %s 'subindex' invalid (must be number 0..255)", sdo->index);
         return ECAT_CONFIG_ERR_INVALID;
     }
 
-    safe_strcpy(sdo->index, get_string(sdo_json, "index", "0x0000"), sizeof(sdo->index));
-    sdo->subindex = (uint8_t)get_int(sdo_json, "subindex", 0);
-    sdo->value = get_numeric_value(sdo_json, "value", 0.0);
+    /* data_type: required, must resolve to a known type (UNKNOWN/PAD reject) */
     safe_strcpy(sdo->data_type, get_string(sdo_json, "data_type", ""), sizeof(sdo->data_type));
     sdo->parsed_type = ecat_parse_data_type(sdo->data_type);
-    safe_strcpy(sdo->name, get_string(sdo_json, "name", ""), sizeof(sdo->name));
+    if (sdo->parsed_type == ECAT_DTYPE_UNKNOWN || sdo->parsed_type == ECAT_DTYPE_PAD) {
+        plugin_logger_error(g_config_logger,
+            "SDO %s:%d 'data_type' invalid: '%s' "
+            "(use BOOL/INT8/UINT8/INT16/UINT16/INT32/UINT32/INT64/UINT64/REAL/LREAL)",
+            sdo->index, sdo->subindex, sdo->data_type);
+        return ECAT_CONFIG_ERR_INVALID;
+    }
 
+    /* value: optional with default 0.  When present must fit the wire type. */
+    sdo->value = get_numeric_value(sdo_json, "value", 0.0);
+    if (!sdo_value_in_range(sdo->parsed_type, sdo->value)) {
+        plugin_logger_error(g_config_logger,
+            "SDO %s:%d 'value' %g out of range for type %s",
+            sdo->index, sdo->subindex, sdo->value, sdo->data_type);
+        return ECAT_CONFIG_ERR_INVALID;
+    }
+
+    safe_strcpy(sdo->name, get_string(sdo_json, "name", ""), sizeof(sdo->name));
     return ECAT_CONFIG_OK;
 }
 
@@ -456,18 +550,28 @@ static int parse_slave(const cJSON *slave_json, ecat_slave_t *slave)
         }
     }
 
-    /* Parse SDO configurations */
+    /* Parse SDO configurations.  A malformed SDO aborts the slave entirely:
+     * a partial SDO write set leaves the slave in an undefined state, so
+     * fail-fast at parse time forces the operator to fix the JSON. */
     slave->sdo_count = 0;
     const cJSON *sdos = cJSON_GetObjectItemCaseSensitive(slave_json, "sdo_configurations");
     if (sdos != NULL && cJSON_IsArray(sdos)) {
         const cJSON *sdo_json;
         cJSON_ArrayForEach(sdo_json, sdos) {
             if (slave->sdo_count >= ECAT_MAX_SDOS) {
-                break;
+                plugin_logger_error(g_config_logger,
+                    "Slave '%s' position %d: SDO count exceeds ECAT_MAX_SDOS=%d",
+                    slave->name, slave->position, ECAT_MAX_SDOS);
+                return ECAT_CONFIG_ERR_INVALID;
             }
-            if (parse_sdo(sdo_json, &slave->sdo_configs[slave->sdo_count]) == ECAT_CONFIG_OK) {
-                slave->sdo_count++;
+            int prc = parse_sdo(sdo_json, &slave->sdo_configs[slave->sdo_count]);
+            if (prc != ECAT_CONFIG_OK) {
+                plugin_logger_error(g_config_logger,
+                    "Slave '%s' position %d: SDO entry rejected (rc=%d) -- aborting slave parse",
+                    slave->name, slave->position, prc);
+                return prc;
             }
+            slave->sdo_count++;
         }
     }
 
@@ -567,11 +671,17 @@ static int parse_slaves_section(const cJSON *slaves, ecat_config_t *config)
     const cJSON *slave_json;
     cJSON_ArrayForEach(slave_json, slaves) {
         if (config->slave_count >= ECAT_MAX_SLAVES) {
+            plugin_logger_error(g_config_logger,
+                "slaves array exceeds ECAT_MAX_SLAVES=%d -- "
+                "extra entries ignored", ECAT_MAX_SLAVES);
             break;
         }
-        if (parse_slave(slave_json, &config->slaves[config->slave_count]) == ECAT_CONFIG_OK) {
-            config->slave_count++;
+        int prc = parse_slave(slave_json, &config->slaves[config->slave_count]);
+        if (prc != ECAT_CONFIG_OK) {
+            /* parse_slave already logged the specific reason; propagate. */
+            return prc;
         }
+        config->slave_count++;
     }
 
     return ECAT_CONFIG_OK;
@@ -658,7 +768,11 @@ int ecat_config_parse(const char *config_path, ecat_config_t *config)
 
     /* Parse each section */
     parse_master_section(cJSON_GetObjectItemCaseSensitive(config_obj, "master"), &config->master);
-    parse_slaves_section(cJSON_GetObjectItemCaseSensitive(config_obj, "slaves"), config);
+    int srs = parse_slaves_section(cJSON_GetObjectItemCaseSensitive(config_obj, "slaves"), config);
+    if (srs != ECAT_CONFIG_OK) {
+        cJSON_Delete(root);
+        return srs;
+    }
     parse_diagnostics_section(cJSON_GetObjectItemCaseSensitive(config_obj, "diagnostics"), &config->diagnostics);
 
     cJSON_Delete(root);
@@ -703,8 +817,12 @@ int ecat_config_parse_all(const char *config_path,
         safe_strcpy(instances[0].name, name, sizeof(instances[0].name));
         parse_master_section(cJSON_GetObjectItemCaseSensitive(config_obj, "master"),
                              &instances[0].config.master);
-        parse_slaves_section(cJSON_GetObjectItemCaseSensitive(config_obj, "slaves"),
-                             &instances[0].config);
+        int srs = parse_slaves_section(cJSON_GetObjectItemCaseSensitive(config_obj, "slaves"),
+                                       &instances[0].config);
+        if (srs != ECAT_CONFIG_OK) {
+            cJSON_Delete(root);
+            return srs;
+        }
         parse_diagnostics_section(cJSON_GetObjectItemCaseSensitive(config_obj, "diagnostics"),
                                   &instances[0].config.diagnostics);
         cJSON_Delete(root);
@@ -737,10 +855,10 @@ int ecat_config_parse_all(const char *config_path,
          * visible -- the editor lets the operator add an arbitrary
          * number of entries; silent truncation here surprises users. */
         if (count >= max_masters) {
-            fprintf(stderr, "ETHERCAT CONFIG: skipping entry[%d] '%s' -- "
-                    "max_masters=%d reached. Increase ECAT_MAX_MASTERS "
-                    "or remove extra ETHERCAT entries.\n",
-                    i, name, max_masters);
+            plugin_logger_error(g_config_logger,
+                "skipping entry[%d] '%s' -- max_masters=%d reached. "
+                "Increase ECAT_MAX_MASTERS or remove extra ETHERCAT entries.",
+                i, name, max_masters);
             continue;
         }
 
@@ -750,11 +868,21 @@ int ecat_config_parse_all(const char *config_path,
         /* Extract master name */
         safe_strcpy(instances[count].name, name, sizeof(instances[count].name));
 
-        /* Parse configuration sections */
+        /* Parse configuration sections.  A SDO/slave-level error aborts
+         * the whole config -- a partially loaded master would surprise
+         * the operator at bus-up time. */
         parse_master_section(cJSON_GetObjectItemCaseSensitive(config_obj, "master"),
                              &instances[count].config.master);
-        parse_slaves_section(cJSON_GetObjectItemCaseSensitive(config_obj, "slaves"),
-                             &instances[count].config);
+        int srs = parse_slaves_section(cJSON_GetObjectItemCaseSensitive(config_obj, "slaves"),
+                                       &instances[count].config);
+        if (srs != ECAT_CONFIG_OK) {
+            plugin_logger_error(g_config_logger,
+                "entry[%d] '%s': slaves section failed (rc=%d) -- aborting parse",
+                i, name, srs);
+            cJSON_Delete(root);
+            *out_count = 0;
+            return srs;
+        }
         parse_diagnostics_section(cJSON_GetObjectItemCaseSensitive(config_obj, "diagnostics"),
                                   &instances[count].config.diagnostics);
 
@@ -763,8 +891,9 @@ int ecat_config_parse_all(const char *config_path,
         if (result == ECAT_CONFIG_OK) {
             count++;
         } else {
-            fprintf(stderr, "ETHERCAT CONFIG: skipping entry[%d] '%s' "
-                    "(validation failed, error=%d)\n", i, name, result);
+            plugin_logger_error(g_config_logger,
+                "skipping entry[%d] '%s' (validation failed, error=%d)",
+                i, name, result);
         }
     }
 
@@ -778,10 +907,9 @@ int ecat_config_parse_all(const char *config_path,
         for (int j = i + 1; j < count; j++) {
             if (strcmp(instances[i].config.master.interface,
                        instances[j].config.master.interface) == 0) {
-                fprintf(stderr,
-                    "ETHERCAT CONFIG: masters '%s' and '%s' share "
-                    "interface '%s' -- not supported. Use a distinct "
-                    "interface per master.\n",
+                plugin_logger_error(g_config_logger,
+                    "masters '%s' and '%s' share interface '%s' -- "
+                    "not supported. Use a distinct interface per master.",
                     instances[i].name, instances[j].name,
                     instances[i].config.master.interface);
                 *out_count = 0;

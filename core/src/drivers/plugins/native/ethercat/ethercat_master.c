@@ -283,15 +283,15 @@ int ecat_master_write_sdos(ecat_master_instance_t *inst, int slave_pos,
         /* Parse index from hex string */
         uint16_t index = (uint16_t)strtol(sdo->index, NULL, 16);
 
-        /* Determine data size from data type */
+        /* Determine data size from data type.  parse_sdo rejects UNKNOWN/PAD
+         * so this branch is defensive -- if it triggers, the parser regressed. */
         ecat_data_type_t dt = sdo->parsed_type;
         int size = ecat_data_type_size(dt);
         if (size <= 0) {
-            plugin_logger_warn(logger,
-                "Slave %d SDO 0x%04X:%d: unknown data type '%s', assuming 4 bytes",
+            plugin_logger_error(logger,
+                "Slave %d SDO 0x%04X:%d: unknown data type '%s' -- skipping (parser regression?)",
                 slave_pos, index, sdo->subindex, sdo->data_type);
-            size = 4;
-            dt = ECAT_DTYPE_INT32;
+            continue;
         }
 
         /* Encode the double value into the correct wire type */
