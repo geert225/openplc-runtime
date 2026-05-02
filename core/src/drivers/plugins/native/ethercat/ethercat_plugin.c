@@ -474,13 +474,29 @@ static int start_single_master(ecat_master_instance_t *inst)
         return -1;
     }
 
-    /* Build channel map for process data exchange */
-    ecat_io_build_channel_map(&inst->config, &inst->channel_map,
-                              inst, &g_runtime_args, &g_logger);
+    /* Build channel map for process data exchange.  Partial maps are
+     * rejected -- the operator must fix the JSON before the master can
+     * enter OPERATIONAL with stale variable bindings. */
+    if (ecat_io_build_channel_map(&inst->config, &inst->channel_map,
+                                  inst, &g_runtime_args, &g_logger) != 0) {
+        plugin_logger_error(&g_logger,
+            "Master '%s': channel map build failed -- aborting startup",
+            inst->name);
+        ecat_master_close(inst, &g_logger);
+        atomic_store(&inst->plugin_state, ECAT_STATE_ERROR);
+        return -1;
+    }
 
     /* Build pre-resolved transfer list for fast per-cycle I/O */
-    ecat_io_build_transfer_list(&inst->channel_map, &inst->transfer_list,
-                                &g_runtime_args, &g_logger);
+    if (ecat_io_build_transfer_list(&inst->channel_map, &inst->transfer_list,
+                                    &g_runtime_args, &g_logger) != 0) {
+        plugin_logger_error(&g_logger,
+            "Master '%s': transfer list build failed -- aborting startup",
+            inst->name);
+        ecat_master_close(inst, &g_logger);
+        atomic_store(&inst->plugin_state, ECAT_STATE_ERROR);
+        return -1;
+    }
 
     /* Cache expected WKC */
     inst->expected_wkc = ecat_master_get_expected_wkc(inst);

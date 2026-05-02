@@ -53,7 +53,8 @@ int ecat_io_parse_iec_location(const char *loc_str, iec_location_t *loc);
  * @param inst    Master instance (provides SOEM context and IOmap)
  * @param args    Runtime args (for buffer_size bounds check)
  * @param logger  Logger instance
- * @return 0 on success, -1 if no channels could be mapped
+ * @return 0 on success, -1 if any channel failed to map (partial maps
+ *         are rejected to surface JSON/ESI mismatches at startup)
  */
 int ecat_io_build_channel_map(const ecat_config_t *config,
                               ecat_channel_map_t *map,
@@ -75,7 +76,9 @@ int ecat_io_build_channel_map(const ecat_config_t *config,
  * @param xfer   Output transfer list (zeroed before population)
  * @param args   Runtime args with PLC buffer pointers
  * @param logger Logger instance
- * @return Number of entries resolved, or -1 on error
+ * @return 0 on success, -1 if zero channels resolved (image table not
+ *         populated yet).  Channels without a PLC variable bound are
+ *         skipped with a warn but do not fail the call.
  */
 int ecat_io_build_transfer_list(const ecat_channel_map_t *map,
                                 ecat_transfer_list_t *xfer,

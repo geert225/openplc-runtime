@@ -579,22 +579,39 @@ int ecat_master_configure(ecat_master_instance_t *inst, plugin_logger_t *logger)
         return -1;
     }
 
-    /* Step 4: Map process data (IO map) */
+    /* Step 4: Map process data (IO map).  ecx_config_map_group returns
+     * the IOmap size in bytes -- 0 means SOEM could not lay out PDOs
+     * (typically SII corrupted, mailbox stuck, or slave not responding
+     * to FPRD).  Without this check we would silently enter SAFE-OP/OP
+     * with an empty IOmap and produce wkc=0 every cycle. */
     plugin_logger_info(logger, "Mapping process data...");
 
-    ecx_config_map_group(&inst->ecx_context, &inst->iomap, 0);
-
-    ec_groupt *grp = &inst->ecx_context.grouplist[0];
-
-    /* Check that total I/O fits in the IOmap buffer */
-    uint32_t total_io = (uint32_t)grp->Obytes + (uint32_t)grp->Ibytes;
-    if (total_io > ECAT_IOMAP_SIZE) {
-        plugin_logger_error(logger, "IOmap overflow: need %u bytes, have %d",
-                            total_io, ECAT_IOMAP_SIZE);
+    int io_size = ecx_config_map_group(&inst->ecx_context, &inst->iomap, 0);
+    if (io_size <= 0) {
+        plugin_logger_error(logger,
+            "ecx_config_map_group returned %d -- process data mapping failed "
+            "(likely SII / mailbox issue)", io_size);
+        return -1;
+    }
+    if (io_size > ECAT_IOMAP_SIZE) {
+        plugin_logger_error(logger, "IOmap overflow: need %d bytes, have %d",
+                            io_size, ECAT_IOMAP_SIZE);
         return -1;
     }
 
-    inst->iomap_used_size = (size_t)total_io;
+    inst->iomap_used_size = (size_t)io_size;
+
+    /* Cross-check: the per-group totals should add up to the same value
+     * SOEM returned.  A mismatch is a SOEM bug or our config is racy --
+     * not fatal but worth surfacing. */
+    ec_groupt *grp = &inst->ecx_context.grouplist[0];
+    uint32_t grp_total = (uint32_t)grp->Obytes + (uint32_t)grp->Ibytes;
+    if ((int)grp_total != io_size) {
+        plugin_logger_warn(logger,
+            "IOmap size mismatch: ecx returned %d but grp totals=%u "
+            "(Obytes=%d Ibytes=%d)",
+            io_size, grp_total, grp->Obytes, grp->Ibytes);
+    }
 
     plugin_logger_info(logger, "IO map: %d output bytes, %d input bytes, %d segments",
                        grp->Obytes, grp->Ibytes, grp->nsegments);

@@ -400,7 +400,17 @@ int ecat_io_build_channel_map(const ecat_config_t *config,
         "Channel map built: %d inputs, %d outputs (%d errors)",
         map->input_count, map->output_count, errors);
 
-    return (mapped > 0) ? 0 : -1;
+    /* Reject partial maps: a typo or ESI mismatch that drops half the
+     * channels would leave the PLC running with stale variables and no
+     * indication of why.  Fail-fast forces the operator to fix the JSON. */
+    if (errors > 0) {
+        plugin_logger_error(logger,
+            "channel map rejected: %d entry/entries failed to map", errors);
+        return -1;
+    }
+    if (mapped == 0)
+        return -1;
+    return 0;
 }
 
 /*
@@ -531,7 +541,18 @@ int ecat_io_build_transfer_list(const ecat_channel_map_t *map,
         "Transfer list built: %d inputs, %d outputs (%d resolved)",
         xfer->input_count, xfer->output_count, resolved);
 
-    return resolved > 0 ? resolved : -1;
+    /* Channels without a PLC variable bound (NULL plc_ptr) are skipped --
+     * legitimate when not every IEC location is mapped to a program
+     * variable.  Surface as warn so the operator can spot mistakes. */
+    int total = map->input_count + map->output_count;
+    if (resolved < total) {
+        plugin_logger_warn(logger,
+            "transfer list: %d/%d channels resolved -- %d skipped (no PLC variable bound)",
+            resolved, total, total - resolved);
+    }
+    if (resolved == 0)
+        return -1;
+    return 0;
 }
 
 void ecat_io_read_inputs_fast(const ecat_transfer_list_t *xfer,
