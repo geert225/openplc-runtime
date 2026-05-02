@@ -55,7 +55,19 @@ check_required_files() {
 check_required_files
 
 CXXFLAGS=(
-    -std=c++17 -O2 -fPIC -Wall -Wno-unknown-pragmas -Wno-deprecated-declarations
+    # -O1 (not -O2): generated.cpp is mostly per-element IECVar
+    # assignments and generated_debug.cpp is mostly constexpr-evaluated
+    # address tables. -O2's aggressive inlining/vectorization buys very
+    # little here while doubling compile time on a Pi 4 — large projects
+    # were taking 10–15 min and tripping the editor's status-polling
+    # timeout. Hot paths that benefit from -O2 (FB locks, image-tables
+    # binding, scan-cycle housekeeping) live in runtime_v4_entry.cpp /
+    # core/src/plc_app/, which are built with the project CMakeLists
+    # at higher optimization. Arduino-targeted builds keep -Os/-O2 from
+    # the Arduino platform.txt — those are constrained-resource
+    # devices where the runtime tradeoff is different.
+    # -pipe avoids temp files between cc1plus and as, modest 5–10% win.
+    -std=c++17 -O1 -pipe -fPIC -Wall -Wno-unknown-pragmas -Wno-deprecated-declarations
     -I "$GENERATED_DIR" -I "$RUNTIME_INC" -I "$PYTHON_INCLUDE_PATH"
 )
 
