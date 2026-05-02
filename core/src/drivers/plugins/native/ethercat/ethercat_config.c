@@ -339,8 +339,7 @@ static int parse_pdo_entry(const cJSON *entry_json, ecat_pdo_entry_t *entry)
     entry->subindex = (uint8_t)get_int(entry_json, "subindex", 0);
     entry->bit_length = (uint8_t)get_int(entry_json, "bit_length", 0);
     safe_strcpy(entry->name, get_string(entry_json, "name", ""), sizeof(entry->name));
-    safe_strcpy(entry->data_type, get_string(entry_json, "data_type", ""), sizeof(entry->data_type));
-    entry->parsed_type = ecat_parse_data_type(entry->data_type);
+    entry->parsed_type = ecat_parse_data_type(get_string(entry_json, "data_type", ""));
 
     return ECAT_CONFIG_OK;
 }
@@ -471,13 +470,13 @@ static int parse_sdo(const cJSON *sdo_json, ecat_sdo_config_t *sdo)
     }
 
     /* data_type: required, must resolve to a known type (UNKNOWN/PAD reject) */
-    safe_strcpy(sdo->data_type, get_string(sdo_json, "data_type", ""), sizeof(sdo->data_type));
-    sdo->parsed_type = ecat_parse_data_type(sdo->data_type);
+    const char *dtype_str = get_string(sdo_json, "data_type", "");
+    sdo->parsed_type = ecat_parse_data_type(dtype_str);
     if (sdo->parsed_type == ECAT_DTYPE_UNKNOWN || sdo->parsed_type == ECAT_DTYPE_PAD) {
         plugin_logger_error(g_config_logger,
             "SDO %s:%d 'data_type' invalid: '%s' "
             "(use BOOL/INT8/UINT8/INT16/UINT16/INT32/UINT32/INT64/UINT64/REAL/LREAL)",
-            sdo->index, sdo->subindex, sdo->data_type);
+            sdo->index, sdo->subindex, dtype_str);
         return ECAT_CONFIG_ERR_INVALID;
     }
 
@@ -486,7 +485,8 @@ static int parse_sdo(const cJSON *sdo_json, ecat_sdo_config_t *sdo)
     if (!sdo_value_in_range(sdo->parsed_type, sdo->value)) {
         plugin_logger_error(g_config_logger,
             "SDO %s:%d 'value' %g out of range for type %s",
-            sdo->index, sdo->subindex, sdo->value, sdo->data_type);
+            sdo->index, sdo->subindex, sdo->value,
+            ecat_data_type_to_string(sdo->parsed_type));
         return ECAT_CONFIG_ERR_INVALID;
     }
 
@@ -1021,4 +1021,24 @@ int ecat_data_type_size(ecat_data_type_t dt)
     case ECAT_DTYPE_PAD:     return 0;
     }
     return 0;
+}
+
+const char *ecat_data_type_to_string(ecat_data_type_t dt)
+{
+    switch (dt) {
+    case ECAT_DTYPE_UNKNOWN: return "UNKNOWN";
+    case ECAT_DTYPE_BOOL:    return "BOOL";
+    case ECAT_DTYPE_INT8:    return "INT8";
+    case ECAT_DTYPE_UINT8:   return "UINT8";
+    case ECAT_DTYPE_INT16:   return "INT16";
+    case ECAT_DTYPE_UINT16:  return "UINT16";
+    case ECAT_DTYPE_INT32:   return "INT32";
+    case ECAT_DTYPE_UINT32:  return "UINT32";
+    case ECAT_DTYPE_INT64:   return "INT64";
+    case ECAT_DTYPE_UINT64:  return "UINT64";
+    case ECAT_DTYPE_REAL32:  return "REAL32";
+    case ECAT_DTYPE_REAL64:  return "REAL64";
+    case ECAT_DTYPE_PAD:     return "PAD";
+    }
+    return "UNKNOWN";
 }

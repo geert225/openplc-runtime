@@ -300,7 +300,8 @@ int ecat_master_write_sdos(ecat_master_instance_t *inst, int slave_pos,
         if (size <= 0) {
             plugin_logger_error(logger,
                 "Slave %d SDO 0x%04X:%d: unknown data type '%s' -- skipping (parser regression?)",
-                slave_pos, index, sdo->subindex, sdo->data_type);
+                slave_pos, index, sdo->subindex,
+                ecat_data_type_to_string(sdo->parsed_type));
             continue;
         }
 
@@ -323,15 +324,16 @@ int ecat_master_write_sdos(ecat_master_instance_t *inst, int slave_pos,
         default:                { int32_t  v = (int32_t)sdo->value;  memcpy(value_buf, &v, sizeof(v)); break; }
         }
 
+        const char *dt_name = ecat_data_type_to_string(dt);
         if (dt == ECAT_DTYPE_REAL32 || dt == ECAT_DTYPE_REAL64) {
             plugin_logger_debug(logger,
                 "Slave %d: writing SDO 0x%04X:%d = %g (%s, %d bytes)",
-                slave_pos, index, sdo->subindex, sdo->value, sdo->data_type, size);
+                slave_pos, index, sdo->subindex, sdo->value, dt_name, size);
         } else {
             plugin_logger_debug(logger,
                 "Slave %d: writing SDO 0x%04X:%d = %lld (%s, %d bytes)",
                 slave_pos, index, sdo->subindex, (long long)(int64_t)sdo->value,
-                sdo->data_type, size);
+                dt_name, size);
         }
 
         /* Use per-slave SDO timeout if configured, otherwise SOEM default */

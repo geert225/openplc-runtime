@@ -210,29 +210,6 @@ static int calculate_iomap_offset(const ec_slavet *soem_slave,
  */
 
 /**
- * @brief Return a human-readable name for an ecat_data_type_t value
- */
-static const char *ecat_data_type_name(ecat_data_type_t dt)
-{
-    switch (dt) {
-    case ECAT_DTYPE_UNKNOWN: return "UNKNOWN";
-    case ECAT_DTYPE_BOOL:    return "BOOL";
-    case ECAT_DTYPE_INT8:    return "INT8";
-    case ECAT_DTYPE_UINT8:   return "UINT8";
-    case ECAT_DTYPE_INT16:   return "INT16";
-    case ECAT_DTYPE_UINT16:  return "UINT16";
-    case ECAT_DTYPE_INT32:   return "INT32";
-    case ECAT_DTYPE_UINT32:  return "UINT32";
-    case ECAT_DTYPE_INT64:   return "INT64";
-    case ECAT_DTYPE_UINT64:  return "UINT64";
-    case ECAT_DTYPE_REAL32:  return "REAL32";
-    case ECAT_DTYPE_REAL64:  return "REAL64";
-    case ECAT_DTYPE_PAD:     return "PAD";
-    }
-    return "UNKNOWN";
-}
-
-/**
  * @brief Return the expected IEC size qualifier for a given data type
  *
  * Used to validate that the IEC location width matches the PDO data type.
@@ -361,7 +338,7 @@ int ecat_io_build_channel_map(const ecat_config_t *config,
                     "Slave '%s' channel '%s': data type %s expects IEC size %s "
                     "but location '%s' uses %s -- data may be truncated or corrupt",
                     cfg_slave->name, ch->name,
-                    ecat_data_type_name(pdo_data_type),
+                    ecat_data_type_to_string(pdo_data_type),
                     iec_size_name((iec_size_t)expected_size),
                     ch->iec_location, iec_size_name(iec_loc.size));
             }
@@ -400,7 +377,7 @@ int ecat_io_build_channel_map(const ecat_config_t *config,
             plugin_logger_debug(logger,
                 "  Mapped: slave '%s' ch '%s' [%s] (%s) -> %s byte=%d bit=%d offset=%zu",
                 cfg_slave->name, ch->name,
-                ecat_data_type_name(pdo_data_type), ch->iec_location,
+                ecat_data_type_to_string(pdo_data_type), ch->iec_location,
                 (iec_loc.direction == IEC_DIR_INPUT) ? "INPUT" : "OUTPUT",
                 iec_loc.byte_index, iec_loc.bit_index, iomap_offset);
 
@@ -413,7 +390,7 @@ int ecat_io_build_channel_map(const ecat_config_t *config,
                     "Declare the PLC variable as %s so the IEEE 754 bit "
                     "pattern is interpreted correctly",
                     cfg_slave->name, ch->name,
-                    ecat_data_type_name(pdo_data_type), ch->iec_location,
+                    ecat_data_type_to_string(pdo_data_type), ch->iec_location,
                     iec_type);
             }
         }

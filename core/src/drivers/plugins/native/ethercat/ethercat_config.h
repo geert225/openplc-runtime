@@ -71,8 +71,7 @@ typedef struct {
     uint8_t          subindex;
     uint8_t          bit_length;
     char             name[ECAT_MAX_NAME_LEN];
-    char             data_type[12];    /* "BOOL", "INT16", "REAL", etc. */
-    ecat_data_type_t parsed_type;      /* enum resolved from data_type string */
+    ecat_data_type_t parsed_type;      /* resolved from data_type string in JSON */
 } ecat_pdo_entry_t;
 
 /**
@@ -98,8 +97,7 @@ typedef struct {
     char             index[12];        /* hex string e.g. "0x8000" */
     uint8_t          subindex;
     double           value;            /* stored as double; cast to target type at write time */
-    char             data_type[12];
-    ecat_data_type_t parsed_type;      /* enum resolved from data_type string */
+    ecat_data_type_t parsed_type;      /* resolved from data_type string in JSON */
     char             name[ECAT_MAX_NAME_LEN];
 } ecat_sdo_config_t;
 
@@ -681,5 +679,16 @@ const char *ecat_state_to_string(ecat_plugin_state_t state);
  * @return Size in bytes (0 for UNKNOWN/PAD, 1 for BOOL)
  */
 int ecat_data_type_size(ecat_data_type_t dt);
+
+/**
+ * @brief Convert a data type enum to a human-readable name (e.g. "INT16").
+ *
+ * Symmetric with ecat_state_to_string.  Used in log messages so the
+ * structs no longer need to carry the original JSON string.
+ *
+ * @param dt Data type enum value
+ * @return Static string ("UNKNOWN" for invalid or unrecognized values)
+ */
+const char *ecat_data_type_to_string(ecat_data_type_t dt);
 
 #endif /* ETHERCAT_CONFIG_H */
