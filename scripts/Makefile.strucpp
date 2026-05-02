@@ -1,0 +1,119 @@
+# Makefile.strucpp — build the user PLC program into build/new_libplc.so
+#
+# Invoked from scripts/compile.sh as `make -j$(nproc) -f
+# scripts/Makefile.strucpp`. Replaces the old serial shell build:
+#
+#   - Per-file compilation rules let `make -j` saturate every core on
+#     the target platform (Pi 4 = 4×, x86 servers = 8–32×).
+#   - `wildcard $(GENERATED_DIR)/*.cpp` discovers however many .cpp
+#     files STruC++ split into. The codegen emits one TU per POU plus
+#     a shared configuration.cpp, so the file set varies per project
+#     — keeping the list out of this file means no Makefile churn
+#     when POUs are added or removed.
+#   - `ccache` is picked up automatically when present. Re-running a
+#     build where only one POU's body changed reuses every other .o
+#     from the cache, so incremental builds drop from minutes to a
+#     few seconds.
+
+GENERATED_DIR := core/generated
+RUNTIME_INC   := $(GENERATED_DIR)/strucpp_runtime/include
+PYTHON_INC    := core/src/plc_app/include
+RUNTIME_SHIM  := core/strucpp_runtime/runtime_v4_entry.cpp
+PYTHON_LOADER := core/src/plc_app/python_loader.c
+BUILD_DIR     := build
+
+# Use ccache transparently when installed. Falls back to the raw
+# compiler binary on systems without it. The wrapper sits in front
+# of $(CXX); CMake-style "CXX_LAUNCHER" idiom would also work.
+CCACHE := $(shell command -v ccache 2>/dev/null)
+CXX    := $(if $(CCACHE),$(CCACHE) g++,g++)
+CC     := $(if $(CCACHE),$(CCACHE) gcc,gcc)
+
+# -O1 (not -O2): generated.cpp is mostly per-element IECVar assignments
+# and generated_debug.cpp is mostly constexpr address tables. -O2's
+# aggressive inlining and vectorization buy little here while doubling
+# compile time on a Pi 4. Hot paths (FB locks, image-tables binding,
+# scan-cycle housekeeping) live in the plc_app/ tree built separately
+# at higher optimization. -pipe avoids temp files between cc1plus and
+# as for an additional 5–10% win.
+CXXFLAGS := -std=c++17 -O1 -pipe -fPIC -Wall \
+            -Wno-unknown-pragmas -Wno-deprecated-declarations \
+            -I $(GENERATED_DIR) -I $(RUNTIME_INC) -I $(PYTHON_INC)
+
+# Python POU stubs (`{external …}` blocks emitted by the editor) call
+# `getpid()`, `create_shm_name()`, `python_block_loader()`. Those
+# declarations live in iec_python.h. STruC++ stays Python-unaware —
+# same trick MatIEC's compile.sh used: force-include iec_python.h on
+# the generated TUs so unqualified references resolve. Stubs without
+# any Python POU pay nothing; the header is declarations only.
+GENERATED_CXXFLAGS := $(CXXFLAGS) -include iec_python.h
+
+# Discover every .cpp emitted into core/generated/. STruC++ splits
+# across configuration.cpp + one pou_<NAME>.cpp per POU, but this
+# Makefile doesn't care — wildcard adapts.
+GEN_CPP := $(wildcard $(GENERATED_DIR)/*.cpp)
+GEN_OBJ := $(patsubst $(GENERATED_DIR)/%.cpp,$(BUILD_DIR)/%.o,$(GEN_CPP))
+
+SHIM_OBJ      := $(BUILD_DIR)/runtime_v4_entry.o
+PYTHON_OBJ    := $(if $(wildcard $(PYTHON_LOADER)),$(BUILD_DIR)/python_loader.o,)
+CBLOCKS_CPP   := $(wildcard $(GENERATED_DIR)/c_blocks_code.cpp)
+CBLOCKS_OBJ   := $(patsubst $(GENERATED_DIR)/%.cpp,$(BUILD_DIR)/%.o,$(CBLOCKS_CPP))
+
+LIBPLC := $(BUILD_DIR)/new_libplc.so
+
+# Cygwin/MSYS2: TCP/UDP communication blocks aren't supported, fall
+# back to no-op stubs so blocks-using programs still link.
+UNAME_S := $(shell uname -s)
+IS_WINDOWS := $(if $(filter CYGWIN_NT-% MSYS_NT-% MINGW64_NT-% MINGW32_NT-%,$(UNAME_S)),1,)
+COMM_STUB_OBJ := $(if $(IS_WINDOWS),$(BUILD_DIR)/comm_stubs.o,)
+
+EXTRA_OBJS := $(CBLOCKS_OBJ) $(PYTHON_OBJ) $(COMM_STUB_OBJ)
+
+.PHONY: all clean
+.DEFAULT_GOAL := all
+
+all: $(LIBPLC)
+
+# Final link. Order matters only for static library resolution; .o
+# objects are interchangeable. -lpthread / -lrt match the historical
+# compile.sh.
+$(LIBPLC): $(GEN_OBJ) $(SHIM_OBJ) $(EXTRA_OBJS) | $(BUILD_DIR)
+	g++ -shared -fPIC -o $@ $^ -lpthread -lrt
+	@echo "[INFO] Build complete: $@"
+
+# Generated TUs from the editor's upload. Force-include iec_python.h
+# so unqualified Python loader symbols in {external} blocks resolve.
+$(BUILD_DIR)/%.o: $(GENERATED_DIR)/%.cpp | $(BUILD_DIR)
+	@echo "[INFO] Compiling $<..."
+	$(CXX) $(GENERATED_CXXFLAGS) -c $< -o $@
+
+# Static runtime shim — lives in the runtime repo, not in the user
+# upload. Doesn't get the iec_python.h force-include.
+$(SHIM_OBJ): $(RUNTIME_SHIM) | $(BUILD_DIR)
+	@echo "[INFO] Compiling runtime_v4_entry.cpp..."
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+# Python loader (C, not C++). Compiled with the runtime tree's local
+# include path so it sees iec_python.h alongside its own headers.
+$(BUILD_DIR)/python_loader.o: $(PYTHON_LOADER) | $(BUILD_DIR)
+	@echo "[INFO] Compiling python_loader.c..."
+	$(CC) -O2 -fPIC -I core/src/plc_app -c $< -o $@
+
+# Cygwin TCP/UDP stub — written on demand, then compiled.
+$(BUILD_DIR)/comm_stubs.o: | $(BUILD_DIR)
+	@echo "[INFO] Generating + compiling Cygwin comm stubs..."
+	@printf '%s\n' \
+		'#include <stdint.h>' \
+		'#include <stddef.h>' \
+		'int connect_to_tcp_server(uint8_t *a, uint16_t b, int c) { (void)a; (void)b; (void)c; return -1; }' \
+		'int send_tcp_message(uint8_t *a, size_t b, int c) { (void)a; (void)b; (void)c; return -1; }' \
+		'int receive_tcp_message(uint8_t *a, size_t b, int c) { (void)a; (void)b; (void)c; return -1; }' \
+		'int close_tcp_connection(int a) { (void)a; return -1; }' \
+		> $(BUILD_DIR)/comm_stubs.c
+	gcc -O2 -fPIC -c $(BUILD_DIR)/comm_stubs.c -o $@
+
+$(BUILD_DIR):
+	@mkdir -p $@
+
+clean:
+	rm -rf $(BUILD_DIR)
