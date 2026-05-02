@@ -257,6 +257,46 @@ int ecat_master_open_and_scan(ecat_master_instance_t *inst, plugin_logger_t *log
  * =============================================================================
  */
 
+/**
+ * @brief Encode a double-typed SDO value into wire bytes for the target type.
+ *
+ * Three paths cover all 11 supported types: REAL32, REAL64, and integer.
+ * Integer types share a common int64_t cast and a memcpy of the LSBs --
+ * parse_sdo's range check guarantees the cast is in-range, so no UB on
+ * the truncation.  Assumes host little-endian (true on x86_64 and ARM
+ * Linux little-endian, the only supported targets); a future big-endian
+ * port would need byteswap here.
+ *
+ * @param dt     Target wire type (must be a valid known type)
+ * @param in     Source value (already range-validated by the parser)
+ * @param out    Output buffer, at least @p ecat_data_type_size(dt) bytes
+ * @return Number of bytes written, or 0 if @p dt is unknown/PAD
+ */
+static int encode_sdo_value(ecat_data_type_t dt, double in, uint8_t out[8])
+{
+    int sz = ecat_data_type_size(dt);
+    if (sz <= 0)
+        return 0;
+
+    memset(out, 0, 8);
+
+    if (dt == ECAT_DTYPE_REAL32) {
+        float v = (float)in;
+        memcpy(out, &v, sizeof(v));
+        return 4;
+    }
+    if (dt == ECAT_DTYPE_REAL64) {
+        memcpy(out, &in, sizeof(in));
+        return 8;
+    }
+
+    /* Integer path (BOOL/INT8/UINT8/.../UINT64): one cast to int64_t,
+     * then memcpy the low @p sz bytes -- little-endian on supported hosts. */
+    int64_t i = (int64_t)in;
+    memcpy(out, &i, (size_t)sz);
+    return sz;
+}
+
 int ecat_master_write_sdos(ecat_master_instance_t *inst, int slave_pos,
                            const ecat_sdo_config_t *sdos,
                            int sdo_count, int sdo_timeout_ms,
@@ -293,35 +333,18 @@ int ecat_master_write_sdos(ecat_master_instance_t *inst, int slave_pos,
         /* Parse index from hex string */
         uint16_t index = (uint16_t)strtol(sdo->index, NULL, 16);
 
-        /* Determine data size from data type.  parse_sdo rejects UNKNOWN/PAD
-         * so this branch is defensive -- if it triggers, the parser regressed. */
+        /* parse_sdo rejects UNKNOWN/PAD so encode_sdo_value() returning
+         * 0 here is a parser regression rather than user input -- skip
+         * the SDO defensively rather than crash. */
         ecat_data_type_t dt = sdo->parsed_type;
-        int size = ecat_data_type_size(dt);
+        uint8_t value_buf[8];
+        int size = encode_sdo_value(dt, sdo->value, value_buf);
         if (size <= 0) {
             plugin_logger_error(logger,
                 "Slave %d SDO 0x%04X:%d: unknown data type '%s' -- skipping (parser regression?)",
                 slave_pos, index, sdo->subindex,
-                ecat_data_type_to_string(sdo->parsed_type));
+                ecat_data_type_to_string(dt));
             continue;
-        }
-
-        /* Encode the double value into the correct wire type */
-        uint8_t value_buf[8];
-        memset(value_buf, 0, sizeof(value_buf));
-
-        switch (dt) {
-        case ECAT_DTYPE_BOOL:
-        case ECAT_DTYPE_UINT8:  { uint8_t  v = (uint8_t)sdo->value;  memcpy(value_buf, &v, sizeof(v)); break; }
-        case ECAT_DTYPE_INT8:   { int8_t   v = (int8_t)sdo->value;   memcpy(value_buf, &v, sizeof(v)); break; }
-        case ECAT_DTYPE_UINT16: { uint16_t v = (uint16_t)sdo->value; memcpy(value_buf, &v, sizeof(v)); break; }
-        case ECAT_DTYPE_INT16:  { int16_t  v = (int16_t)sdo->value;  memcpy(value_buf, &v, sizeof(v)); break; }
-        case ECAT_DTYPE_UINT32: { uint32_t v = (uint32_t)sdo->value; memcpy(value_buf, &v, sizeof(v)); break; }
-        case ECAT_DTYPE_INT32:  { int32_t  v = (int32_t)sdo->value;  memcpy(value_buf, &v, sizeof(v)); break; }
-        case ECAT_DTYPE_UINT64: { uint64_t v = (uint64_t)sdo->value; memcpy(value_buf, &v, sizeof(v)); break; }
-        case ECAT_DTYPE_INT64:  { int64_t  v = (int64_t)sdo->value;  memcpy(value_buf, &v, sizeof(v)); break; }
-        case ECAT_DTYPE_REAL32: { float    v = (float)sdo->value;    memcpy(value_buf, &v, sizeof(v)); break; }
-        case ECAT_DTYPE_REAL64: { double   v = sdo->value;           memcpy(value_buf, &v, sizeof(v)); break; }
-        default:                { int32_t  v = (int32_t)sdo->value;  memcpy(value_buf, &v, sizeof(v)); break; }
         }
 
         const char *dt_name = ecat_data_type_to_string(dt);
