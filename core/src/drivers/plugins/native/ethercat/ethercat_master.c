@@ -406,13 +406,23 @@ int ecat_master_write_sdos(ecat_master_instance_t *inst, int slave_pos,
  * Default divider 0x09C2 = 2498 -> (2498+2)*25ns = 62.5us per tick.
  * To set watchdog to X ms: ticks = X * 1000 / 62.5 = X * 16
  *
+ * SM watchdog is treated as a critical configuration when @p strict is
+ * true: if the FPWR returns wkc<=0, the slave would run with the
+ * EEPROM-default watchdog (often disabled), defeating the operator's
+ * intent.  PDI watchdog is always best-effort -- many slaves do not
+ * support that register and return wkc=0 legitimately.
+ *
+ * @param inst      Master instance
  * @param slave_pos 1-based slave position on the bus
  * @param wd        Watchdog configuration
+ * @param strict    Abort startup on SM watchdog write failure
  * @param logger    Plugin logger instance
+ * @return 0 on success, -1 on SM watchdog write failure with @p strict
  */
-static void ecat_master_configure_watchdog(ecat_master_instance_t *inst, int slave_pos,
-                                           const ecat_watchdog_t *wd,
-                                           plugin_logger_t *logger)
+static int ecat_master_configure_watchdog(ecat_master_instance_t *inst, int slave_pos,
+                                          const ecat_watchdog_t *wd,
+                                          bool strict,
+                                          plugin_logger_t *logger)
 {
     /* Maximum watchdog timeout in ms that fits in a uint16_t register
      * with the default divider (1 tick = 62.5 us -> ticks = ms * 16).
@@ -438,8 +448,15 @@ static void ecat_master_configure_watchdog(ecat_master_instance_t *inst, int sla
         wkc = ecx_FPWR(&inst->ecx_context.port, configadr, 0x0420,
                             sizeof(sm_wd_ticks), &sm_wd_ticks, EC_TIMEOUTRET);
         if (wkc <= 0) {
+            if (strict) {
+                plugin_logger_error(logger,
+                    "Slave %d: failed to write SM watchdog register 0x0420 (wkc=%d) -- "
+                    "slave would run with EEPROM-default watchdog (often disabled)",
+                    slave_pos, wkc);
+                return -1;
+            }
             plugin_logger_warn(logger,
-                "Slave %d: failed to write SM watchdog register 0x0420 (wkc=%d)",
+                "Slave %d: SM watchdog write failed (wkc=%d), strict_sdo=false -- continuing",
                 slave_pos, wkc);
         } else {
             plugin_logger_debug(logger,
@@ -452,8 +469,8 @@ static void ecat_master_configure_watchdog(ecat_master_instance_t *inst, int sla
             slave_pos);
     }
 
-    /* PDI watchdog register 0x0402 - only write if explicitly enabled,
-     * as many slaves do not support PDI watchdog and return wkc=0. */
+    /* PDI watchdog register 0x0402 - many slaves do not support this
+     * register and return wkc=0 legitimately, so always best-effort. */
     if (wd->pdi_watchdog_enabled) {
         uint16_t pdi_wd_ticks = 0;
         if (wd->pdi_watchdog_ms > 0) {
@@ -470,7 +487,8 @@ static void ecat_master_configure_watchdog(ecat_master_instance_t *inst, int sla
                         sizeof(pdi_wd_ticks), &pdi_wd_ticks, EC_TIMEOUTRET);
         if (wkc <= 0) {
             plugin_logger_warn(logger,
-                "Slave %d: failed to write PDI watchdog register 0x0402 (wkc=%d)",
+                "Slave %d: PDI watchdog write returned wkc=%d (many slaves do not "
+                "support this register -- typically benign)",
                 slave_pos, wkc);
         } else {
             plugin_logger_debug(logger,
@@ -482,6 +500,8 @@ static void ecat_master_configure_watchdog(ecat_master_instance_t *inst, int sla
             "Slave %d: PDI watchdog disabled, skipping register write",
             slave_pos);
     }
+
+    return 0;
 }
 
 /**
@@ -616,13 +636,22 @@ int ecat_master_configure(ecat_master_instance_t *inst, plugin_logger_t *logger)
     plugin_logger_info(logger, "IO map: %d output bytes, %d input bytes, %d segments",
                        grp->Obytes, grp->Ibytes, grp->nsegments);
 
-    /* Step 5: Configure watchdogs per slave */
+    /* Step 5: Configure watchdogs per slave.  Reuses slave->strict_sdo --
+     * a slave that wants strict SDO writes also wants strict SM watchdog
+     * writes; both are critical configuration the operator pinned in JSON. */
     plugin_logger_info(logger, "Configuring per-slave watchdogs...");
     for (int i = 0; i < config->slave_count; i++) {
         const ecat_slave_t *slave = &config->slaves[i];
         int pos = slave->position;
-        if (pos >= 1 && pos <= inst->ecx_context.slavecount) {
-            ecat_master_configure_watchdog(inst, pos, &slave->watchdog, logger);
+        if (pos < 1 || pos > inst->ecx_context.slavecount)
+            continue;
+        if (ecat_master_configure_watchdog(inst, pos, &slave->watchdog,
+                                           slave->strict_sdo, logger) != 0) {
+            plugin_logger_error(logger,
+                "Master '%s': Slave %d (%s): SM watchdog config failed and "
+                "strict_sdo=true -- aborting startup",
+                inst->name, pos, slave->name);
+            return -1;
         }
     }
 
