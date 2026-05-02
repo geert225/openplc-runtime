@@ -48,14 +48,4 @@ check_required_files() {
 
 check_required_files
 
-# Pick parallel job count. macOS / Linux differ on nproc availability;
-# fall back to sysctl on Darwin and 4 elsewhere.
-if command -v nproc >/dev/null 2>&1; then
-    JOBS=$(nproc)
-elif command -v sysctl >/dev/null 2>&1 && sysctl -n hw.ncpu >/dev/null 2>&1; then
-    JOBS=$(sysctl -n hw.ncpu)
-else
-    JOBS=4
-fi
-
-exec make -j"$JOBS" -f scripts/Makefile.strucpp
+exec make -j"$(nproc)" -f scripts/Makefile.strucpp

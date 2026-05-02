@@ -210,6 +210,16 @@ install_cmake() {
     echo "CMake $(cmake --version | head -1) installed"
 }
 
+# `ccache` is added to every package set below. The runtime's
+# scripts/Makefile.strucpp picks it up automatically when present and
+# uses it to cache compiled .o files keyed by a hash of the
+# preprocessed source + compile flags. The editor uploads the full
+# project on every build, but ccache compares CONTENT (not file
+# mtime), so unchanged TUs hit the cache and skip recompilation
+# entirely. Single-POU edits drop incremental rebuilds from minutes
+# to a few seconds. Without ccache the runtime still builds — just
+# without the per-file reuse.
+
 # For apt-based distros (Debian, Ubuntu, Linux Mint, Pop!_OS, elementary OS, Zorin, MX Linux, etc.)
 install_deps_apt() {
     apt-get update && \
@@ -218,6 +228,7 @@ install_deps_apt() {
         python3-dev python3-pip python3-venv \
         gcc \
         make \
+        ccache \
         pkg-config \
         libffi-dev \
         ethtool \
@@ -232,7 +243,7 @@ install_deps_apt() {
 # For yum-based distros (RHEL 7, CentOS 7, Amazon Linux)
 install_deps_yum() {
     yum install -y \
-        gcc gcc-c++ make cmake \
+        gcc gcc-c++ make cmake ccache \
         python3 python3-devel python3-pip python3-venv \
     && yum clean all
 }
@@ -240,7 +251,7 @@ install_deps_yum() {
 # For dnf-based distros (Fedora, RHEL 8+, CentOS Stream, Rocky Linux, AlmaLinux, Oracle Linux 8+)
 install_deps_dnf() {
     dnf install -y \
-        gcc gcc-c++ make cmake \
+        gcc gcc-c++ make cmake ccache \
         python3 python3-devel python3-pip python3-venv \
     && dnf clean all
 }
@@ -253,6 +264,7 @@ install_deps_pacman() {
         gcc \
         make \
         cmake \
+        ccache \
         pkgconf \
         python \
         python-pip \
@@ -263,7 +275,7 @@ install_deps_pacman() {
 install_deps_zypper() {
     zypper refresh && \
     zypper install -y \
-        gcc gcc-c++ make cmake \
+        gcc gcc-c++ make cmake ccache \
         python3 python3-devel python3-pip \
         pkg-config
 }
@@ -276,6 +288,7 @@ install_deps_apk() {
         gcc \
         make \
         cmake \
+        ccache \
         pkgconf \
         python3 python3-dev py3-pip
 }
