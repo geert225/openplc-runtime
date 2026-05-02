@@ -297,6 +297,9 @@ ecat_data_type_t ecat_parse_data_type(const char *str)
  */
 static void parse_master_section(const cJSON *master, ecat_master_config_t *config)
 {
+    /* Defaults applied even when the "master" object is absent. */
+    config->safe_close = true;
+
     if (master == NULL) {
         return;
     }
@@ -308,6 +311,7 @@ static void parse_master_section(const cJSON *master, ecat_master_config_t *conf
     safe_strcpy(config->log_level, get_string(master, "log_level", "info"), sizeof(config->log_level));
     safe_strcpy(config->task_name, get_string(master, "task_name", ""), sizeof(config->task_name));
     config->task_cycle_time_us = get_int(master, "task_cycle_time_us", 0);
+    config->safe_close = get_bool(master, "safe_close", true);
 }
 
 /**
@@ -712,6 +716,7 @@ void ecat_config_init_defaults(ecat_config_t *config)
     safe_strcpy(config->master.log_level, "info", sizeof(config->master.log_level));
     config->master.task_name[0] = '\0';
     config->master.task_cycle_time_us = 0;
+    config->master.safe_close = true;
 
     /* Diagnostics defaults */
     config->diagnostics.log_connections = true;

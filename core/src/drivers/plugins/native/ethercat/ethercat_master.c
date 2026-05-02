@@ -747,12 +747,55 @@ int ecat_master_transition_to_op(ecat_master_instance_t *inst, plugin_logger_t *
 void ecat_master_close(ecat_master_instance_t *inst, plugin_logger_t *logger)
 {
     if (inst->soem_initialized) {
-        /* Transition all slaves to INIT state */
+        /* Step 1: drive outputs to zero before the transition (safe-close).
+         * For drives, valves and active-high IO this leaves the slave in a
+         * safe state immediately, before its SM watchdog has a chance to
+         * fire.  Skip when there is no IOmap yet (close on early-startup
+         * failure path). */
+        if (inst->config.master.safe_close && inst->iomap_used_size > 0) {
+            plugin_logger_info(logger,
+                "Zeroing outputs and sending final processdata before close");
+            memset(inst->iomap, 0, inst->iomap_used_size);
+            ecx_send_processdata(&inst->ecx_context);
+            int wkc = ecx_receive_processdata(&inst->ecx_context, EC_TIMEOUTRET);
+            if (wkc <= 0) {
+                plugin_logger_warn(logger,
+                    "Final processdata returned wkc=%d -- outputs may not have "
+                    "reached slaves; falling back to slave SM watchdog", wkc);
+            }
+        }
+
+        /* Step 2: request INIT and confirm the transition.  Discarding
+         * wkc here meant slaves could remain in OP/SAFE-OP after stop_loop
+         * if the broadcast did not reach them. */
         plugin_logger_info(logger, "Transitioning slaves to INIT state...");
         inst->ecx_context.slavelist[0].state = EC_STATE_INIT;
-        ecx_writestate(&inst->ecx_context, 0);
+        int init_wkc = ecx_writestate(&inst->ecx_context, 0);
+        if (init_wkc <= 0) {
+            plugin_logger_error(logger,
+                "writestate(INIT) returned wkc=%d -- slaves may remain in "
+                "OP/SAFE-OP until their SM watchdog expires", init_wkc);
+        } else {
+            /* Short timeout -- not worth waiting safeop_to_op here. */
+            ecx_statecheck(&inst->ecx_context, 0, EC_STATE_INIT, EC_TIMEOUTSTATE);
+            ecx_readstate(&inst->ecx_context);
+            int stuck = 0;
+            for (int i = 1; i <= inst->ecx_context.slavecount; i++) {
+                uint16_t st = inst->ecx_context.slavelist[i].state;
+                if (st != EC_STATE_INIT) {
+                    plugin_logger_warn(logger,
+                        "Slave %d (%s): did not reach INIT (state=0x%04X) -- "
+                        "fallback to slave SM watchdog",
+                        i, inst->ecx_context.slavelist[i].name, st);
+                    stuck++;
+                }
+            }
+            if (stuck == 0) {
+                plugin_logger_info(logger, "All slaves confirmed in INIT");
+            }
+        }
 
-        /* Close the network interface */
+        /* Step 3: close the network interface */
         ecx_close(&inst->ecx_context);
         inst->soem_initialized = 0;
     }

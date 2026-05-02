@@ -224,6 +224,8 @@ typedef struct {
     char             log_level[8];
     char             task_name[ECAT_MAX_NAME_LEN];
     int              task_cycle_time_us;
+    /* Zero outputs and confirm INIT transition on stop_loop (default true). */
+    bool             safe_close;
 } ecat_master_config_t;
 
 /**
