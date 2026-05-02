@@ -56,8 +56,17 @@ check_required_files
 
 CXXFLAGS=(
     -std=c++17 -O2 -fPIC -Wall -Wno-unknown-pragmas -Wno-deprecated-declarations
-    -I "$GENERATED_DIR" -I "$RUNTIME_INC"
+    -I "$GENERATED_DIR" -I "$RUNTIME_INC" -I "$PYTHON_INCLUDE_PATH"
 )
+
+# Python POU stubs (`{external …}` blocks emitted by the editor) call
+# `getpid()`, `create_shm_name()`, `python_block_loader()`. Their
+# declarations live in iec_python.h. STruC++ stays Python-unaware —
+# same as iec2c did — so the runtime force-includes the header into
+# generated.cpp (this is exactly the trick MatIEC's compile.sh used:
+# `-include iec_python.h` on the Config0.c invocation). Stubs without
+# any Python POU pay nothing; the header is just declarations.
+GENERATED_CXXFLAGS=("${CXXFLAGS[@]}" -include iec_python.h)
 
 # On Cygwin/MSYS2, TCP/UDP communication blocks aren't supported — fall back
 # to no-op stubs so blocks-using programs still compile.
@@ -78,7 +87,7 @@ STUB
 esac
 
 echo "[INFO] Compiling generated.cpp..."
-g++ "${CXXFLAGS[@]}" -c "$GENERATED_DIR/generated.cpp"        -o "$BUILD_DIR/generated.o"
+g++ "${GENERATED_CXXFLAGS[@]}" -c "$GENERATED_DIR/generated.cpp" -o "$BUILD_DIR/generated.o"
 
 echo "[INFO] Compiling generated_debug.cpp..."
 g++ "${CXXFLAGS[@]}" -c "$GENERATED_DIR/generated_debug.cpp"  -o "$BUILD_DIR/generated_debug.o"
