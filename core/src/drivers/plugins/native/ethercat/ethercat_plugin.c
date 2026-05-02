@@ -274,6 +274,7 @@ static int attempt_recovery(ecat_master_instance_t *inst)
             "Master '%s': All slaves recovered to OPERATIONAL (attempts=%d)",
             inst->name, atomic_load(&inst->recovery_attempts));
         atomic_store(&inst->recovery_attempts, 0);
+        atomic_store(&inst->recovery_writestate_failures, 0);
         atomic_store(&inst->consecutive_wkc_errors, 0);
         return 1;
     }
@@ -527,6 +528,7 @@ static int start_single_master(ecat_master_instance_t *inst)
     /* --- Phase 4: OPERATIONAL --- */
     atomic_store(&inst->consecutive_wkc_errors, 0);
     atomic_store(&inst->recovery_attempts, 0);
+    atomic_store(&inst->recovery_writestate_failures, 0);
     inst->cycle_counter = 0;
     diag_reset(&inst->diag);
 
@@ -633,6 +635,7 @@ static void stop_single_master(ecat_master_instance_t *inst)
     memset(&inst->transfer_list, 0, sizeof(inst->transfer_list));
     atomic_store(&inst->consecutive_wkc_errors, 0);
     atomic_store(&inst->recovery_attempts, 0);
+    atomic_store(&inst->recovery_writestate_failures, 0);
     inst->expected_wkc = 0;
 
     ecat_master_close(inst, &g_logger);
@@ -1600,6 +1603,8 @@ static cJSON *build_master_diagnostics_json(ecat_master_instance_t *inst)
     cJSON_AddNumberToObject(recovery, "max_recovery_attempts", ECAT_MAX_RECOVERY_ATTEMPTS);
     cJSON_AddNumberToObject(recovery, "wkc_error_threshold", ECAT_WKC_ERROR_THRESHOLD);
     cJSON_AddNumberToObject(recovery, "exchange_skips", (double)exchange_skips);
+    cJSON_AddNumberToObject(recovery, "writestate_failures",
+        (double)atomic_load(&inst->recovery_writestate_failures));
     cJSON_AddItemToObject(master, "recovery", recovery);
 
     /* Master configuration */

@@ -606,6 +606,11 @@ typedef struct {
     ecat_cycle_diag_t diag;
     _Atomic(int) consecutive_wkc_errors;
     _Atomic(int) recovery_attempts;
+    /* Counts ecx_writestate calls during recovery that returned wkc<=0
+     * (request did not reach the slave -- link/cable issue, vs. slave
+     * reachable but rejecting the state).  Distinguishes physical from
+     * configuration recovery failures in the operator UI. */
+    _Atomic(uint32_t) recovery_writestate_failures;
     uint64_t cycle_counter;
     unsigned int tick_divisor;
 

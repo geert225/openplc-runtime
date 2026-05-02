@@ -852,6 +852,33 @@ uint16_t ecat_master_get_slave_state(ecat_master_instance_t *inst, int position)
  * =============================================================================
  */
 
+/**
+ * @brief Issue ecx_writestate during recovery, capturing wkc.
+ *
+ * wkc<=0 means the request did not reach the slave (link/cable issue,
+ * not a config problem).  Tally these into recovery_writestate_failures
+ * so the operator can distinguish "physical recovery failure" from
+ * "slave reachable but rejecting state" in the diagnostics.
+ *
+ * @return ecx_writestate's wkc (positive on success, <=0 on no response)
+ */
+static int writestate_with_check(ecat_master_instance_t *inst, int position,
+                                  uint16_t target_state, plugin_logger_t *logger)
+{
+    inst->ecx_context.slavelist[position].state = target_state;
+    int wkc = ecx_writestate(&inst->ecx_context, (uint16)position);
+    if (wkc <= 0) {
+        atomic_fetch_add_explicit(&inst->recovery_writestate_failures, 1,
+                                  memory_order_relaxed);
+        plugin_logger_warn(logger,
+            "Slave %d (%s): writestate(0x%04X) wkc=%d -- request did not "
+            "reach slave (link/cable issue?)",
+            position, inst->ecx_context.slavelist[position].name,
+            target_state, wkc);
+    }
+    return wkc;
+}
+
 int ecat_master_recover_slave(ecat_master_instance_t *inst, int position, plugin_logger_t *logger)
 {
     if (position < 1 || position > inst->ecx_context.slavecount) {
@@ -873,12 +900,10 @@ int ecat_master_recover_slave(ecat_master_instance_t *inst, int position, plugin
             "Slave %d (%s): SAFE_OP+ERROR (ALstatus=0x%04X), sending ACK",
             position, slave->name, slave->ALstatuscode);
 
-        slave->state = EC_STATE_SAFE_OP + EC_STATE_ACK;
-        ecx_writestate(&inst->ecx_context, (uint16)position);
+        writestate_with_check(inst, position, EC_STATE_SAFE_OP + EC_STATE_ACK, logger);
 
         /* Now request OP */
-        slave->state = EC_STATE_OPERATIONAL;
-        ecx_writestate(&inst->ecx_context, (uint16)position);
+        writestate_with_check(inst, position, EC_STATE_OPERATIONAL, logger);
 
         /* Check if it worked */
         ecx_statecheck(&inst->ecx_context, (uint16)position,
@@ -897,8 +922,7 @@ int ecat_master_recover_slave(ecat_master_instance_t *inst, int position, plugin
         plugin_logger_info(logger, "Slave %d (%s): in SAFE_OP, requesting OP",
                            position, slave->name);
 
-        slave->state = EC_STATE_OPERATIONAL;
-        ecx_writestate(&inst->ecx_context, (uint16)position);
+        writestate_with_check(inst, position, EC_STATE_OPERATIONAL, logger);
 
         ecx_statecheck(&inst->ecx_context, (uint16)position,
                         EC_STATE_OPERATIONAL, EC_TIMEOUTRET);
