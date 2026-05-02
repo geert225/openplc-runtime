@@ -275,6 +275,16 @@ int ecat_master_write_sdos(ecat_master_instance_t *inst, int slave_pos,
     if (sdo_count == 0)
         return 0;
 
+    /* Slaves without CoE mailbox cannot accept SDO writes; refuse early
+     * with a clear message instead of letting every ecx_SDOwrite return
+     * wkc=0. */
+    if ((inst->ecx_context.slavelist[slave_pos].mbx_proto & 0x04) == 0) {
+        plugin_logger_error(logger,
+            "Slave %d: %d SDO(s) configured but slave does not support CoE mailbox",
+            slave_pos, sdo_count);
+        return -1;
+    }
+
     int written = 0;
 
     for (int i = 0; i < sdo_count; i++) {
@@ -343,9 +353,15 @@ int ecat_master_write_sdos(ecat_master_instance_t *inst, int slave_pos,
         }
     }
 
+    if (written < sdo_count) {
+        plugin_logger_warn(logger,
+            "Slave %d: only %d/%d SDOs written successfully",
+            slave_pos, written, sdo_count);
+        return -1;
+    }
     plugin_logger_info(logger, "Slave %d: %d/%d SDOs written successfully",
                        slave_pos, written, sdo_count);
-    return written;
+    return 0;
 }
 
 /*

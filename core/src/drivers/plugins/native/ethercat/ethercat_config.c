@@ -600,9 +600,12 @@ static int parse_slave(const cJSON *slave_json, ecat_slave_t *slave)
     slave->dc.sync1_enabled = false;
     slave->dc.sync1_cycle_us = 0;
     slave->dc.sync1_shift_us = 0;
+    slave->strict_sdo = true;
 
     const cJSON *cfg = cJSON_GetObjectItemCaseSensitive(slave_json, "config");
     if (cfg != NULL && cJSON_IsObject(cfg)) {
+        slave->strict_sdo = get_bool(cfg, "strict_sdo", true);
+
         /* Startup checks */
         const cJSON *sc = cJSON_GetObjectItemCaseSensitive(cfg, "startup_checks");
         if (sc != NULL && cJSON_IsObject(sc)) {

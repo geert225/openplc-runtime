@@ -444,13 +444,24 @@ static int start_single_master(ecat_master_instance_t *inst)
         "Master '%s': [state: CONFIGURING] Writing SDOs and mapping process data...",
         inst->name);
 
-    /* Write SDOs for each slave that has them configured */
+    /* Write SDOs for each slave that has them configured.  When
+     * slave->strict_sdo is true (default) any failed write aborts the
+     * master so it never enters OPERATIONAL with a half-configured slave. */
     for (int i = 0; i < inst->config.slave_count; i++) {
         const ecat_slave_t *slave = &inst->config.slaves[i];
-        if (slave->sdo_count > 0) {
-            ecat_master_write_sdos(inst, slave->position, slave->sdo_configs,
-                                   slave->sdo_count,
-                                   slave->timeouts.sdo_timeout_ms, &g_logger);
+        if (slave->sdo_count == 0)
+            continue;
+
+        int rc = ecat_master_write_sdos(inst, slave->position, slave->sdo_configs,
+                                        slave->sdo_count,
+                                        slave->timeouts.sdo_timeout_ms, &g_logger);
+        if (rc != 0 && slave->strict_sdo) {
+            plugin_logger_error(&g_logger,
+                "Master '%s': Slave %d (%s): SDO config failed and strict_sdo=true -- aborting startup",
+                inst->name, slave->position, slave->name);
+            ecat_master_close(inst, &g_logger);
+            atomic_store(&inst->plugin_state, ECAT_STATE_ERROR);
+            return -1;
         }
     }
 

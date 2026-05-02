@@ -49,7 +49,9 @@ int ecat_master_open_and_scan(ecat_master_instance_t *inst, plugin_logger_t *log
  * @param sdo_count      Number of SDO entries
  * @param sdo_timeout_ms SDO operation timeout in milliseconds (0 = SOEM default)
  * @param logger         Plugin logger instance
- * @return Number of SDOs successfully written, or -1 on critical error
+ * @return 0 if all SDOs were written, -1 if any SDO write failed
+ *         (sanity-check, missing CoE support, or any wkc<=0).  When the
+ *         caller has slave->strict_sdo set, -1 should abort startup.
  */
 int ecat_master_write_sdos(ecat_master_instance_t *inst, int slave_pos,
                            const ecat_sdo_config_t *sdos,

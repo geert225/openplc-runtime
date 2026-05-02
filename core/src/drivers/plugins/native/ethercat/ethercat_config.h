@@ -206,6 +206,8 @@ typedef struct {
     ecat_timeouts_t       timeouts;
     ecat_watchdog_t       watchdog;
     ecat_dc_config_t      dc;
+    /* Abort master startup on any SDO write failure (default true). */
+    bool                  strict_sdo;
 } ecat_slave_t;
 
 /**
