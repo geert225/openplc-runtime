@@ -315,11 +315,15 @@ static void log_ecat_error(const ecat_master_instance_t *inst, const ec_errort *
  * releases the lock before logging -- plugin_logger does a synchronous
  * socket write that we don't want under soem_lock.
  *
- * Caller is the monitor thread; safe to call only when SOEM is initialized
- * and slaves are at least in PRE-OP (mailbox prerequisite).
+ * Caller is the monitor thread.  No-op when SOEM is not initialized so a
+ * future refactor that reorders stop (close before join) cannot turn this
+ * into use-after-close on the raw socket.
  */
 static void drain_mailbox_and_errors(ecat_master_instance_t *inst)
 {
+    if (!inst->soem_initialized)
+        return;
+
     /* EC_MAXELIST is SOEM's queue capacity; we never need more slots. */
     ec_errort errors[EC_MAXELIST];
     int err_count = 0;
