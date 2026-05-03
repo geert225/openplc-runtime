@@ -73,6 +73,8 @@ uint16_t (*ext_strucpp_debug_size)       (uint8_t, uint16_t)             = nullp
 uint8_t  (*ext_strucpp_debug_set)        (uint8_t, uint16_t, bool,
                                           const uint8_t *, uint16_t)     = nullptr;
 uint16_t (*ext_strucpp_debug_read)       (uint8_t, uint16_t, uint8_t *)  = nullptr;
+uint8_t  (*ext_strucpp_debug_write)      (uint8_t, uint16_t,
+                                          const uint8_t *, uint16_t)     = nullptr;
 
 namespace {
     using GetConfigFn = strucpp::ConfigurationInstance *(*)(void);
@@ -172,13 +174,14 @@ extern "C" int symbols_init(PluginManager *pm)
     *(void **)&ext_strucpp_debug_size        = resolve(pm, "strucpp_debug_size",        true);
     *(void **)&ext_strucpp_debug_set         = resolve(pm, "strucpp_debug_set",         true);
     *(void **)&ext_strucpp_debug_read        = resolve(pm, "strucpp_debug_read",        true);
+    *(void **)&ext_strucpp_debug_write       = resolve(pm, "strucpp_debug_write",       true);
 
     if (!ext_strucpp_advance_time ||
         !ext_strucpp_get_config || !ext_strucpp_set_locks ||
         !ext_strucpp_get_located_vars || !ext_strucpp_get_located_var_count ||
         !ext_strucpp_debug_array_count || !ext_strucpp_debug_elem_count ||
         !ext_strucpp_debug_size || !ext_strucpp_debug_set ||
-        !ext_strucpp_debug_read)
+        !ext_strucpp_debug_read || !ext_strucpp_debug_write)
     {
         log_error("[strucpp] failed to resolve all required .so symbols");
         return -1;

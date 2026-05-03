@@ -17,6 +17,7 @@
 
 #include "../lib/iec_types.h"
 #include <pthread.h>
+#include <stdbool.h>
 #include <stdint.h>
 
 /**
@@ -50,6 +51,39 @@ typedef int (*plugin_journal_write_byte_func_t)(int type, int index, int value);
 typedef int (*plugin_journal_write_int_func_t)(int type, int index, int value);
 typedef int (*plugin_journal_write_dint_func_t)(int type, int index, unsigned int value);
 typedef int (*plugin_journal_write_lint_func_t)(int type, int index, unsigned long long value);
+
+/**
+ * @brief Variable-access function pointer types (STruC++ debugger surface)
+ *
+ * These wrap the strucpp_debug_* exports of the loaded program .so:
+ *
+ *   debug_array_count() / debug_elem_count(arr) — table sizes
+ *   debug_size(arr, elem)                       — bytes consumed by force/read/write
+ *   debug_read(arr, elem, dest)                 — read current value (respects forcing)
+ *   debug_set(arr, elem, forcing, bytes, len)   — force / unforce
+ *   debug_write(arr, elem, bytes, len)          — soft write (respects existing force)
+ *
+ * Variables are addressed by (arr, elem) — array and element indices into
+ * the per-project debug Entry tables emitted by STruC++ codegen. The map
+ * from human-readable names to (arr, elem) lives in debug-map.json,
+ * produced by the editor at compile time. Plugins do not interact with
+ * the map directly; the editor resolves user-selected variables and
+ * writes the (arr, elem) tuples into each plugin's per-plugin config.
+ *
+ * All five thunks are NULL-safe: they short-circuit when no program is
+ * loaded yet (ext_strucpp_debug_* still nullptr after symbols_init has
+ * not run). debug_array_count returns 0 in that state.
+ */
+typedef uint8_t  (*plugin_debug_array_count_func_t)(void);
+typedef uint16_t (*plugin_debug_elem_count_func_t)(uint8_t arr);
+typedef uint16_t (*plugin_debug_size_func_t)(uint8_t arr, uint16_t elem);
+typedef uint16_t (*plugin_debug_read_func_t)(uint8_t arr, uint16_t elem,
+                                             uint8_t *dest);
+typedef uint8_t  (*plugin_debug_set_func_t)(uint8_t arr, uint16_t elem,
+                                            bool forcing,
+                                            const uint8_t *bytes, uint16_t len);
+typedef uint8_t  (*plugin_debug_write_func_t)(uint8_t arr, uint16_t elem,
+                                              const uint8_t *bytes, uint16_t len);
 
 /**
  * @brief Runtime buffer access structure for plugins
@@ -88,11 +122,17 @@ typedef struct
     int (*mutex_give)(pthread_mutex_t *mutex);
     pthread_mutex_t *buffer_mutex;
 
-    /* Variable access functions — removed in the STruC++ migration.
-     * The flat-index API (get_var_list / get_var_size / get_var_count)
-     * is replaced by the hierarchical strucpp_debug_* PDU surface.
-     * Plugins consuming variables (OPC UA primarily) must migrate to
-     * the new API; see Phase 9 docs in the editor repo. */
+    /* STruC++ debugger variable-access surface.
+     * Replaces the MatIEC-era flat-index API (get_var_list /
+     * get_var_size / get_var_count). Plugins like OPC-UA receive
+     * pre-resolved (arr, elem) tuples from the editor in their
+     * per-plugin config and forward them through these thunks. */
+    plugin_debug_array_count_func_t debug_array_count;
+    plugin_debug_elem_count_func_t  debug_elem_count;
+    plugin_debug_size_func_t        debug_size;
+    plugin_debug_read_func_t        debug_read;
+    plugin_debug_set_func_t         debug_set;
+    plugin_debug_write_func_t       debug_write;
 
     /* Plugin configuration */
     char plugin_specific_config_file_path[256];

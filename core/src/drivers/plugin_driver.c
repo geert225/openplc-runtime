@@ -107,6 +107,48 @@ static int plugin_journal_write_lint(int type, int index, unsigned long long val
     return journal_write_lint((journal_buffer_type_t)type, (uint16_t)index, (uint64_t)value);
 }
 
+// STruC++ debugger thunks. Forward to ext_strucpp_debug_* function
+// pointers resolved from the program .so by image_tables symbols_init.
+// All five tolerate ext_*==NULL (program not yet loaded) and return a
+// safe sentinel: counts → 0, debug_set/debug_write → STATUS_OUT_OF_BOUNDS
+// (0x81), debug_read → 0 bytes written.
+
+static uint8_t plugin_debug_array_count(void)
+{
+    return ext_strucpp_debug_array_count ? ext_strucpp_debug_array_count() : 0;
+}
+
+static uint16_t plugin_debug_elem_count(uint8_t arr)
+{
+    return ext_strucpp_debug_elem_count ? ext_strucpp_debug_elem_count(arr) : 0;
+}
+
+static uint16_t plugin_debug_size(uint8_t arr, uint16_t elem)
+{
+    return ext_strucpp_debug_size ? ext_strucpp_debug_size(arr, elem) : 0;
+}
+
+static uint16_t plugin_debug_read(uint8_t arr, uint16_t elem, uint8_t *dest)
+{
+    return ext_strucpp_debug_read ? ext_strucpp_debug_read(arr, elem, dest) : 0;
+}
+
+static uint8_t plugin_debug_set(uint8_t arr, uint16_t elem, bool forcing,
+                                const uint8_t *bytes, uint16_t len)
+{
+    return ext_strucpp_debug_set
+               ? ext_strucpp_debug_set(arr, elem, forcing, bytes, len)
+               : 0x81; // STATUS_OUT_OF_BOUNDS
+}
+
+static uint8_t plugin_debug_write(uint8_t arr, uint16_t elem,
+                                  const uint8_t *bytes, uint16_t len)
+{
+    return ext_strucpp_debug_write
+               ? ext_strucpp_debug_write(arr, elem, bytes, len)
+               : 0x81; // STATUS_OUT_OF_BOUNDS
+}
+
 // Python capsule destructor for runtime args
 // Breakpoint here to debug capsule issues
 static void plugin_runtime_args_capsule_destructor(PyObject *capsule)
@@ -647,9 +689,16 @@ void *generate_structured_args_with_driver(plugin_type_t type, plugin_driver_t *
     // Initialize mutex functions
     args->mutex_take = plugin_mutex_take;
     args->mutex_give = plugin_mutex_give;
-    // get_var_list / get_var_size / get_var_count fields removed in the
-    // STruC++ migration (Phase 5). Plugins consuming variables migrate
-    // to the hierarchical strucpp_debug_* surface — see Phase 9 docs.
+    // STruC++ debugger surface — replaces the MatIEC-era
+    // get_var_list / get_var_size / get_var_count flat-index API.
+    // Each thunk forwards to the corresponding ext_strucpp_debug_*
+    // function pointer resolved from the program .so. NULL-safe.
+    args->debug_array_count = plugin_debug_array_count;
+    args->debug_elem_count  = plugin_debug_elem_count;
+    args->debug_size        = plugin_debug_size;
+    args->debug_read        = plugin_debug_read;
+    args->debug_set         = plugin_debug_set;
+    args->debug_write       = plugin_debug_write;
     // Set buffer mutex from driver
     args->buffer_mutex = &driver->buffer_mutex;
 

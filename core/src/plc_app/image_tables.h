@@ -67,6 +67,15 @@ extern "C"
                                                      uint16_t len);
     extern uint16_t (*ext_strucpp_debug_read)       (uint8_t arr, uint16_t elem,
                                                      uint8_t *dest);
+    /* Soft write — updates the variable's underlying value via
+     * IECVar::set(). If the variable is currently forced, the write is
+     * silently ignored (force remains authoritative). Distinct from
+     * ext_strucpp_debug_set(forcing=true) which pins the value
+     * indefinitely. Used by plugins (OPC-UA, BACnet) that want regular
+     * write semantics rather than debugger-style forcing. */
+    extern uint8_t  (*ext_strucpp_debug_write)      (uint8_t arr, uint16_t elem,
+                                                     const uint8_t *bytes,
+                                                     uint16_t len);
 
     /* -------------------------------------------------------------------------
      * Symbol resolution.

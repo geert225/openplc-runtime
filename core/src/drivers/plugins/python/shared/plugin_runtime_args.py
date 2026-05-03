@@ -41,10 +41,28 @@ class PluginRuntimeArgs(ctypes.Structure):
         ("mutex_take", ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p)),
         ("mutex_give", ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p)),
         ("buffer_mutex", ctypes.c_void_p),
-        # Variable access functions
-        ("get_var_list", ctypes.CFUNCTYPE(None, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_void_p))),
-        ("get_var_size", ctypes.CFUNCTYPE(ctypes.c_size_t, ctypes.c_size_t)),
-        ("get_var_count", ctypes.CFUNCTYPE(ctypes.c_uint16)),
+        # STruC++ debugger variable-access surface. Replaces the
+        # MatIEC-era flat-index API (get_var_list/get_var_size/
+        # get_var_count). Variables are addressed by (arr, elem); the
+        # editor resolves user-selected variables against debug-map.json
+        # and writes the tuples into each plugin's per-plugin config.
+        # debug_set toggles forcing; debug_write does a soft write that
+        # respects existing forces (the next scan cycle can overwrite).
+        ("debug_array_count", ctypes.CFUNCTYPE(ctypes.c_uint8)),
+        ("debug_elem_count",  ctypes.CFUNCTYPE(ctypes.c_uint16, ctypes.c_uint8)),
+        ("debug_size",        ctypes.CFUNCTYPE(ctypes.c_uint16, ctypes.c_uint8, ctypes.c_uint16)),
+        ("debug_read",        ctypes.CFUNCTYPE(ctypes.c_uint16,
+                                               ctypes.c_uint8, ctypes.c_uint16,
+                                               ctypes.POINTER(ctypes.c_uint8))),
+        ("debug_set",         ctypes.CFUNCTYPE(ctypes.c_uint8,
+                                               ctypes.c_uint8, ctypes.c_uint16,
+                                               ctypes.c_bool,
+                                               ctypes.POINTER(ctypes.c_uint8),
+                                               ctypes.c_uint16)),
+        ("debug_write",       ctypes.CFUNCTYPE(ctypes.c_uint8,
+                                               ctypes.c_uint8, ctypes.c_uint16,
+                                               ctypes.POINTER(ctypes.c_uint8),
+                                               ctypes.c_uint16)),
         ("plugin_specific_config_file_path", ctypes.c_char * 256),
         # Buffer size information
         ("buffer_size", ctypes.c_int),
@@ -61,6 +79,8 @@ class PluginRuntimeArgs(ctypes.Structure):
         ("journal_write_int", ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int)),
         ("journal_write_dint", ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint)),
         ("journal_write_lint", ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_ulonglong)),
+        # PLC base tick time in nanoseconds (mirrors C-side base_tick_ns).
+        ("base_tick_ns", ctypes.c_ulonglong),
     ]
 
     def validate_pointers(self):
