@@ -234,6 +234,113 @@ static void publish_slaves_snapshot(ecat_master_instance_t *inst)
 #if ECAT_ENABLE_MONITOR_THREAD
 /*
  * =============================================================================
+ * Mailbox Drain + Error Queue (runs in monitor thread)
+ * =============================================================================
+ *
+ * SOEM dispatches CoE Emergencies internally when ecx_mbxreceive sees a
+ * mailbox with CANopen header service=1.  But mbxreceive only fires when
+ * something else (SDO write/read) drains SM1 -- in steady-state OP we
+ * never trigger it, so emergencies pile up in the slave's SM1 until the
+ * next mailbox transaction.  ecx_mbxhandler is SOEM's periodic drain:
+ * it walks the mailbox queues for the group and processes pending in/out
+ * mailboxes.  Run it from the monitor thread (cold path), then pop the
+ * resulting ec_errort entries (Emergencies, SDO aborts, MBX errors) from
+ * SOEM's internal error queue and surface them through the plugin logger.
+ */
+
+/** Map ec_err_type to a short human-readable tag for log lines. */
+static const char *ecat_err_type_name(ec_err_type t)
+{
+    switch (t) {
+    case EC_ERR_TYPE_SDO_ERROR:           return "SDO";
+    case EC_ERR_TYPE_EMERGENCY:           return "EMERGENCY";
+    case EC_ERR_TYPE_PACKET_ERROR:        return "PACKET";
+    case EC_ERR_TYPE_SDOINFO_ERROR:       return "SDOINFO";
+    case EC_ERR_TYPE_FOE_ERROR:           return "FOE";
+    case EC_ERR_TYPE_FOE_BUF2SMALL:       return "FOE_BUF2SMALL";
+    case EC_ERR_TYPE_FOE_PACKETNUMBER:    return "FOE_PKTNUM";
+    case EC_ERR_TYPE_SOE_ERROR:           return "SOE";
+    case EC_ERR_TYPE_MBX_ERROR:           return "MBX";
+    case EC_ERR_TYPE_FOE_FILE_NOTFOUND:   return "FOE_NOTFOUND";
+    case EC_ERR_TYPE_EOE_INVALID_RX_DATA: return "EOE_RX";
+    }
+    return "UNKNOWN";
+}
+
+/**
+ * @brief Surface one popped ec_errort through the plugin logger.
+ *
+ * Emergency Error Code 0x0000 (CiA 301) is a "no error / error reset"
+ * notification -- log at info level so operators can see drives clearing
+ * faults, but don't escalate to warn/error.
+ */
+static void log_ecat_error(const ecat_master_instance_t *inst, const ec_errort *e)
+{
+    const char *type = ecat_err_type_name(e->Etype);
+
+    if (e->Etype == EC_ERR_TYPE_EMERGENCY) {
+        /* CiA 301 "Error reset / no error" carries ErrorCode 0x0000.
+         * Surface as info so operators can see drives clearing faults
+         * without escalating to error level. */
+        if (e->ErrorCode == 0x0000) {
+            plugin_logger_info(&g_logger,
+                "Master '%s': %s slave=%u code=0x%04X reg=0x%02X "
+                "data=%02X %04X %04X (error reset)",
+                inst->name, type, (unsigned)e->Slave,
+                (unsigned)e->ErrorCode, (unsigned)e->ErrorReg,
+                (unsigned)e->b1, (unsigned)e->w1, (unsigned)e->w2);
+        } else {
+            plugin_logger_error(&g_logger,
+                "Master '%s': %s slave=%u code=0x%04X reg=0x%02X "
+                "data=%02X %04X %04X",
+                inst->name, type, (unsigned)e->Slave,
+                (unsigned)e->ErrorCode, (unsigned)e->ErrorReg,
+                (unsigned)e->b1, (unsigned)e->w1, (unsigned)e->w2);
+        }
+    } else {
+        plugin_logger_warn(&g_logger,
+            "Master '%s': %s slave=%u index=0x%04X:%u abort=0x%08X",
+            inst->name, type, (unsigned)e->Slave,
+            (unsigned)e->Index, (unsigned)e->SubIdx,
+            (unsigned)e->AbortCode);
+    }
+}
+
+/**
+ * @brief Drain SM1 mailboxes and SOEM's internal error queue.
+ *
+ * Acquires soem_lock briefly, calls ecx_mbxhandler to dispatch any pending
+ * mailbox traffic (SOEM internally pushes CoE Emergencies into elist when
+ * it sees them), then pops the queued errors into a local buffer and
+ * releases the lock before logging -- plugin_logger does a synchronous
+ * socket write that we don't want under soem_lock.
+ *
+ * Caller is the monitor thread; safe to call only when SOEM is initialized
+ * and slaves are at least in PRE-OP (mailbox prerequisite).
+ */
+static void drain_mailbox_and_errors(ecat_master_instance_t *inst)
+{
+    /* EC_MAXELIST is SOEM's queue capacity; we never need more slots. */
+    ec_errort errors[EC_MAXELIST];
+    int err_count = 0;
+
+    pthread_mutex_lock(&inst->soem_lock);
+    /* limit=8 caps work per call -- mbxhandler iterates queued mailbox
+     * operations across the group; the cap keeps the lock window bounded
+     * even when traffic is bursty. */
+    ecx_mbxhandler(&inst->ecx_context, 0, 8);
+    while (err_count < EC_MAXELIST &&
+           ecx_poperror(&inst->ecx_context, &errors[err_count])) {
+        err_count++;
+    }
+    pthread_mutex_unlock(&inst->soem_lock);
+
+    for (int i = 0; i < err_count; i++)
+        log_ecat_error(inst, &errors[i]);
+}
+
+/*
+ * =============================================================================
  * Recovery Logic (runs in monitor thread, never in PLC scan cycle)
  * =============================================================================
  */
@@ -389,6 +496,16 @@ static void *ecat_monitor_thread(void *arg)
                     "Master '%s': entered ERROR state after max recovery attempts",
                     inst->name);
             }
+        }
+
+        /* Drain SM1 mailboxes (CoE Emergencies, async SDO responses) and
+         * surface anything SOEM pushed into its internal error queue.
+         * Skip in ERROR/STOPPED -- mailbox state is undefined when slaves
+         * are not at least in PRE-OP. */
+        int mbx_state = atomic_load(&inst->plugin_state);
+        if (mbx_state == ECAT_STATE_OPERATIONAL ||
+            mbx_state == ECAT_STATE_RECOVERING) {
+            drain_mailbox_and_errors(inst);
         }
 
         /* --- Transition-based logging (replaces hot-path PLC logs) --- */
