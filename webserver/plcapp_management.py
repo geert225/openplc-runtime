@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from enum import Enum, auto
 import os
+import shutil
 import zipfile
 import subprocess
 import threading
@@ -235,8 +236,15 @@ def update_plugin_configurations(generated_dir: str = "core/generated"):
         build_state.log("[ERROR] Failed to save updated plugin configuration\n")
 
 
-def run_compile(runtime_manager: RuntimeManager, cwd: str = "core/generated"):
-    """Run compile script synchronously (wait for completion) and update status/logs."""
+def run_compile(runtime_manager: RuntimeManager, cwd: str = "core/generated", clean: bool = False):
+    """Run compile script synchronously (wait for completion) and update status/logs.
+
+    When ``clean=True`` (editor's "Clean build and upload" option), wipe the
+    Make-managed ``core/build/`` directory and clear the ccache contents
+    before invoking compile.sh. This forces a full recompile from scratch
+    even when source content hashes match the cached objects — useful when
+    the user suspects a stale or corrupted cache.
+    """
     script_path: str = "./scripts/compile.sh"
 
     build_state.status = BuildStatus.COMPILING
@@ -257,6 +265,39 @@ def run_compile(runtime_manager: RuntimeManager, cwd: str = "core/generated"):
         else:
             build_state.status = BuildStatus.FAILED
             build_state.log(f"[ERROR] {step_name} failed (exit={exit_code})\n")
+
+    # --- Optional clean step ---
+    if clean:
+        build_state.log("[INFO] Clean build requested — wiping core/build/ and ccache\n")
+        # Wipe the per-project object cache. shutil.rmtree avoids needing
+        # `make clean` (which would require the Makefile to be in cwd).
+        build_dir = "core/build"
+        if os.path.exists(build_dir):
+            try:
+                shutil.rmtree(build_dir)
+            except OSError as e:
+                build_state.log(f"[WARNING] Failed to remove {build_dir}: {e}\n")
+        # Wipe ccache. Failures here are non-fatal — `ccache -C` returning
+        # non-zero (e.g. ccache not installed) shouldn't abort the build,
+        # since the build folder wipe alone already invalidates per-file
+        # caches that live in build/.
+        try:
+            ccache_proc = subprocess.run(
+                ["ccache", "-C"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            if ccache_proc.returncode == 0:
+                build_state.log("[INFO] ccache cleared\n")
+            else:
+                build_state.log(
+                    f"[WARNING] ccache -C exited {ccache_proc.returncode}: "
+                    f"{ccache_proc.stderr.strip() or 'no error output'}\n"
+                )
+        except FileNotFoundError:
+            build_state.log("[INFO] ccache not installed — skipping cache wipe\n")
 
     # --- Compile step ---
     compile_proc = subprocess.Popen(

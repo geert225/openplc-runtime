@@ -244,13 +244,19 @@ def handle_upload_file(data: dict) -> dict:
         # Update plugin configurations based on extracted config files
         update_plugin_configurations(extract_dir)
 
+        # ?clean=1 — wired from the editor's "Clean build and upload" UI
+        # option. Forces a full recompile by wiping core/build/ and the
+        # ccache contents before invoking compile.sh. Older editors
+        # don't pass this flag, so behaviour for them is unchanged.
+        clean_build = flask.request.args.get("clean") == "1"
+
         # Start compilation in a separate thread
         build_state.status = BuildStatus.COMPILING
 
         task_compile = threading.Thread(
             target=run_compile,
             args=(runtime_manager,),
-            kwargs={"cwd": extract_dir},
+            kwargs={"cwd": extract_dir, "clean": clean_build},
             daemon=True,
         )
 
