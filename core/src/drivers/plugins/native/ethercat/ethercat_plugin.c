@@ -576,6 +576,8 @@ static int start_single_master(ecat_master_instance_t *inst)
 
     if (ecat_master_open_and_scan(inst, &g_logger) != 0) {
         plugin_logger_error(&g_logger, "Master '%s': Bus scan failed", inst->name);
+        /* open_and_scan may have partially applied iface state -- close reverts it. */
+        ecat_master_close(inst, &g_logger);
         atomic_store(&inst->plugin_state, ECAT_STATE_ERROR);
         return -1;
     }
