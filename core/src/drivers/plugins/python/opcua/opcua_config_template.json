@@ -85,9 +85,9 @@
             "browse_name": "bool_var",
             "display_name": "Boolean Variable",
             "datatype": "BOOL",
-            "initial_value": false,
             "description": "Example boolean variable",
-            "index": 0,
+            "arr": 0,
+            "elem": 0,
             "permissions": {"viewer": "r", "operator": "rw", "engineer": "rw"}
           },
           {
@@ -95,9 +95,9 @@
             "browse_name": "int_var",
             "display_name": "Integer Variable",
             "datatype": "INT",
-            "initial_value": 0,
             "description": "Example 16-bit signed integer",
-            "index": 1,
+            "arr": 0,
+            "elem": 1,
             "permissions": {"viewer": "r", "operator": "rw", "engineer": "rw"}
           },
           {
@@ -105,9 +105,9 @@
             "browse_name": "dint_var",
             "display_name": "Double Integer Variable",
             "datatype": "DINT",
-            "initial_value": 0,
             "description": "Example 32-bit signed integer",
-            "index": 2,
+            "arr": 0,
+            "elem": 2,
             "permissions": {"viewer": "r", "operator": "rw", "engineer": "rw"}
           },
           {
@@ -115,9 +115,9 @@
             "browse_name": "real_var",
             "display_name": "Real Variable",
             "datatype": "REAL",
-            "initial_value": 0.0,
             "description": "Example 32-bit floating point",
-            "index": 3,
+            "arr": 0,
+            "elem": 3,
             "permissions": {"viewer": "r", "operator": "rw", "engineer": "rw"}
           },
           {
@@ -125,9 +125,9 @@
             "browse_name": "string_var",
             "display_name": "String Variable",
             "datatype": "STRING",
-            "initial_value": "",
             "description": "Example string variable",
-            "index": 4,
+            "arr": 0,
+            "elem": 4,
             "permissions": {"viewer": "r", "operator": "rw", "engineer": "rw"}
           },
           {
@@ -135,9 +135,9 @@
             "browse_name": "readonly_counter",
             "display_name": "Read-Only Counter",
             "datatype": "DINT",
-            "initial_value": 0,
             "description": "Example read-only variable",
-            "index": 5,
+            "arr": 0,
+            "elem": 5,
             "permissions": {"viewer": "r", "operator": "r", "engineer": "r"}
           },
           {
@@ -145,9 +145,9 @@
             "browse_name": "cycle_time",
             "display_name": "Cycle Time",
             "datatype": "TIME",
-            "initial_value": 0,
             "description": "PLC scan cycle time (TIME type, represented as milliseconds in OPC-UA)",
-            "index": 6,
+            "arr": 0,
+            "elem": 6,
             "permissions": {"viewer": "r", "operator": "r", "engineer": "rw"}
           },
           {
@@ -155,9 +155,9 @@
             "browse_name": "timer_preset",
             "display_name": "Timer Preset",
             "datatype": "TIME",
-            "initial_value": 0,
             "description": "Timer preset value (TIME type)",
-            "index": 7,
+            "arr": 0,
+            "elem": 7,
             "permissions": {"viewer": "r", "operator": "rw", "engineer": "rw"}
           },
           {
@@ -165,9 +165,9 @@
             "browse_name": "time_of_day",
             "display_name": "Time of Day",
             "datatype": "TOD",
-            "initial_value": 0,
             "description": "Current time of day (TOD type, mapped to OPC-UA DateTime)",
-            "index": 8,
+            "arr": 0,
+            "elem": 8,
             "permissions": {"viewer": "r", "operator": "r", "engineer": "rw"}
           }
         ],
@@ -181,22 +181,22 @@
               {
                 "name": "sensor_id",
                 "datatype": "INT",
-                "initial_value": 1,
-                "index": 10,
+                "arr": 0,
+                "elem": 10,
                 "permissions": {"viewer": "r", "operator": "rw", "engineer": "rw"}
               },
               {
                 "name": "value",
                 "datatype": "REAL",
-                "initial_value": 0.0,
-                "index": 11,
+                "arr": 0,
+                "elem": 11,
                 "permissions": {"viewer": "r", "operator": "rw", "engineer": "rw"}
               },
               {
                 "name": "is_valid",
                 "datatype": "BOOL",
-                "initial_value": false,
-                "index": 12,
+                "arr": 0,
+                "elem": 12,
                 "permissions": {"viewer": "r", "operator": "r", "engineer": "r"}
               }
             ]
@@ -209,8 +209,8 @@
             "display_name": "Integer Array",
             "datatype": "INT",
             "length": 5,
-            "initial_value": 0,
-            "index": 20,
+            "arr": 0,
+            "elem": 20,
             "permissions": {"viewer": "r", "operator": "rw", "engineer": "rw"}
           },
           {
@@ -219,8 +219,8 @@
             "display_name": "Real Array",
             "datatype": "REAL",
             "length": 4,
-            "initial_value": 0.0,
-            "index": 25,
+            "arr": 0,
+            "elem": 25,
             "permissions": {"viewer": "r", "operator": "rw", "engineer": "rw"}
           }
         ]

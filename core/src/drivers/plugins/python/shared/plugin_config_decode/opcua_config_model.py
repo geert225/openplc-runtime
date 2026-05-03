@@ -173,13 +173,16 @@ class VariableField:
     Field within a struct variable.
 
     Supports nested fields for complex types (FB instances, nested structs).
-    When a field has nested fields, its index will be None since only leaf
-    fields have actual debug variable indices.
+    When a field has nested fields, its (arr, elem) address will be None
+    since only leaf fields have addresses in the debugger Entry tables.
     """
     name: str
     datatype: str
-    initial_value: Any
-    index: Optional[int]  # None for complex types that have nested fields
+    # None for complex types that have nested fields. Leaf fields carry
+    # both — an (arr, elem) tuple addressing the leaf in the runtime's
+    # debug Entry tables (debug_dispatch.hpp).
+    arr: Optional[int]
+    elem: Optional[int]
     permissions: VariablePermissions
     fields: Optional[List['VariableField']] = None  # Nested fields for complex types
 
@@ -189,8 +192,8 @@ class VariableField:
         try:
             name = data["name"]
             datatype = data["datatype"]
-            initial_value = data["initial_value"]
-            index = data["index"]  # Can be None for complex types
+            arr = data["arr"]
+            elem = data["elem"]
             permissions_data = data["permissions"]
         except KeyError as e:
             raise ValueError(f"Missing required field in variable field: {e}")
@@ -205,8 +208,8 @@ class VariableField:
         return cls(
             name=name,
             datatype=datatype,
-            initial_value=initial_value,
-            index=index,
+            arr=arr,
+            elem=elem,
             permissions=permissions,
             fields=nested_fields
         )
@@ -244,14 +247,15 @@ class StructVariable:
 
 @dataclass
 class ArrayVariable:
-    """Array variable configuration."""
+    """Array variable configuration. Elements live at (arr, elem + i)
+    for i in 0..length-1; STruC++ guarantees per-array contiguity."""
     node_id: str
     browse_name: str
     display_name: str
     datatype: str
     length: int
-    initial_value: Any
-    index: int
+    arr: int
+    elem: int
     permissions: VariablePermissions
 
     @classmethod
@@ -263,8 +267,8 @@ class ArrayVariable:
             display_name = data["display_name"]
             datatype = data["datatype"]
             length = data["length"]
-            initial_value = data["initial_value"]
-            index = data["index"]
+            arr = data["arr"]
+            elem = data["elem"]
             permissions_data = data["permissions"]
         except KeyError as e:
             raise ValueError(f"Missing required field in array variable: {e}")
@@ -277,21 +281,22 @@ class ArrayVariable:
             display_name=display_name,
             datatype=datatype,
             length=length,
-            initial_value=initial_value,
-            index=index,
+            arr=arr,
+            elem=elem,
             permissions=permissions
         )
 
 @dataclass
 class SimpleVariable:
-    """Simple variable configuration."""
+    """Simple variable configuration. Address is (arr, elem) into the
+    runtime's debug Entry tables (debug_dispatch.hpp)."""
     node_id: str
     browse_name: str
     display_name: str
     datatype: str
-    initial_value: Any
     description: str
-    index: int
+    arr: int
+    elem: int
     permissions: VariablePermissions
 
     @classmethod
@@ -302,9 +307,9 @@ class SimpleVariable:
             browse_name = data["browse_name"]
             display_name = data["display_name"]
             datatype = data["datatype"]
-            initial_value = data["initial_value"]
             description = data["description"]
-            index = data["index"]
+            arr = data["arr"]
+            elem = data["elem"]
             permissions_data = data["permissions"]
         except KeyError as e:
             raise ValueError(f"Missing required field in simple variable: {e}")
@@ -316,9 +321,9 @@ class SimpleVariable:
             browse_name=browse_name,
             display_name=display_name,
             datatype=datatype,
-            initial_value=initial_value,
             description=description,
-            index=index,
+            arr=arr,
+            elem=elem,
             permissions=permissions
         )
 
@@ -456,25 +461,30 @@ class OpcuaMasterConfig(PluginConfigContract):
             if len(all_node_ids) != len(set(all_node_ids)):
                 raise ValueError(f"Duplicate node_ids found in plugin '{plugin.name}'")
 
-            # Check for duplicate indices
-            # Helper to collect indices recursively from nested fields
-            def collect_field_indices(fields: List[VariableField]) -> List[int]:
-                indices = []
+            # Check for duplicate addresses. Variables are addressed by
+            # (arr, elem) tuples into the runtime's debug Entry tables.
+            def collect_field_addrs(fields: List[VariableField]) -> List[tuple]:
+                addrs: List[tuple] = []
                 for field in fields:
-                    if field.index is not None:  # Skip None indices (complex types)
-                        indices.append(field.index)
+                    if field.arr is not None and field.elem is not None:
+                        addrs.append((field.arr, field.elem))
                     if field.fields:  # Recurse into nested fields
-                        indices.extend(collect_field_indices(field.fields))
-                return indices
+                        addrs.extend(collect_field_addrs(field.fields))
+                return addrs
 
-            all_indices = []
-            all_indices.extend([var.index for var in address_space.variables])
+            all_addrs: List[tuple] = []
+            all_addrs.extend([(var.arr, var.elem) for var in address_space.variables])
             for struct in address_space.structures:
-                all_indices.extend(collect_field_indices(struct.fields))
-            all_indices.extend([arr.index for arr in address_space.arrays])
+                all_addrs.extend(collect_field_addrs(struct.fields))
+            # Each array claims length consecutive addresses starting
+            # at (arr, elem). Expand for the duplicate check so an
+            # array overlapping a scalar is caught.
+            for ary in address_space.arrays:
+                for offset in range(ary.length):
+                    all_addrs.append((ary.arr, ary.elem + offset))
 
-            if len(all_indices) != len(set(all_indices)):
-                raise ValueError(f"Duplicate indices found in plugin '{plugin.name}'")
+            if len(all_addrs) != len(set(all_addrs)):
+                raise ValueError(f"Duplicate variable addresses found in plugin '{plugin.name}'")
 
             # Validate datatypes
             # Helper to validate datatypes recursively for nested fields
