@@ -98,8 +98,10 @@ class OpcuaServerManager:
         # Address space builder (initialized in _create_address_space)
         self.address_space_builder: Optional[AddressSpaceBuilder] = None
 
-        # Node mappings (populated by address space builder)
-        self.variable_nodes: Dict[int, VariableNode] = {}
+        # Node mappings (populated by address space builder).
+        # Variables are keyed by (arr, elem) tuples — the same
+        # address the runtime's debug_read / debug_write thunks take.
+        self.variable_nodes: Dict[Any, VariableNode] = {}
         self.node_permissions: Dict[str, Any] = {}
         self.nodeid_to_variable: Dict[Any, str] = {}
 
@@ -375,10 +377,13 @@ class OpcuaServerManager:
             True if initialization successful
         """
         try:
+            # SyncManager talks to the runtime's debug_* C function
+            # pointers directly via the underlying ctypes struct.
+            # buffer_accessor.runtime_args exposes that struct.
             self.sync_manager = SynchronizationManager(
-                buffer_accessor=self.buffer_accessor,
+                args=self.buffer_accessor.runtime_args,
                 variable_nodes=self.variable_nodes,
-                server=self.server  # Pass server for subscription support
+                server=self.server,
             )
 
             if not await self.sync_manager.initialize():

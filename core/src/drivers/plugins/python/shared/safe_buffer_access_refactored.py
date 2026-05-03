@@ -56,6 +56,10 @@ class SafeBufferAccess(ISafeBufferAccess):
         Args:
             runtime_args: PluginRuntimeArgs instance
         """
+        # Expose so plugins (e.g. OPC-UA SyncManager) can reach the
+        # debug_read / debug_write / debug_size function pointers
+        # without going through the buffer-access wrapper.
+        self.runtime_args = runtime_args
         # Initialize all components
         self.buffer_types = get_buffer_types()
         self.mutex_manager = MutexManager(runtime_args)
