@@ -17,7 +17,6 @@ try:
     from .buffer_validator import BufferValidator
     from .component_interfaces import ISafeBufferAccess
     from .config_handler import ConfigHandler
-    from .debug_utils import DebugUtils
     from .mutex_manager import MutexManager
 except ImportError:
     # Fall back to absolute imports (when testing standalone)
@@ -27,7 +26,6 @@ except ImportError:
     from buffer_validator import BufferValidator
     from component_interfaces import ISafeBufferAccess
     from config_handler import ConfigHandler
-    from debug_utils import DebugUtils
     from mutex_manager import MutexManager
 
 
@@ -68,7 +66,6 @@ class SafeBufferAccess(ISafeBufferAccess):
             runtime_args, self.validator, self.mutex_manager
         )
         self.batch_processor = BatchProcessor(self.buffer_accessor, self.mutex_manager)
-        self.debug_utils = DebugUtils(runtime_args)
         self.config_handler = ConfigHandler(runtime_args)
 
         # Validate initialization (maintains original behavior)
@@ -299,46 +296,17 @@ class SafeBufferAccess(ISafeBufferAccess):
         return self.batch_processor.process_mixed_operations(read_operations, write_operations)
 
     # ============================================================================
-    # Debug/Variable Operations
+    # Variable access (debug_*) — moved out of SafeBufferAccess.
+    #
+    # The MatIEC-era flat-index API (get_var_list / get_var_size /
+    # get_var_count / get_var_value / get_var_*_batch) is gone. Plugins
+    # that need to read/write program variables call the runtime's
+    # debug_read / debug_write / debug_set / debug_size function
+    # pointers directly via runtime_args.* — see
+    # opcua/opcua_memory.py for the typed Python helpers
+    # (debug_read_value, debug_write_value, debug_force_value,
+    # debug_unforce, initialize_variable_cache).
     # ============================================================================
-
-    def get_var_list(self, indexes: List[int]) -> Tuple[List[int], str]:
-        """Get variable addresses for indexes."""
-        return self.debug_utils.get_var_list(indexes)
-
-    def get_var_size(self, index: int) -> Tuple[int, str]:
-        """Get variable size."""
-        return self.debug_utils.get_var_size(index)
-
-    def get_var_value(self, index: int) -> Tuple[Any, str]:
-        """Read variable value by index."""
-        return self.debug_utils.get_var_value(index)
-
-    def set_var_value(self, index: int, value: Any) -> Tuple[bool, str]:
-        """Write variable value by index."""
-        return self.debug_utils.set_var_value(index, value)
-
-    def get_var_count(self) -> Tuple[int, str]:
-        """Get total variable count."""
-        return self.debug_utils.get_var_count()
-
-    def get_var_info(self, index: int) -> Tuple[Dict, str]:
-        """Get variable information."""
-        return self.debug_utils.get_var_info(index)
-
-    def get_var_sizes_batch(self, indexes: List[int]) -> Tuple[List[int], str]:
-        """Get sizes for multiple variables in batch."""
-        return self.debug_utils.get_var_sizes_batch(indexes)
-
-    def get_var_values_batch(self, indexes: List[int]) -> Tuple[List[Tuple[Any, str]], str]:
-        """Read multiple variable values in batch."""
-        return self.debug_utils.get_var_values_batch(indexes)
-
-    def set_var_values_batch(
-        self, index_value_pairs: List[Tuple[int, Any]]
-    ) -> Tuple[List[Tuple[bool, str]], str]:
-        """Write multiple variable values in batch."""
-        return self.debug_utils.set_var_values_batch(index_value_pairs)
 
     # ============================================================================
     # Configuration Operations
