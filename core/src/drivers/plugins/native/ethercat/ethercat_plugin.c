@@ -241,32 +241,52 @@ static void publish_slaves_snapshot(ecat_master_instance_t *inst)
 /**
  * @brief Attempt to recover all slaves that are not in OP
  *
- * MUST be called with inst->soem_lock held (the monitor thread takes it
- * before calling), because these SOEM calls are blocking and not
- * thread-safe versus the PLC's exchange.
+ * Acquires inst->soem_lock per slave (not for the whole iteration),
+ * yielding briefly between slaves so the RT PLC thread can grab the
+ * lock and run an exchange.  Without chunking, recovery of N slaves
+ * holds the lock contiguously for ~N * (ecx_writestate + ecx_statecheck
+ * + ecx_recover_slave) -- seconds, in the worst case -- and the PLC's
+ * trylock fails for that entire window, freezing I/O at stale values.
  *
  * @param inst Per-master instance
  * @return 1 if all slaves back in OP, 0 if some still recovering, -1 on max attempts
  */
 static int attempt_recovery(ecat_master_instance_t *inst)
 {
+    /* Initial state read under lock so cycle_start_single never sees
+     * a slavelist[] mid-update. */
+    pthread_mutex_lock(&inst->soem_lock);
     ecat_master_read_states(inst);
+    pthread_mutex_unlock(&inst->soem_lock);
 
     int all_ok = 1;
 
+    /* 1 ms is comfortably above one PLC tick at typical cycle times
+     * (250 us-1 ms), giving the higher-priority RT thread a guaranteed
+     * window to grab the lock between our per-slave acquisitions.  In
+     * configurations with cycle_time > 1 ms, the trylock would still
+     * fail occasionally but exchange_skips no longer climb continuously. */
+    const struct timespec yield = { 0, 1000 * 1000 };  /* 1 ms */
+
     for (int i = 0; i < inst->config.slave_count; i++) {
         int pos = inst->config.slaves[i].position;
-        uint16_t state = ecat_master_get_slave_state(inst, pos);
 
+        pthread_mutex_lock(&inst->soem_lock);
+        uint16_t state = ecat_master_get_slave_state(inst, pos);
+        int result = 1;
         if (state != EC_STATE_OPERATIONAL) {
             all_ok = 0;
-            int result = ecat_master_recover_slave(inst, pos, &g_logger);
-            if (result < 0) {
-                plugin_logger_error(&g_logger,
-                    "Master '%s': Slave %d (%s): recovery error",
-                    inst->name, pos, inst->config.slaves[i].name);
-            }
+            result = ecat_master_recover_slave(inst, pos, &g_logger);
         }
+        pthread_mutex_unlock(&inst->soem_lock);
+
+        if (result < 0) {
+            plugin_logger_error(&g_logger,
+                "Master '%s': Slave %d (%s): recovery error",
+                inst->name, pos, inst->config.slaves[i].name);
+        }
+
+        nanosleep(&yield, NULL);
     }
 
     if (all_ok) {
@@ -348,9 +368,13 @@ static void *ecat_monitor_thread(void *arg)
             pthread_mutex_unlock(&inst->soem_lock);
 
         } else if (state == ECAT_STATE_RECOVERING) {
-            /* Recovery holds the lock for longer; PLC will skip cycles. */
-            pthread_mutex_lock(&inst->soem_lock);
+            /* attempt_recovery acquires soem_lock per slave with a yield
+             * in between, so the PLC trylock has frequent windows to
+             * succeed during recovery.  Snapshot publish takes the lock
+             * once after recovery returns. */
             int result = attempt_recovery(inst);
+
+            pthread_mutex_lock(&inst->soem_lock);
             publish_slaves_snapshot(inst);
             pthread_mutex_unlock(&inst->soem_lock);
 

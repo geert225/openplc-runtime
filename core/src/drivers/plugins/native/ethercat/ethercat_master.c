@@ -34,7 +34,9 @@
  * =============================================================================
  */
 
-/** Number of retries when polling for OPERATIONAL state */
+/** Minimum retry count when polling for OPERATIONAL state.  The actual
+ *  retry count scales with min_sm_wd / total budget so the cadence stays
+ *  inside the smallest configured SM watchdog (see transition_to_op). */
 #define ECAT_OP_POLL_RETRIES 10
 
 /*
@@ -725,13 +727,46 @@ int ecat_master_transition_to_op(ecat_master_instance_t *inst, plugin_logger_t *
     inst->ecx_context.slavelist[0].state = EC_STATE_OPERATIONAL;
     ecx_writestate(&inst->ecx_context, 0);
 
-    /* Poll for OP state with process data exchange between checks */
-    int op_reached = 0;
-    int poll_timeout_us = max_safeop_timeout_us / ECAT_OP_POLL_RETRIES;
+    /* Poll for OP state with process data exchange between checks.
+     *
+     * Cadence is bounded by the smallest configured SM watchdog: a SAFE-OP
+     * slave's SM2 watchdog starts counting on SAFE-OP entry and trips with
+     * AL Status 0x001B if the master stops writing for longer than
+     * sm_watchdog_ms.  Cap the per-iteration statecheck timeout to a
+     * quarter of that smallest watchdog so the trickle of exchanges keeps
+     * SM2 rearmed throughout the SAFE-OP -> OP poll, regardless of how
+     * generous safeop_to_op_timeout_ms is set per slave. */
+    int min_sm_wd_us = 0;
+    for (int i = 0; i < config->slave_count; i++) {
+        const ecat_watchdog_t *wd = &config->slaves[i].watchdog;
+        if (wd->sm_watchdog_enabled && wd->sm_watchdog_ms > 0) {
+            int wd_us = wd->sm_watchdog_ms * 1000;
+            if (min_sm_wd_us == 0 || wd_us < min_sm_wd_us)
+                min_sm_wd_us = wd_us;
+        }
+    }
+    /* Default ESC SM watchdog is 100 ms.  Use it when no slave has an
+     * explicit watchdog configured. */
+    if (min_sm_wd_us == 0)
+        min_sm_wd_us = 100 * 1000;
+
+    int poll_timeout_us = min_sm_wd_us / 4;
     if (poll_timeout_us < EC_TIMEOUTRET)
         poll_timeout_us = EC_TIMEOUTRET;
 
-    for (int retry = 0; retry < ECAT_OP_POLL_RETRIES; retry++) {
+    /* Total polling budget is the longest configured safeop->op timeout.
+     * Derive the retry count from the cadence we need. */
+    int retries = max_safeop_timeout_us / poll_timeout_us;
+    if (retries < ECAT_OP_POLL_RETRIES)
+        retries = ECAT_OP_POLL_RETRIES;
+
+    plugin_logger_debug(logger,
+        "OP poll cadence: timeout=%d us, retries=%d "
+        "(min SM watchdog among slaves=%d us)",
+        poll_timeout_us, retries, min_sm_wd_us);
+
+    int op_reached = 0;
+    for (int retry = 0; retry < retries; retry++) {
         ecx_send_processdata(&inst->ecx_context);
         ecx_receive_processdata(&inst->ecx_context, EC_TIMEOUTRET);
         ecx_statecheck(&inst->ecx_context, 0, EC_STATE_OPERATIONAL, poll_timeout_us);
@@ -744,8 +779,9 @@ int ecat_master_transition_to_op(ecat_master_instance_t *inst, plugin_logger_t *
 
     if (!op_reached) {
         plugin_logger_error(logger,
-            "Not all slaves reached OPERATIONAL state after %d retries",
-            ECAT_OP_POLL_RETRIES);
+            "Not all slaves reached OPERATIONAL state after %d retries "
+            "(poll_timeout=%d us)",
+            retries, poll_timeout_us);
 
         /* Log individual slave states for debugging */
         ecx_readstate(&inst->ecx_context);
