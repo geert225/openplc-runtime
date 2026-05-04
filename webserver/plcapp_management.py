@@ -237,9 +237,10 @@ def update_plugin_configurations(generated_dir: str = "core/generated"):
         build_state.log("[ERROR] Failed to save updated plugin configuration\n")
 
 
-def _wait_for_plc_state(runtime_manager: RuntimeManager, expected: str, timeout_s: float = 30.0) -> bool:
+def _wait_for_plc_state(runtime_manager: RuntimeManager, expected: str, timeout_s: float) -> bool:
     """Poll status_plc() until the runtime reports the expected state or
-    timeout elapses. Returns True on match.
+    timeout elapses. Returns True on match. Used to confirm the new
+    program reached RUNNING after start_plc().
 
     ``stop_plc()`` and ``start_plc()`` go over a Unix socket with a 500 ms
     response window. The runtime ACKs the command before its teardown /
@@ -255,6 +256,30 @@ def _wait_for_plc_state(runtime_manager: RuntimeManager, expected: str, timeout_
         resp = runtime_manager.status_plc()
         # Response format from the runtime is "STATUS:RUNNING\n" / "STATUS:STOPPED\n".
         if resp and expected in resp.upper():
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def _wait_for_plc_idle(runtime_manager: RuntimeManager, timeout_s: float) -> bool:
+    """Poll status_plc() until the runtime is NOT in a transition.
+
+    The runtime reports STATUS:TRANSITIONING while a stop/start worker
+    is in flight (plc_state has flipped but the unload/load work hasn't
+    completed). Any other STATUS (STOPPED, EMPTY, INIT, RUNNING) means
+    the runtime is settled and ready to accept the next command.
+
+    Used before the cleanup script runs, so the .so move doesn't race
+    against an in-flight unload, and before sending START, so the
+    runtime can actually process the command instead of returning
+    COMMAND:BUSY. Tolerates the case where the PLC was never started
+    (state == INIT or EMPTY) — those return immediately since there's
+    no transition to wait for.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        resp = runtime_manager.status_plc()
+        if resp and "TRANSITIONING" not in resp.upper():
             return True
         time.sleep(0.1)
     return False
@@ -344,14 +369,16 @@ def run_compile(runtime_manager: RuntimeManager, cwd: str = "core/generated", cl
     # Stop the running PLC before swapping the .so. stop_plc() returns
     # as soon as the runtime ACKs over the socket, but the actual task
     # / plugin / .so teardown continues asynchronously — wait for the
-    # runtime to actually report STOPPED before letting the cleanup
-    # script touch build/new_libplc.so. Otherwise the new .so could be
-    # moved into place (or the old one held open) while teardown is
-    # still in progress.
+    # runtime to settle (not in a transition) before letting the
+    # cleanup script touch build/new_libplc.so. Otherwise the new .so
+    # could be moved into place (or the old one held open) while
+    # teardown is still in progress. _wait_for_plc_idle returns
+    # immediately for the "PLC was never started" case (state == INIT
+    # / EMPTY) — there's no transition to wait for.
     runtime_manager.stop_plc()
-    if not _wait_for_plc_state(runtime_manager, "STOPPED", timeout_s=30.0):
+    if not _wait_for_plc_idle(runtime_manager, timeout_s=30.0):
         build_state.log(
-            "[WARNING] Runtime did not report STOPPED within 30s; "
+            "[WARNING] Runtime stayed in TRANSITIONING for 30s; "
             "proceeding with cleanup anyway\n"
         )
 
