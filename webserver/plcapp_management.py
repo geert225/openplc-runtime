@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 import os
 import shutil
+import time
 import zipfile
 import subprocess
 import threading
@@ -236,6 +237,29 @@ def update_plugin_configurations(generated_dir: str = "core/generated"):
         build_state.log("[ERROR] Failed to save updated plugin configuration\n")
 
 
+def _wait_for_plc_state(runtime_manager: RuntimeManager, expected: str, timeout_s: float = 30.0) -> bool:
+    """Poll status_plc() until the runtime reports the expected state or
+    timeout elapses. Returns True on match.
+
+    ``stop_plc()`` and ``start_plc()`` go over a Unix socket with a 500 ms
+    response window. The runtime ACKs the command before its teardown /
+    bring-up actually finishes (tasks stop, plugins shut down, .so
+    unloads, then for start: .so loads, plugins init, tasks spawn).
+    Without waiting for the actual state transition, run_compile would
+    race: cleanup script + start_plc would fire while the runtime is
+    still tearing the previous program down, and the new .so load
+    silently fails.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        resp = runtime_manager.status_plc()
+        # Response format from the runtime is "STATUS:RUNNING\n" / "STATUS:STOPPED\n".
+        if resp and expected in resp.upper():
+            return True
+        time.sleep(0.1)
+    return False
+
+
 def run_compile(runtime_manager: RuntimeManager, cwd: str = "core/generated", clean: bool = False):
     """Run compile script synchronously (wait for completion) and update status/logs.
 
@@ -256,15 +280,18 @@ def run_compile(runtime_manager: RuntimeManager, cwd: str = "core/generated", cl
             build_state.log(msg)
         pipe.close()
 
-    def wait_and_finish(proc: subprocess.Popen, step_name: str):
+    def wait_step(proc: subprocess.Popen, step_name: str) -> bool:
+        """Wait for a subprocess and log the result. Returns True on
+        zero-exit. Caller is responsible for combining results — does
+        NOT mutate build_state.status, since that's only updated once
+        after every step (compile + cleanup) completes, so a successful
+        compile isn't masked by a failed cleanup or vice-versa."""
         exit_code = proc.wait()
-        build_state.exit_code = exit_code
         if exit_code == 0:
-            build_state.status = BuildStatus.SUCCESS
             build_state.log(f"[INFO] {step_name} finished successfully\n")
-        else:
-            build_state.status = BuildStatus.FAILED
-            build_state.log(f"[ERROR] {step_name} failed (exit={exit_code})\n")
+            return True
+        build_state.log(f"[ERROR] {step_name} failed (exit={exit_code})\n")
+        return False
 
     # --- Optional clean step ---
     if clean:
@@ -311,11 +338,22 @@ def run_compile(runtime_manager: RuntimeManager, cwd: str = "core/generated", cl
     threading.Thread(target=stream_output, args=(compile_proc.stdout, ""), daemon=True).start()
     threading.Thread(target=stream_output, args=(compile_proc.stderr, "[ERROR] "), daemon=True).start()
 
-    # Block until compile finishes
-    wait_and_finish(compile_proc, "Build")
+    # Block until compile finishes.
+    compile_ok = wait_step(compile_proc, "Build")
 
-    # Stop PLC before cleanup
+    # Stop the running PLC before swapping the .so. stop_plc() returns
+    # as soon as the runtime ACKs over the socket, but the actual task
+    # / plugin / .so teardown continues asynchronously — wait for the
+    # runtime to actually report STOPPED before letting the cleanup
+    # script touch build/new_libplc.so. Otherwise the new .so could be
+    # moved into place (or the old one held open) while teardown is
+    # still in progress.
     runtime_manager.stop_plc()
+    if not _wait_for_plc_state(runtime_manager, "STOPPED", timeout_s=30.0):
+        build_state.log(
+            "[WARNING] Runtime did not report STOPPED within 30s; "
+            "proceeding with cleanup anyway\n"
+        )
 
     # --- Cleanup step ---
     cleanup_proc = subprocess.Popen(
@@ -329,12 +367,38 @@ def run_compile(runtime_manager: RuntimeManager, cwd: str = "core/generated", cl
     threading.Thread(target=stream_output, args=(cleanup_proc.stdout, ""), daemon=True).start()
     threading.Thread(target=stream_output, args=(cleanup_proc.stderr, "[ERROR] "), daemon=True).start()
 
-    # Block until cleanup finishes
-    wait_and_finish(cleanup_proc, "Cleanup")
+    cleanup_ok = wait_step(cleanup_proc, "Cleanup")
 
-    # Restart PLC only if everything succeeded
-    if build_state.status == BuildStatus.SUCCESS:
+    # Update build_state.status from the COMBINED result. Previously,
+    # only the cleanup result mattered (the second wait_and_finish
+    # overwrote whatever the compile set), so a failed compile + a
+    # successful cleanup would have been reported as SUCCESS, and a
+    # successful compile + a failed cleanup as FAILED — neither
+    # matches what actually happened.
+    if compile_ok and cleanup_ok:
+        build_state.status = BuildStatus.SUCCESS
+        build_state.exit_code = 0
+    else:
+        build_state.status = BuildStatus.FAILED
+        build_state.exit_code = 1
+
+    # Restart PLC only if both compile and cleanup succeeded.
+    if compile_ok and cleanup_ok:
         runtime_manager.reset_crash_tracking()
-        runtime_manager.start_plc()
+        build_state.log("[INFO] Starting PLC...\n")
+        start_resp = runtime_manager.start_plc()
+        # start_plc returns "START:OK\n" on success or "START:ERROR\n"
+        # / None on failure. Surface that in the build log so the user
+        # can tell whether the runtime accepted the new program.
+        if start_resp and "OK" in start_resp.upper():
+            if _wait_for_plc_state(runtime_manager, "RUNNING", timeout_s=15.0):
+                build_state.log("[INFO] PLC running\n")
+            else:
+                build_state.log(
+                    "[WARNING] PLC started but did not reach RUNNING state within 15s. "
+                    "Check the runtime logs for crash or load errors.\n"
+                )
+        else:
+            build_state.log(f"[ERROR] start_plc failed: {start_resp!r}\n")
     else:
         build_state.log("[WARNING] PLC program has not been updated because the build failed\n")
