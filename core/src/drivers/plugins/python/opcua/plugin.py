@@ -11,6 +11,7 @@ This is a thin entry point that delegates to the modular components.
 """
 
 import asyncio
+import logging
 import os
 import sys
 import threading
@@ -56,6 +57,50 @@ _stop_event = threading.Event()
 _loop: Optional[asyncio.AbstractEventLoop] = None
 
 
+class _PermissionDenialFilter(logging.Filter):
+    """Quiet asyncua's "Error while processing message" traceback when
+    the underlying cause is a UaError raised by our pre-read /
+    pre-write permission callback.
+
+    The permission system in callbacks.py raises ua.UaError to deny a
+    write — that's the documented asyncua API for rejecting a request.
+    The wire response is the protocol-correct BadUserAccessDenied
+    status code. asyncua's process_message however catches the
+    exception with logger.exception(), so the runtime log gets a full
+    Python traceback for what is really an expected, well-handled
+    permission denial.
+
+    This filter drops the traceback for those specific cases — the
+    one-line WARN log emitted by callbacks.py
+    ("DENY write for user … on node …") still goes through, so the
+    operator has the audit trail without the stack-trace noise.
+    Genuine errors from process_message (decode failures, broken
+    requests, etc.) keep their traceback.
+    """
+
+    _DENIAL_MARKERS = (
+        "Access denied:",
+        "anonymous read not allowed",
+        "anonymous write not allowed",
+        "insufficient write permissions",
+        "no permissions configured",
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.exc_info:
+            exc = record.exc_info[1]
+            if exc is not None:
+                msg = str(exc)
+                if any(marker in msg for marker in self._DENIAL_MARKERS):
+                    return False  # drop the record
+        return True
+
+
+def _install_asyncua_log_filter() -> None:
+    """Install the permission-denial filter on asyncua's processor logger."""
+    logging.getLogger("asyncua.server.uaprocessor").addFilter(_PermissionDenialFilter())
+
+
 def init(args_capsule) -> bool:
     """
     Initialize the OPC UA plugin.
@@ -84,6 +129,8 @@ def init(args_capsule) -> bool:
         if logging_accessor.is_valid:
             get_logger().initialize(logging_accessor)
             log_debug("Logging initialized with runtime accessor")
+
+        _install_asyncua_log_filter()
 
         log_info("OPC UA Plugin initialized successfully")
         return True
