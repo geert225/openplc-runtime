@@ -835,7 +835,7 @@ static void cycle_start_single(ecat_master_instance_t *inst)
      * cycle.  Trylock is non-blocking; in contention it costs only a futex
      * read and returns immediately. */
     if (pthread_mutex_trylock(&inst->soem_lock) != 0) {
-        atomic_fetch_add(&inst->exchange_skips, 1);
+        atomic_fetch_add_explicit(&inst->exchange_skips, 1, memory_order_relaxed);
         return;
     }
 #endif
@@ -911,7 +911,8 @@ static void cycle_start_single(ecat_master_instance_t *inst)
      * jitter in the hot path.  The monitor thread observes these counters
      * and emits the user-facing log messages. */
     if (wkc_error) {
-        int consec = atomic_fetch_add(&inst->consecutive_wkc_errors, 1) + 1;
+        int consec = atomic_fetch_add_explicit(&inst->consecutive_wkc_errors, 1,
+                                               memory_order_relaxed) + 1;
 #if ECAT_ENABLE_MONITOR_THREAD
         if (state == ECAT_STATE_OPERATIONAL &&
             consec >= ECAT_WKC_ERROR_THRESHOLD) {
