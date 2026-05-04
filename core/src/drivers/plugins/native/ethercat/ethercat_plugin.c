@@ -880,14 +880,16 @@ static void cycle_start_single(ecat_master_instance_t *inst)
 
     atomic_fetch_add_explicit(&inst->diag.cycle_count, 1, memory_order_relaxed);
 
-    /* EWMA: avg += (sample - avg) >> SHIFT.  Tracks recent-window jitter
+    /* EWMA: avg += (sample - avg) / 2^SHIFT.  Tracks recent-window jitter
      * instead of a historical mean (which the previous integer-Welford
-     * loop stalled at once cycle_count grew large).  Signed right shift
-     * is implementation-defined in C but is arithmetic on GCC/Clang,
-     * which the runtime already depends on. */
+     * loop stalled at once cycle_count grew large).  Division (not signed
+     * right shift) keeps the math portable -- the compiler emits the same
+     * sar sequence on supported targets without invoking the IDB on
+     * negative-operand right shift. */
     int64_t cur_avg = atomic_load_explicit(&inst->diag.avg_bus_cycle_ns,
                                            memory_order_relaxed);
-    cur_avg += ((int64_t)exchange_ns - cur_avg) >> ECAT_AVG_EWMA_SHIFT;
+    int64_t delta = (int64_t)exchange_ns - cur_avg;
+    cur_avg += delta / (1 << ECAT_AVG_EWMA_SHIFT);
     atomic_store_explicit(&inst->diag.avg_bus_cycle_ns, cur_avg,
                           memory_order_relaxed);
 
