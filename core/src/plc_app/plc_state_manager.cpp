@@ -588,6 +588,15 @@ extern "C" bool plc_set_state(PLCState new_state)
     plc_state = new_state;
     pthread_mutex_unlock(&state_mutex);
 
+    // Note: plc_state must flip BEFORE load/unload runs. Task threads
+    // exit their scan loops via `while (plc_get_state() == RUNNING)`,
+    // and unload_plc_program() depends on that signal to join them.
+    // The "STATUS reports STOPPED while teardown is still in flight"
+    // window this opens is gated externally via is_transitioning in
+    // unix_socket.c — STATUS returns STATUS:TRANSITIONING for the
+    // duration of the worker, so external pollers don't see the
+    // stale STOPPED.
+
     if (new_state == PLC_STATE_RUNNING)
     {
         if (plc_program == NULL)

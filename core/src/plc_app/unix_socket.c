@@ -97,6 +97,24 @@ static ssize_t read_line(int fd, char *buffer, size_t max_length)
 
 static void format_status_response(char *response, size_t response_size)
 {
+    // While a transition is in progress, plc_state has already flipped
+    // to the target value (so the running task threads can exit their
+    // `while (plc_get_state() == RUNNING)` loops) but the actual
+    // load/unload work is still happening on the transition worker
+    // thread. Reporting the bare state here would tell external
+    // pollers STATUS:STOPPED while the runtime can't yet accept a
+    // START — they'd race ahead and get COMMAND:BUSY.
+    //
+    // Surfacing TRANSITIONING for the duration of the worker keeps
+    // _wait_for_plc_state(STOPPED) on the webserver side honest:
+    // STATUS:STOPPED is reported only after the worker has completed
+    // and is_transitioning has cleared.
+    if (atomic_load(&is_transitioning))
+    {
+        strncpy(response, "STATUS:TRANSITIONING\n", response_size);
+        return;
+    }
+
     PLCState current_state = plc_get_state();
 
     if (current_state == PLC_STATE_INIT)
