@@ -202,6 +202,13 @@ class SynchronizationManager:
 
                 self._cycle_timestamp = datetime.now(timezone.utc)
                 await self.sync_opcua_to_runtime()
+                # Mid-cycle preemption point: a stop request between
+                # the two sync directions exits without doing the
+                # second pass — keeps shutdown latency bounded by one
+                # half-cycle instead of a full cycle for projects
+                # with many variables.
+                if not is_running():
+                    break
                 await self.sync_runtime_to_opcua()
                 await asyncio.sleep(cycle_time_seconds)
 

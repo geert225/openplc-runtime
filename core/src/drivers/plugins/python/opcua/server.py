@@ -311,12 +311,22 @@ class OpcuaServerManager:
         """
         Clean up resources.
 
-        Stops the server and releases resources.
+        Stops the server and releases resources. asyncua's server.stop()
+        can block while it waits for connected clients to disconnect
+        gracefully (a UAExpert client left running across an editor
+        Stop press is the classic case). Cap that with a short timeout
+        so the editor's Stop button feels responsive — any clients
+        that don't disconnect in 1.5s are dropped when the listening
+        sockets close.
         """
         try:
             if self.server and self.running:
-                await self.server.stop()
-                log_info("OPC-UA server stopped")
+                try:
+                    await asyncio.wait_for(self.server.stop(), timeout=1.5)
+                    log_info("OPC-UA server stopped")
+                except asyncio.TimeoutError:
+                    log_warn("OPC-UA server.stop() did not finish in 1.5s; "
+                             "proceeding with cleanup anyway")
 
             self.running = False
             self.server = None

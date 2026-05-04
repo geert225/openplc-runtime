@@ -203,10 +203,19 @@ def stop_loop() -> bool:
     Stop the OPC UA server.
 
     Uses a two-phase approach:
-    1. Graceful (10s): signal the stop event and wait for the async server to
-       shut down cleanly via its monitor task.
-    2. Forced (5s): if the thread is still alive, cancel all asyncio tasks on
+    1. Graceful (2s): signal the stop event and wait for the async server to
+       shut down cleanly via its monitor task. The sync loop preempts
+       between sync directions, so one cycle (~100 ms) is the typical
+       graceful exit budget; the 2 s window covers asyncua's internal
+       teardown of listening sockets / connected clients.
+    2. Forced (3s): if the thread is still alive, cancel all asyncio tasks on
        the event loop and wait again.
+
+    The previous timeout (10 s graceful + 5 s forced) made the editor's
+    Stop button feel broken — the runtime appeared frozen for ~10 s
+    while asyncua's server.stop() waited on connected clients to
+    disconnect. The forced path always succeeded eventually, so the
+    grace period was just dead time.
 
     Returns:
         True if the server thread stopped, False if it survived both phases.
@@ -216,19 +225,19 @@ def stop_loop() -> bool:
     log_info("Stopping OPC UA server...")
 
     try:
-        # Phase 1: Graceful stop -- signal and wait
+        # Phase 1: Graceful stop — signal and wait briefly.
         _stop_event.set()
 
         if _server_thread and _server_thread.is_alive():
-            _server_thread.join(timeout=10.0)
+            _server_thread.join(timeout=2.0)
 
         if _server_thread and _server_thread.is_alive():
-            # Phase 2: Force-cancel the asyncio event loop
-            log_warn("Graceful stop timed out, forcing event loop cancellation...")
+            # Phase 2: force-cancel the asyncio event loop.
+            log_warn("Graceful stop did not complete in 2s, forcing cancellation...")
             loop = _loop
             if loop is not None and loop.is_running():
                 loop.call_soon_threadsafe(_cancel_all_tasks, loop)
-            _server_thread.join(timeout=5.0)
+            _server_thread.join(timeout=3.0)
 
         if _server_thread and _server_thread.is_alive():
             log_error("OPC UA server thread did not stop after forced cancellation")
