@@ -409,10 +409,19 @@ typedef struct {
 /**
  * @brief EWMA shift for the avg_*_ns counters in ecat_cycle_diag_t.
  *
- * The moving average update is:  avg += (sample - avg) >> SHIFT
- * which is equivalent to an exponentially-weighted moving average with
- * weight 1 / 2^SHIFT.  SHIFT=5 gives an effective window of ~32 samples
- * (a few ms at 250us cycles, tens of ms at 1ms cycles).
+ * The moving average update is:  avg += (sample - avg) / (1 << SHIFT),
+ * an exponentially-weighted moving average with weight 1 / 2^SHIFT per
+ * sample.  Effective window is ~2^SHIFT samples.
+ *
+ * SHIFT=5 -> window of 32 samples:
+ *   - cycle 250 us -> 8 ms window  (smooths PDO-cycle jitter)
+ *   - cycle 500 us -> 16 ms window
+ *   - cycle 1 ms   -> 32 ms window (smooths transient bus events)
+ *
+ * Trade-off: smaller SHIFT is more responsive but noisier; larger SHIFT
+ * smooths more but lags behind real drift.  5 is the sweet spot for
+ * RT diagnostics where the operator wants "is the bus healthy now?",
+ * not "what was the historical mean?".
  *
  * This replaces the integer Welford running mean previously used, which
  * stalls under integer division once cycle_count grows past ~10^7.

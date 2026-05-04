@@ -384,7 +384,9 @@ static int attempt_recovery(ecat_master_instance_t *inst)
 
         pthread_mutex_lock(&inst->soem_lock);
         uint16_t state = ecat_master_get_slave_state(inst, pos);
-        int result = 1;
+        /* 0 = no recovery needed (slave already in OP); only set to a
+         * negative value if ecat_master_recover_slave reports an error. */
+        int result = 0;
         if (state != EC_STATE_OPERATIONAL) {
             all_ok = 0;
             result = ecat_master_recover_slave(inst, pos, &g_logger);

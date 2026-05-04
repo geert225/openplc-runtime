@@ -456,7 +456,8 @@ static int parse_sdo(const cJSON *sdo_json, ecat_sdo_config_t *sdo)
     unsigned long idx = strtoul(idx_str, &endptr, 0);
     if (endptr == idx_str || *endptr != '\0' || idx == 0 || idx > 0xFFFF) {
         plugin_logger_error(g_config_logger,
-            "SDO 'index' invalid: '%s' (must be hex 0x0001..0xFFFF)", idx_str);
+            "SDO 'index' invalid: '%s' (expected hex 0x0001..0xFFFF or decimal 1..65535)",
+            idx_str);
         return ECAT_CONFIG_ERR_INVALID;
     }
     snprintf(sdo->index, sizeof(sdo->index), "0x%04lX", idx);
