@@ -9,9 +9,13 @@
  *  1. At startup, ecat_io_build_channel_map() walks every configured channel,
  *     resolves its IOmap pointer via PDO walking, parses its IEC location,
  *     and stores a compact mapping entry.
- *  2. Each PLC scan cycle:
- *     - cycle_start  → ecat_io_read_inputs()  copies IOmap → PLC inputs
- *     - cycle_end    → ecat_io_write_outputs() copies PLC outputs → IOmap
+ *  2. Still at startup, ecat_io_build_transfer_list() pre-resolves each map
+ *     entry into a {plc_ptr, iomap_offset, byte_count} triple.
+ *  3. Each PLC scan cycle (hot path):
+ *     - cycle_start_single() calls ecat_io_write_outputs_fast() to push
+ *       PLC outputs into the IOmap, then ecat_io_read_inputs_fast() to
+ *       pull fresh inputs back. Both operate on the pre-resolved transfer
+ *       list — no PDO walking, no NULL checks.
  */
 
 #include "ethercat_io.h"
@@ -206,29 +210,6 @@ static int calculate_iomap_offset(const ec_slavet *soem_slave,
  */
 
 /**
- * @brief Return a human-readable name for an ecat_data_type_t value
- */
-static const char *ecat_data_type_name(ecat_data_type_t dt)
-{
-    switch (dt) {
-    case ECAT_DTYPE_UNKNOWN: return "UNKNOWN";
-    case ECAT_DTYPE_BOOL:    return "BOOL";
-    case ECAT_DTYPE_INT8:    return "INT8";
-    case ECAT_DTYPE_UINT8:   return "UINT8";
-    case ECAT_DTYPE_INT16:   return "INT16";
-    case ECAT_DTYPE_UINT16:  return "UINT16";
-    case ECAT_DTYPE_INT32:   return "INT32";
-    case ECAT_DTYPE_UINT32:  return "UINT32";
-    case ECAT_DTYPE_INT64:   return "INT64";
-    case ECAT_DTYPE_UINT64:  return "UINT64";
-    case ECAT_DTYPE_REAL32:  return "REAL32";
-    case ECAT_DTYPE_REAL64:  return "REAL64";
-    case ECAT_DTYPE_PAD:     return "PAD";
-    }
-    return "UNKNOWN";
-}
-
-/**
  * @brief Return the expected IEC size qualifier for a given data type
  *
  * Used to validate that the IEC location width matches the PDO data type.
@@ -357,7 +338,7 @@ int ecat_io_build_channel_map(const ecat_config_t *config,
                     "Slave '%s' channel '%s': data type %s expects IEC size %s "
                     "but location '%s' uses %s -- data may be truncated or corrupt",
                     cfg_slave->name, ch->name,
-                    ecat_data_type_name(pdo_data_type),
+                    ecat_data_type_to_string(pdo_data_type),
                     iec_size_name((iec_size_t)expected_size),
                     ch->iec_location, iec_size_name(iec_loc.size));
             }
@@ -396,7 +377,7 @@ int ecat_io_build_channel_map(const ecat_config_t *config,
             plugin_logger_debug(logger,
                 "  Mapped: slave '%s' ch '%s' [%s] (%s) -> %s byte=%d bit=%d offset=%zu",
                 cfg_slave->name, ch->name,
-                ecat_data_type_name(pdo_data_type), ch->iec_location,
+                ecat_data_type_to_string(pdo_data_type), ch->iec_location,
                 (iec_loc.direction == IEC_DIR_INPUT) ? "INPUT" : "OUTPUT",
                 iec_loc.byte_index, iec_loc.bit_index, iomap_offset);
 
@@ -409,7 +390,7 @@ int ecat_io_build_channel_map(const ecat_config_t *config,
                     "Declare the PLC variable as %s so the IEEE 754 bit "
                     "pattern is interpreted correctly",
                     cfg_slave->name, ch->name,
-                    ecat_data_type_name(pdo_data_type), ch->iec_location,
+                    ecat_data_type_to_string(pdo_data_type), ch->iec_location,
                     iec_type);
             }
         }
@@ -419,113 +400,17 @@ int ecat_io_build_channel_map(const ecat_config_t *config,
         "Channel map built: %d inputs, %d outputs (%d errors)",
         map->input_count, map->output_count, errors);
 
-    return (mapped > 0) ? 0 : -1;
-}
-
-/*
- * =============================================================================
- * Per-Cycle I/O Functions
- * =============================================================================
- */
-
-/**
- * @note Thread safety: buffer_mutex must be held by the caller.
- * This is guaranteed by plc_cycle_thread() in plc_state_manager.c
- * which holds buffer_mutex across the entire scan cycle.
- */
-void ecat_io_read_inputs(const ecat_channel_map_t *map,
-                         const uint8_t *iomap_base,
-                         plugin_runtime_args_t *args)
-{
-    for (int i = 0; i < map->input_count; i++) {
-        const ecat_channel_map_entry_t *e = &map->inputs[i];
-        const uint8_t *ptr = iomap_base + e->iomap_offset;
-
-        switch (e->size) {
-        case IEC_SIZE_BIT:
-            if (args->bool_input &&
-                args->bool_input[e->byte_index] &&
-                args->bool_input[e->byte_index][e->bit_index]) {
-                *args->bool_input[e->byte_index][e->bit_index] =
-                    iomap_read_bit(ptr, e->iomap_bit_offset);
-            }
-            break;
-
-        case IEC_SIZE_BYTE:
-            if (args->byte_input && args->byte_input[e->byte_index]) {
-                *args->byte_input[e->byte_index] = *ptr;
-            }
-            break;
-
-        case IEC_SIZE_WORD:
-            if (args->int_input && args->int_input[e->byte_index]) {
-                memcpy(args->int_input[e->byte_index], ptr, 2);
-            }
-            break;
-
-        case IEC_SIZE_DWORD:
-            if (args->dint_input && args->dint_input[e->byte_index]) {
-                memcpy(args->dint_input[e->byte_index], ptr, 4);
-            }
-            break;
-
-        case IEC_SIZE_LWORD:
-            if (args->lint_input && args->lint_input[e->byte_index]) {
-                memcpy(args->lint_input[e->byte_index], ptr, 8);
-            }
-            break;
-        }
+    /* Reject partial maps: a typo or ESI mismatch that drops half the
+     * channels would leave the PLC running with stale variables and no
+     * indication of why.  Fail-fast forces the operator to fix the JSON. */
+    if (errors > 0) {
+        plugin_logger_error(logger,
+            "channel map rejected: %d entry/entries failed to map", errors);
+        return -1;
     }
-}
-
-/**
- * @note Thread safety: buffer_mutex must be held by the caller.
- * This is guaranteed by plc_cycle_thread() in plc_state_manager.c
- * which holds buffer_mutex across the entire scan cycle.
- */
-void ecat_io_write_outputs(const ecat_channel_map_t *map,
-                           uint8_t *iomap_base,
-                           plugin_runtime_args_t *args)
-{
-    for (int i = 0; i < map->output_count; i++) {
-        const ecat_channel_map_entry_t *e = &map->outputs[i];
-        uint8_t *ptr = iomap_base + e->iomap_offset;
-
-        switch (e->size) {
-        case IEC_SIZE_BIT:
-            if (args->bool_output &&
-                args->bool_output[e->byte_index] &&
-                args->bool_output[e->byte_index][e->bit_index]) {
-                iomap_write_bit(ptr, e->iomap_bit_offset,
-                                *args->bool_output[e->byte_index][e->bit_index]);
-            }
-            break;
-
-        case IEC_SIZE_BYTE:
-            if (args->byte_output && args->byte_output[e->byte_index]) {
-                *ptr = *args->byte_output[e->byte_index];
-            }
-            break;
-
-        case IEC_SIZE_WORD:
-            if (args->int_output && args->int_output[e->byte_index]) {
-                memcpy(ptr, args->int_output[e->byte_index], 2);
-            }
-            break;
-
-        case IEC_SIZE_DWORD:
-            if (args->dint_output && args->dint_output[e->byte_index]) {
-                memcpy(ptr, args->dint_output[e->byte_index], 4);
-            }
-            break;
-
-        case IEC_SIZE_LWORD:
-            if (args->lint_output && args->lint_output[e->byte_index]) {
-                memcpy(ptr, args->lint_output[e->byte_index], 8);
-            }
-            break;
-        }
-    }
+    if (mapped == 0)
+        return -1;
+    return 0;
 }
 
 /*
@@ -656,7 +541,18 @@ int ecat_io_build_transfer_list(const ecat_channel_map_t *map,
         "Transfer list built: %d inputs, %d outputs (%d resolved)",
         xfer->input_count, xfer->output_count, resolved);
 
-    return resolved > 0 ? resolved : -1;
+    /* Channels without a PLC variable bound (NULL plc_ptr) are skipped --
+     * legitimate when not every IEC location is mapped to a program
+     * variable.  Surface as warn so the operator can spot mistakes. */
+    int total = map->input_count + map->output_count;
+    if (resolved < total) {
+        plugin_logger_warn(logger,
+            "transfer list: %d/%d channels resolved -- %d skipped (no PLC variable bound)",
+            resolved, total, total - resolved);
+    }
+    if (resolved == 0)
+        return -1;
+    return 0;
 }
 
 void ecat_io_read_inputs_fast(const ecat_transfer_list_t *xfer,
