@@ -28,6 +28,17 @@
 #define ECAT_BUSY_POLL_US 50
 #endif
 
+/* SDO encoding (encode_sdo_value below) memcpys host bytes directly into
+ * the EtherCAT wire buffer, which the spec defines as little-endian.
+ * Supported targets (linux/amd64, linux/arm64, linux/arm/v7) are all LE.
+ * If a future port targets a big-endian host, this build fails here --
+ * fix by inserting htole32/htole64 calls in encode_sdo_value before the
+ * memcpy, rather than letting SDO writes silently corrupt slave configs. */
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__)
+_Static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
+               "EtherCAT SDO encoding requires a little-endian host");
+#endif
+
 /*
  * =============================================================================
  * SOEM Context and IO Map
@@ -265,9 +276,8 @@ int ecat_master_open_and_scan(ecat_master_instance_t *inst, plugin_logger_t *log
  * Three paths cover all 11 supported types: REAL32, REAL64, and integer.
  * Integer types share a common int64_t cast and a memcpy of the LSBs --
  * parse_sdo's range check guarantees the cast is in-range, so no UB on
- * the truncation.  Assumes host little-endian (true on x86_64 and ARM
- * Linux little-endian, the only supported targets); a future big-endian
- * port would need byteswap here.
+ * the truncation.  Host little-endian is enforced at file scope by the
+ * _Static_assert above; a future big-endian port fails the build there.
  *
  * @param dt     Target wire type (must be a valid known type)
  * @param in     Source value (already range-validated by the parser)
