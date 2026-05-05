@@ -9,10 +9,6 @@
  * the system to its original state.
  *
  * Persistence file:  /run/runtime/ecat_iface_<iface>.state
- *
- * Migration: legacy NIC state file (ecat_nic_saved_<iface>.conf) from
- * the pre-consolidation version of this module is detected on apply,
- * reverted, and removed before the current flow runs.
  */
 
 #ifndef ETHERCAT_IFACE_STATE_H

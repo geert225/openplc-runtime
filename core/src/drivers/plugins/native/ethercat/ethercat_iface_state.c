@@ -36,11 +36,6 @@
 #define ECAT_IFACE_STATE_DIR  "/run/runtime"
 #define ECAT_IFACE_STATE_FMT  ECAT_IFACE_STATE_DIR "/ecat_iface_%s.state"
 
-/* Legacy NIC-tuning state file from the pre-consolidation version of
- * this module. Detected on apply, reverted, and removed before the
- * current flow runs. */
-#define ECAT_LEGACY_NIC_FMT   ECAT_IFACE_STATE_DIR "/ecat_nic_saved_%s.conf"
-
 /* ------------------------------------------------------------------ */
 /*  ethtool output parsing                                             */
 /* ------------------------------------------------------------------ */
@@ -308,64 +303,6 @@ static bool load_state(const char *iface, ecat_iface_state_t *s)
 }
 
 /* ------------------------------------------------------------------ */
-/*  Legacy file migration                                              */
-/* ------------------------------------------------------------------ */
-
-/*
- * If a NIC settings file from the pre-consolidation version exists,
- * parse it, restore the NIC, and remove the file.
- */
-static void migrate_legacy_nic(const char *iface, plugin_logger_t *logger)
-{
-    char path[160];
-    snprintf(path, sizeof(path), ECAT_LEGACY_NIC_FMT, iface);
-    FILE *fp = fopen(path, "r");
-    if (!fp)
-        return;
-
-    plugin_logger_warn(logger,
-        "Found legacy NIC state file %s - reverting and migrating", path);
-
-    ecat_iface_state_t legacy;
-    memset(&legacy, 0, sizeof(legacy));
-    strncpy(legacy.iface, iface, sizeof(legacy.iface) - 1);
-    legacy.iface[sizeof(legacy.iface) - 1] = '\0';
-
-    char line[128];
-    while (fgets(line, sizeof(line), fp)) {
-        size_t len = strlen(line);
-        if (len > 0 && line[len - 1] == '\n')
-            line[len - 1] = '\0';
-        char *eq = strchr(line, '=');
-        if (!eq)
-            continue;
-        *eq = '\0';
-        const char *key = line;
-        const char *val = eq + 1;
-        if (strcmp(key, "rx_usecs") == 0) {
-            legacy.rx_usecs = atoi(val);
-            legacy.coalescing_saved = true;
-        } else if (strcmp(key, "tx_usecs") == 0) {
-            legacy.tx_usecs = atoi(val);
-            legacy.coalescing_saved = true;
-        } else if (strcmp(key, "gro") == 0) {
-            legacy.gro = (strcmp(val, "on") == 0);
-            legacy.offloads_saved = true;
-        } else if (strcmp(key, "gso") == 0) {
-            legacy.gso = (strcmp(val, "on") == 0);
-            legacy.offloads_saved = true;
-        } else if (strcmp(key, "tso") == 0) {
-            legacy.tso = (strcmp(val, "on") == 0);
-            legacy.offloads_saved = true;
-        }
-    }
-    fclose(fp);
-
-    restore_nic_settings(&legacy, logger);
-    unlink(path);
-}
-
-/* ------------------------------------------------------------------ */
 /*  Crash recovery from the unified state file                         */
 /* ------------------------------------------------------------------ */
 
@@ -409,9 +346,6 @@ void ecat_iface_state_apply(ecat_iface_state_t *state, const char *iface,
 
     strncpy(state->iface, iface, sizeof(state->iface) - 1);
     state->iface[sizeof(state->iface) - 1] = '\0';
-
-    /* Migrate any leftover state from prior versions (best-effort) */
-    migrate_legacy_nic(iface, logger);
 
     /* Recover from a crash of the current-format file */
     recover_from_crash(iface, logger);
