@@ -86,32 +86,6 @@ typedef uint8_t  (*plugin_debug_write_func_t)(uint8_t arr, uint16_t elem,
                                               const uint8_t *bytes, uint16_t len);
 
 /**
- * @brief Scan-cycle tracker registration thunks
- *
- * Plugins that drive their own periodic threads (e.g. the EtherCAT
- * bus thread) report their cycle timing through a `scan_cycle_tracker_t`
- * registered with the runtime. The runtime walks all registered
- * trackers when formatting the STATS response, so the plugin's bus
- * timing surfaces in the editor alongside the IEC task entries.
- *
- * Plugins call `tracker_init` once per tracker, register it under a
- * stable name, drive `tracker_start` / `tracker_end` around their
- * work, and unregister + cleanup on shutdown.
- *
- * The tracker type itself is opaque to plugins — they receive an
- * opaque pointer and call back through these thunks. Concrete layout
- * lives in scan_cycle_manager.h on the runtime side. Plugins
- * allocate storage via `tracker_size` and `tracker_init`.
- */
-typedef size_t (*plugin_tracker_size_func_t)(void);
-typedef int    (*plugin_tracker_init_func_t)(void *tracker, int64_t interval_ns);
-typedef void   (*plugin_tracker_cleanup_func_t)(void *tracker);
-typedef void   (*plugin_tracker_start_func_t)(void *tracker);
-typedef void   (*plugin_tracker_end_func_t)(void *tracker);
-typedef int    (*plugin_tracker_register_func_t)(const char *name, void *tracker);
-typedef void   (*plugin_tracker_unregister_func_t)(void *tracker);
-
-/**
  * @brief Runtime buffer access structure for plugins
  *
  * This structure is passed to plugins during initialization, providing
@@ -184,16 +158,6 @@ typedef struct
      * Populated when the runtime initializes the plugin; may be 0 if
      * symbols are not yet resolved (plugin must guard against zero). */
     unsigned long long base_tick_ns;
-
-    /* Scan-cycle tracker thunks. NULL on older runtimes that don't
-     * support per-thread stats — plugins should null-check before use. */
-    plugin_tracker_size_func_t       tracker_size;
-    plugin_tracker_init_func_t       tracker_init;
-    plugin_tracker_cleanup_func_t    tracker_cleanup;
-    plugin_tracker_start_func_t      tracker_start;
-    plugin_tracker_end_func_t        tracker_end;
-    plugin_tracker_register_func_t   tracker_register;
-    plugin_tracker_unregister_func_t tracker_unregister;
 } plugin_runtime_args_t;
 
 #endif /* PLUGIN_TYPES_H */

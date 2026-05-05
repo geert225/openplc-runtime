@@ -113,64 +113,6 @@ bool scan_cycle_tracker_snapshot(scan_cycle_tracker_t *tracker, plc_timing_stats
 extern PlcTaskCtx *plc_tasks;
 extern size_t      plc_task_count;
 
-/* Plugin-owned tracker registry. Native plugins that drive their own
- * periodic threads (EtherCAT bus thread, future motion control, etc.)
- * register here so their cycle timing surfaces in STATS without each
- * plugin growing its own protocol path. Small fixed cap keeps it
- * lock-free for the snapshot walk; protected by a coarse mutex on
- * (un)registration. */
-#define MAX_PLUGIN_TRACKERS 16
-typedef struct
-{
-    const char           *name;
-    scan_cycle_tracker_t *tracker;
-} plugin_tracker_entry_t;
-
-static plugin_tracker_entry_t plugin_trackers[MAX_PLUGIN_TRACKERS];
-static size_t                 plugin_tracker_count = 0;
-static pthread_mutex_t        plugin_tracker_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-int scan_cycle_tracker_register(const char *name, scan_cycle_tracker_t *tracker)
-{
-    if (!name || !tracker) return -1;
-    pthread_mutex_lock(&plugin_tracker_mutex);
-    if (plugin_tracker_count >= MAX_PLUGIN_TRACKERS)
-    {
-        pthread_mutex_unlock(&plugin_tracker_mutex);
-        return -1;
-    }
-    for (size_t i = 0; i < plugin_tracker_count; ++i)
-    {
-        if (strcmp(plugin_trackers[i].name, name) == 0)
-        {
-            pthread_mutex_unlock(&plugin_tracker_mutex);
-            return -1;
-        }
-    }
-    plugin_trackers[plugin_tracker_count].name    = name;
-    plugin_trackers[plugin_tracker_count].tracker = tracker;
-    plugin_tracker_count++;
-    pthread_mutex_unlock(&plugin_tracker_mutex);
-    return 0;
-}
-
-void scan_cycle_tracker_unregister(scan_cycle_tracker_t *tracker)
-{
-    if (!tracker) return;
-    pthread_mutex_lock(&plugin_tracker_mutex);
-    for (size_t i = 0; i < plugin_tracker_count; ++i)
-    {
-        if (plugin_trackers[i].tracker == tracker)
-        {
-            // Swap-remove
-            plugin_trackers[i] = plugin_trackers[plugin_tracker_count - 1];
-            plugin_tracker_count--;
-            break;
-        }
-    }
-    pthread_mutex_unlock(&plugin_tracker_mutex);
-}
-
 static int append_task_entry(char *buffer, size_t buffer_size, size_t offset,
                              const char *name, const plc_timing_stats_t *s,
                              bool valid)
@@ -229,50 +171,21 @@ int format_timing_stats_response(char *buffer, size_t buffer_size)
     if (n < 0) return 0;
     offset += (size_t)n;
 
-    bool first = true;
     for (size_t i = 0; i < plc_task_count; ++i)
     {
-        if (!first)
+        if (i > 0)
         {
-            if (offset >= buffer_size) goto done;
+            if (offset >= buffer_size) break;
             buffer[offset++] = ',';
         }
-        first = false;
         plc_timing_stats_t snap;
         bool valid = scan_cycle_tracker_snapshot(&plc_tasks[i].tracker, &snap);
         n = append_task_entry(buffer, buffer_size, offset, plc_tasks[i].name, &snap, valid);
-        if (n <= 0) goto done;
+        if (n <= 0) break;
         offset += (size_t)n;
-        if (offset >= buffer_size) goto done;
+        if (offset >= buffer_size) break;
     }
 
-    /* Append plugin-registered trackers after the IEC tasks. Snapshot
-     * the registry list under the mutex (cheap, contention-free) so we
-     * don't need to hold it across the snprintf calls. */
-    plugin_tracker_entry_t local[MAX_PLUGIN_TRACKERS];
-    size_t                 local_count;
-    pthread_mutex_lock(&plugin_tracker_mutex);
-    local_count = plugin_tracker_count;
-    memcpy(local, plugin_trackers, local_count * sizeof(local[0]));
-    pthread_mutex_unlock(&plugin_tracker_mutex);
-
-    for (size_t i = 0; i < local_count; ++i)
-    {
-        if (!first)
-        {
-            if (offset >= buffer_size) goto done;
-            buffer[offset++] = ',';
-        }
-        first = false;
-        plc_timing_stats_t snap;
-        bool valid = scan_cycle_tracker_snapshot(local[i].tracker, &snap);
-        n = append_task_entry(buffer, buffer_size, offset, local[i].name, &snap, valid);
-        if (n <= 0) goto done;
-        offset += (size_t)n;
-        if (offset >= buffer_size) goto done;
-    }
-
-done:
     n = snprintf(buffer + offset, buffer_size - offset, "]}\n");
     if (n > 0) offset += (size_t)n;
     return (int)offset;

@@ -566,20 +566,11 @@ typedef struct {
 
     /* Dedicated bus thread. Periodic at master.cycle_time_us, SCHED_FIFO
      * at the configured taskPriority. Drives the synchronous SOEM
-     * exchange independently of the IEC scan threads. The IEC tasks
-     * never invoke this plugin's cycle_start hook anymore. */
+     * exchange independently of the IEC scan threads. Bus cycle stats
+     * live on `inst->diag` and reach the editor via the existing
+     * /api/discovery/ethercat/{runtime-status,diagnostics} routes. */
     pthread_t              bus_thread;
     _Atomic(bool)          bus_running;
-    /* Per-bus scan/cycle/latency tracker. Storage is sized via the
-     * runtime's `tracker_size` thunk and accessed only through the
-     * `tracker_*` thunks on `plugin_runtime_args_t` — the concrete
-     * `scan_cycle_tracker_t` layout is private to the runtime. We
-     * register it under name "ecat-<master>" so the STATS endpoint
-     * includes it alongside the IEC task entries. 256 bytes is a
-     * comfortable upper bound for the current struct (mutex + 32 B
-     * stats); checked at startup against `tracker_size()`. */
-    void                  *bus_tracker;
-    char                   tracker_name[ECAT_MAX_NAME_LEN + 8];
 
     /* Iface isolation: true means we applied this setting and must revert. */
     bool iface_iptables_added;

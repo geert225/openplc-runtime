@@ -807,31 +807,6 @@ static int start_single_master(ecat_master_instance_t *inst)
     }
 #endif
 
-    /* Allocate and register the per-master scan-cycle tracker so the bus
-     * cycle timing surfaces in STATS. Sized via the runtime thunk so the
-     * concrete struct layout stays opaque to the plugin. */
-    if (g_runtime_args.tracker_size && g_runtime_args.tracker_init) {
-        size_t tsize = g_runtime_args.tracker_size();
-        inst->bus_tracker = calloc(1, tsize);
-        if (inst->bus_tracker) {
-            int64_t interval_ns = (int64_t)inst->config.master.cycle_time_us * 1000LL;
-            if (interval_ns <= 0) interval_ns = 1000000LL;
-            if (g_runtime_args.tracker_init(inst->bus_tracker, interval_ns) != 0) {
-                plugin_logger_warn(&g_logger,
-                    "Master '%s': tracker_init failed — bus stats will be unavailable",
-                    inst->name);
-                free(inst->bus_tracker);
-                inst->bus_tracker = NULL;
-            } else {
-                snprintf(inst->tracker_name, sizeof inst->tracker_name,
-                         "ecat-%s", inst->name);
-                if (g_runtime_args.tracker_register) {
-                    g_runtime_args.tracker_register(inst->tracker_name, inst->bus_tracker);
-                }
-            }
-        }
-    }
-
     /* Silence the IP stack on the EtherCAT NIC. Reverted in stop_single_master. */
     apply_iface_isolation(inst, &g_logger);
 
@@ -885,18 +860,6 @@ static void stop_single_master(ecat_master_instance_t *inst)
         pthread_join(inst->bus_thread, NULL);
         plugin_logger_debug(&g_logger,
             "Master '%s': Bus thread joined", inst->name);
-    }
-
-    /* Unregister and free the cycle tracker. */
-    if (inst->bus_tracker) {
-        if (g_runtime_args.tracker_unregister) {
-            g_runtime_args.tracker_unregister(inst->bus_tracker);
-        }
-        if (g_runtime_args.tracker_cleanup) {
-            g_runtime_args.tracker_cleanup(inst->bus_tracker);
-        }
-        free(inst->bus_tracker);
-        inst->bus_tracker = NULL;
     }
 
 #if ECAT_ENABLE_MONITOR_THREAD
@@ -956,6 +919,13 @@ static void stop_single_master(ecat_master_instance_t *inst)
  *   3. lock buffer_mutex → copy IOmap inputs into PLC buffers → unlock
  *   4. Update WKC + diagnostics
  *
+ * Diag timing distinguishes two metrics:
+ *   - `exchange_ns`: just the SOEM round-trip (wire / NIC time)
+ *   - `total_ns`:    full work window — both mutex acquisitions, both
+ *                    memcpys, AND the exchange. The difference between
+ *                    the two surfaces buffer-mutex contention with the
+ *                    IEC tasks, which is the diagnostic users want.
+ *
  * The IOmap is owned by the plugin (this thread + monitor thread via
  * `request_soem_access`) so it never crosses the PLC mutex.
  *
@@ -982,6 +952,11 @@ static bool ecat_run_one_cycle(ecat_master_instance_t *inst)
     }
 #endif
 
+    /* Start of full-cycle timing. Includes both mutex windows and the
+     * exchange so `total_ns - exchange_ns` reports buffer-mutex contention. */
+    ec_timet t_start, t_exch_start, t_exch_end, t_end;
+    osal_get_monotonic_time(&t_start);
+
     /* 1. Lock briefly, snapshot outputs from PLC buffers into the IOmap.
      *    This is a pure memcpy — microseconds — so we don't hold the
      *    image-tables mutex across the SOEM exchange. */
@@ -995,12 +970,11 @@ static bool ecat_run_one_cycle(ecat_master_instance_t *inst)
 
     /* 2. Exchange process data with slaves (synchronous, NO mutex held).
      *    IEC scan tasks can read/write IO during this window. */
-    ec_timet t0, t1;
-    osal_get_monotonic_time(&t0);
+    osal_get_monotonic_time(&t_exch_start);
     int wkc = ecat_master_exchange_processdata(inst, inst->receive_timeout_us);
-    osal_get_monotonic_time(&t1);
+    osal_get_monotonic_time(&t_exch_end);
 
-    inst->diag.exchange_ns = elapsed_ns(&t0, &t1);
+    inst->diag.exchange_ns = elapsed_ns(&t_exch_start, &t_exch_end);
 
     /* 3. Lock again briefly, copy received inputs from IOmap into PLC
      *    buffers. */
@@ -1011,6 +985,8 @@ static bool ecat_run_one_cycle(ecat_master_instance_t *inst)
     if (g_runtime_args.mutex_give && g_runtime_args.buffer_mutex) {
         g_runtime_args.mutex_give(g_runtime_args.buffer_mutex);
     }
+
+    osal_get_monotonic_time(&t_end);
 
     inst->cycle_counter++;
 
@@ -1044,8 +1020,10 @@ static bool ecat_run_one_cycle(ecat_master_instance_t *inst)
         atomic_store(&inst->consecutive_wkc_errors, 0);
     }
 
-    /* 5. Update diagnostics (no SOEM calls, Welford's incremental average) */
-    inst->diag.total_ns = inst->diag.exchange_ns;
+    /* 5. Update diagnostics (no SOEM calls, Welford's incremental average).
+     *    `total_ns` includes both mutex windows + the exchange, so
+     *    `total_ns - exchange_ns` exposes IEC buffer-mutex contention. */
+    inst->diag.total_ns = elapsed_ns(&t_start, &t_end);
     inst->diag.cycle_count++;
 
     inst->diag.avg_total_ns += ((int64_t)inst->diag.total_ns - inst->diag.avg_total_ns)
@@ -1142,15 +1120,12 @@ static void *ecat_bus_thread(void *arg)
     clock_gettime(CLOCK_MONOTONIC, &next_wakeup);
 
     while (atomic_load(&inst->bus_running)) {
-        if (g_runtime_args.tracker_start && inst->bus_tracker) {
-            g_runtime_args.tracker_start(inst->bus_tracker);
-        }
-
+        /* All bus-cycle stats live on `inst->diag` and are published via
+         * `update_status_snapshot()` (refreshed by the monitor thread
+         * every ECAT_MONITOR_INTERVAL_MS), consumed by the editor
+         * through the existing `/api/discovery/ethercat/runtime-status`
+         * and `/diagnostics` routes. The bus thread just runs cycles. */
         ecat_run_one_cycle(inst);
-
-        if (g_runtime_args.tracker_end && inst->bus_tracker) {
-            g_runtime_args.tracker_end(inst->bus_tracker);
-        }
 
         next_wakeup.tv_nsec += (long)(interval_ns % 1000000000LL);
         next_wakeup.tv_sec  += (time_t)(interval_ns / 1000000000LL);
