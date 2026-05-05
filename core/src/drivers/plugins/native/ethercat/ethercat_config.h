@@ -383,9 +383,27 @@ typedef struct {
     ecat_slave_status_t slaves[ECAT_MAX_SLAVES];
     uint64_t            cycle_count;
     uint64_t            wkc_error_count;
+    /* Work-window timing (mutex+exchange+mutex). avg_cycle_us reports
+     * how long each cycle's work actually took; max_cycle_us is the
+     * worst observed work window. max_exchange_us isolates the SOEM
+     * round-trip from the surrounding mutex copies. */
     uint64_t            avg_cycle_us;
     uint64_t            max_cycle_us;
     uint64_t            max_exchange_us;
+    /* Scheduling timing — answers "are we actually hitting the
+     * configured cycle period?". avg/max/min_period_us is the
+     * observed period between cycle starts (should equal
+     * configured_cycle_us on a healthy RT system). avg/max/min_latency_us
+     * is the wake-up scheduling delay: how much later than its absolute
+     * deadline the bus thread actually started the cycle. Captured by
+     * the bus thread itself, so the numbers are independent of the
+     * monitor thread's snapshot cadence. */
+    uint64_t            avg_period_us;
+    uint64_t            max_period_us;
+    uint64_t            min_period_us;
+    int64_t             avg_latency_us;
+    int64_t             max_latency_us;
+    int64_t             min_latency_us;
     int                 consecutive_wkc_errors;
     int                 recovery_attempts;
     int                 expected_wkc;
@@ -418,6 +436,16 @@ typedef struct {
     int64_t  avg_exchange_ns;     /* incremental moving average (Welford) */
     uint64_t min_exchange_ns;     /* best-case send+receive             */
     uint64_t min_total_ns;        /* best-case total                    */
+    /* Scheduling timing — answers "are we actually hitting the
+     * configured cycle period, and how late are we waking up?". */
+    uint64_t period_ns;           /* last observed cycle period (ns)    */
+    uint64_t min_period_ns;       /* best-case period                   */
+    uint64_t max_period_ns;       /* worst-case period                  */
+    int64_t  avg_period_ns;       /* incremental moving average         */
+    int64_t  latency_ns;          /* last wake-up scheduling delay (ns) */
+    int64_t  min_latency_ns;      /* best-case wake-up delay            */
+    int64_t  max_latency_ns;      /* worst-case wake-up delay           */
+    int64_t  avg_latency_ns;      /* incremental moving average         */
 } ecat_cycle_diag_t;
 
 /*

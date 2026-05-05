@@ -465,12 +465,26 @@ static void update_status_snapshot(ecat_master_instance_t *inst)
     snap.exchange_skips = atomic_load(&inst->exchange_skips);
 #endif
 
-    /* Cycle metrics */
+    /* Work-window metrics */
     snap.cycle_count = inst->diag.cycle_count;
     snap.wkc_error_count = inst->diag.wkc_error_count;
     snap.max_cycle_us = inst->diag.max_total_ns / 1000;
     snap.max_exchange_us = inst->diag.max_exchange_ns / 1000;
     snap.avg_cycle_us = inst->diag.avg_total_ns / 1000;
+
+    /* Scheduling metrics — period (actual time between cycle starts) and
+     * latency (wake-up delay vs deadline). Microsecond precision matches
+     * the existing work-window fields. */
+    snap.avg_period_us  = (uint64_t)(inst->diag.avg_period_ns / 1000);
+    snap.max_period_us  = inst->diag.max_period_ns / 1000;
+    snap.min_period_us  =
+        (inst->diag.min_period_ns == UINT64_MAX) ? 0
+                                                 : inst->diag.min_period_ns / 1000;
+    snap.avg_latency_us = inst->diag.avg_latency_ns / 1000;
+    snap.max_latency_us = inst->diag.max_latency_ns / 1000;
+    snap.min_latency_us =
+        (inst->diag.min_latency_ns == INT64_MAX) ? 0
+                                                 : inst->diag.min_latency_ns / 1000;
 
     /* Per-slave status */
     for (int i = 0; i < inst->config.slave_count && i < ECAT_MAX_SLAVES; i++) {
@@ -1073,14 +1087,28 @@ static void ecat_bus_sigusr1_noop(int sig)
     (void)sig;
 }
 
+static inline uint64_t ts_to_ns(const struct timespec *ts)
+{
+    return (uint64_t)ts->tv_sec * 1000000000ULL + (uint64_t)ts->tv_nsec;
+}
+
 /**
  * @brief Bus thread body — periodic SOEM exchange driver
  *
  * Runs at SCHED_FIFO with the configured taskPriority. Sleeps absolutely
  * (CLOCK_MONOTONIC + TIMER_ABSTIME) to the next deadline so jitter stays
- * bounded. Each tick: tracker_start → ecat_run_one_cycle → tracker_end →
- * advance deadline. Tracker timing is reported via the runtime's STATS
- * endpoint under the registered "ecat-<master>" name.
+ * bounded. Each tick:
+ *   - clock_nanosleep TIMER_ABSTIME → wake at the absolute deadline
+ *   - capture wake-up timing: latency vs deadline, period vs prev wake
+ *   - run the cycle (mutex+exchange+mutex)
+ *   - advance the deadline
+ *
+ * Two scheduling metrics surface the answers to "are we hitting our
+ * configured cycle time, and how late are we waking up?":
+ *   - period_ns: actual_wake[N] - actual_wake[N-1]; should equal
+ *     interval_ns on average on a healthy RT system.
+ *   - latency_ns: actual_wake[N] - expected_wake[N]; how much later
+ *     than its deadline the bus thread actually started running.
  */
 static void *ecat_bus_thread(void *arg)
 {
@@ -1116,15 +1144,54 @@ static void *ecat_bus_thread(void *arg)
         (int64_t)inst->config.master.cycle_time_us * 1000LL;
     if (interval_ns <= 0) interval_ns = 1000000LL; /* 1 ms safety floor */
 
+    /* Initialise scheduling-stat seed values. */
+    inst->diag.min_period_ns  = UINT64_MAX;
+    inst->diag.min_latency_ns = INT64_MAX;
+
     struct timespec next_wakeup;
     clock_gettime(CLOCK_MONOTONIC, &next_wakeup);
 
+    bool     have_prev_wake = false;
+    uint64_t prev_wake_ns   = 0;
+
     while (atomic_load(&inst->bus_running)) {
-        /* All bus-cycle stats live on `inst->diag` and are published via
-         * `update_status_snapshot()` (refreshed by the monitor thread
-         * every ECAT_MONITOR_INTERVAL_MS), consumed by the editor
-         * through the existing `/api/discovery/ethercat/runtime-status`
-         * and `/diagnostics` routes. The bus thread just runs cycles. */
+        /* Capture actual wake-up time. The first iteration's deadline
+         * is "now" so latency should be ~0; meaningful from iteration 2. */
+        struct timespec actual_wake;
+        clock_gettime(CLOCK_MONOTONIC, &actual_wake);
+        uint64_t actual_wake_ns = ts_to_ns(&actual_wake);
+        uint64_t expected_ns    = ts_to_ns(&next_wakeup);
+
+        /* Latency = how much later than the deadline we woke up. Can
+         * theoretically be slightly negative if clock skew or coarse
+         * timer granularity puts us a fraction ahead. Welford-update
+         * after the first cycle (which has no meaningful prev period). */
+        int64_t latency_ns = (int64_t)(actual_wake_ns - expected_ns);
+        inst->diag.latency_ns = latency_ns;
+        if (latency_ns < inst->diag.min_latency_ns) inst->diag.min_latency_ns = latency_ns;
+        if (latency_ns > inst->diag.max_latency_ns) inst->diag.max_latency_ns = latency_ns;
+
+        if (have_prev_wake) {
+            uint64_t period_ns = actual_wake_ns - prev_wake_ns;
+            inst->diag.period_ns = period_ns;
+            if (period_ns < inst->diag.min_period_ns) inst->diag.min_period_ns = period_ns;
+            if (period_ns > inst->diag.max_period_ns) inst->diag.max_period_ns = period_ns;
+            /* Welford incremental average — uses cycle_count as the
+             * divisor, so we update *after* the cycle has incremented
+             * it (period is meaningful only when we've ticked once). */
+            uint64_t n = inst->diag.cycle_count + 1; /* this cycle */
+            inst->diag.avg_period_ns +=
+                ((int64_t)period_ns - inst->diag.avg_period_ns) / (int64_t)n;
+            inst->diag.avg_latency_ns +=
+                (latency_ns - inst->diag.avg_latency_ns) / (int64_t)n;
+        }
+        prev_wake_ns   = actual_wake_ns;
+        have_prev_wake = true;
+
+        /* All cycle work-window stats live on `inst->diag` (updated
+         * inside ecat_run_one_cycle) and reach the editor through the
+         * existing /api/discovery/ethercat/{runtime-status,diagnostics}
+         * routes after the monitor thread refreshes the snapshot. */
         ecat_run_one_cycle(inst);
 
         next_wakeup.tv_nsec += (long)(interval_ns % 1000000000LL);
@@ -1742,13 +1809,22 @@ static cJSON *build_master_status_json(ecat_master_instance_t *inst)
         cJSON_AddItemToArray(slaves, slave);
     }
 
-    /* Cycle metrics */
+    /* Cycle metrics — work-window (cycle/exchange) and scheduling
+     * (period/latency). See build_master_diagnostics_json for the
+     * definitions; both shapes carry the same keys so the editor can
+     * render them through a single code path. */
     cJSON *metrics = cJSON_CreateObject();
     cJSON_AddNumberToObject(metrics, "cycle_count", (double)snap.cycle_count);
     cJSON_AddNumberToObject(metrics, "wkc_error_count", (double)snap.wkc_error_count);
     cJSON_AddNumberToObject(metrics, "avg_cycle_us", (double)snap.avg_cycle_us);
     cJSON_AddNumberToObject(metrics, "max_cycle_us", (double)snap.max_cycle_us);
     cJSON_AddNumberToObject(metrics, "max_exchange_us", (double)snap.max_exchange_us);
+    cJSON_AddNumberToObject(metrics, "avg_period_us", (double)snap.avg_period_us);
+    cJSON_AddNumberToObject(metrics, "max_period_us", (double)snap.max_period_us);
+    cJSON_AddNumberToObject(metrics, "min_period_us", (double)snap.min_period_us);
+    cJSON_AddNumberToObject(metrics, "avg_latency_us", (double)snap.avg_latency_us);
+    cJSON_AddNumberToObject(metrics, "max_latency_us", (double)snap.max_latency_us);
+    cJSON_AddNumberToObject(metrics, "min_latency_us", (double)snap.min_latency_us);
     cJSON_AddNumberToObject(metrics, "consecutive_wkc_errors", snap.consecutive_wkc_errors);
     cJSON_AddNumberToObject(metrics, "recovery_attempts", snap.recovery_attempts);
     cJSON_AddNumberToObject(metrics, "exchange_skips", (double)snap.exchange_skips);
@@ -1816,13 +1892,32 @@ static cJSON *build_master_diagnostics_json(ecat_master_instance_t *inst)
         cJSON_AddItemToArray(slaves, slave);
     }
 
-    /* Extended timing metrics */
+    /* Timing metrics, two distinct categories:
+     *
+     *   work-window (avg/max_cycle_us, max_exchange_us): how much time
+     *     the bus thread spends actually working per cycle. Tells you
+     *     whether the configured cycle period is sufficient to fit the
+     *     SOEM round-trip plus the two mutex-protected memcpys.
+     *
+     *   scheduling (avg/max/min_period_us, avg/max/min_latency_us):
+     *     how well the bus thread is being scheduled. period_us is
+     *     the observed time between cycle starts (should equal
+     *     configured_cycle_us on average); latency_us is the
+     *     wake-up delay from clock_nanosleep's deadline. Spikes here
+     *     point at OS scheduling jitter, not bus or PLC issues.
+     */
     cJSON *timing = cJSON_CreateObject();
     cJSON_AddNumberToObject(timing, "cycle_count", (double)snap.cycle_count);
     cJSON_AddNumberToObject(timing, "wkc_error_count", (double)snap.wkc_error_count);
     cJSON_AddNumberToObject(timing, "avg_cycle_us", (double)snap.avg_cycle_us);
     cJSON_AddNumberToObject(timing, "max_cycle_us", (double)snap.max_cycle_us);
     cJSON_AddNumberToObject(timing, "max_exchange_us", (double)snap.max_exchange_us);
+    cJSON_AddNumberToObject(timing, "avg_period_us", (double)snap.avg_period_us);
+    cJSON_AddNumberToObject(timing, "max_period_us", (double)snap.max_period_us);
+    cJSON_AddNumberToObject(timing, "min_period_us", (double)snap.min_period_us);
+    cJSON_AddNumberToObject(timing, "avg_latency_us", (double)snap.avg_latency_us);
+    cJSON_AddNumberToObject(timing, "max_latency_us", (double)snap.max_latency_us);
+    cJSON_AddNumberToObject(timing, "min_latency_us", (double)snap.min_latency_us);
     cJSON_AddNumberToObject(timing, "configured_cycle_us",
                             inst->config.master.cycle_time_us);
     cJSON_AddNumberToObject(timing, "receive_timeout_us", inst->receive_timeout_us);
