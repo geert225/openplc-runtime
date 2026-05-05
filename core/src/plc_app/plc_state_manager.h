@@ -2,6 +2,7 @@
 #define PLC_STATE_MANAGER_H
 
 #include "plcapp_manager.h"
+#include "scan_cycle_manager.h"
 #include <pthread.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -61,6 +62,13 @@ typedef struct PlcTaskCtx
 
     plc_atomic_long_t     heartbeat;
     plc_atomic_u64_t      local_tick;
+
+    /* Per-task scan/cycle/latency tracker. Each task thread updates its
+     * own tracker around its scan body; the STATS handler walks all
+     * trackers to emit per-task entries. Replaces the old single global
+     * plc_timing_stats from scan_cycle_manager.c which only tracked the
+     * fastest task. */
+    scan_cycle_tracker_t  tracker;
 } PlcTaskCtx;
 
 extern PlcTaskCtx *plc_tasks;

@@ -46,7 +46,6 @@ struct timespec  timer_start;
 pthread_t        plc_thread;
 PluginManager   *plc_program = NULL;
 
-extern plc_timing_stats_t plc_timing_stats;
 extern std::atomic<long>  plc_heartbeat;
 extern plugin_driver_t   *plugin_driver;
 
@@ -159,11 +158,13 @@ static void *plc_task_thread(void *arg)
         ctx->holding_mutex = 1;
         pthread_mutex_lock(image_tables_mutex());
 
-        /* Fastest task drives the per-cycle housekeeping window. Other
-         * task threads skip the housekeeping and just run their bodies. */
+        /* Per-task scan timing. Every task thread tracks its own
+         * scan/cycle/latency stats around its body; the IO housekeeping
+         * window (plugin cycle hooks) is still anchored on the fastest
+         * task because plugins assume one cross-cycle handoff per scan. */
+        scan_cycle_tracker_start(&ctx->tracker);
         if (ctx->is_fastest_task)
         {
-            scan_cycle_time_start();
             plc_run_io_cycle_pre();
         }
 
@@ -175,8 +176,8 @@ static void *plc_task_thread(void *arg)
         if (ctx->is_fastest_task)
         {
             plc_run_io_cycle_post();
-            scan_cycle_time_end();
         }
+        scan_cycle_tracker_end(&ctx->tracker);
 
         pthread_mutex_unlock(image_tables_mutex());
         ctx->holding_mutex = 0;
@@ -208,10 +209,8 @@ void *plc_cycle_thread(void *arg)
     bootstrap_crash_sig     = 0;
     bootstrap_holding_mutex = 0;
 
-    if (scan_cycle_manager_init() != 0)
-    {
-        log_error("Failed to initialize scan cycle manager");
-    }
+    /* Per-task trackers are initialised below, once we know the task list
+     * and each task's interval. */
 
     lock_memory();
 
@@ -291,7 +290,6 @@ void *plc_cycle_thread(void *arg)
     pthread_mutex_unlock(&state_mutex);
     log_info("PLC State: RUNNING");
 
-    plc_timing_stats.scan_count = 0;
     clock_gettime(CLOCK_MONOTONIC, &timer_start);
 
     int crash_sig = sigsetjmp(bootstrap_crash_jmp, 1);
@@ -395,6 +393,10 @@ void *plc_cycle_thread(void *arg)
                 std::snprintf(ctx->name, sizeof ctx->name, "plc-task-%zu", flat_idx);
                 ctx->heartbeat.store(now_t, std::memory_order_relaxed);
                 ctx->local_tick.store(0,    std::memory_order_relaxed);
+                if (scan_cycle_tracker_init(&ctx->tracker, ctx->interval_ns) != 0)
+                {
+                    log_error("Failed to init scan-cycle tracker for task %s", ctx->name);
+                }
                 ++flat_idx;
             }
         }
@@ -458,6 +460,10 @@ void *plc_cycle_thread(void *arg)
     {
         pthread_join(plc_tasks[i].thread, nullptr);
     }
+    for (size_t i = 0; i < plc_task_count; ++i)
+    {
+        scan_cycle_tracker_cleanup(&plc_tasks[i].tracker);
+    }
     std::free(plc_tasks);
     plc_tasks      = nullptr;
     plc_task_count = 0;
@@ -465,7 +471,6 @@ void *plc_cycle_thread(void *arg)
     signal(SIGFPE,  SIG_DFL);
     signal(SIGSEGV, SIG_DFL);
 
-    scan_cycle_manager_cleanup();
     return NULL;
 }
 
