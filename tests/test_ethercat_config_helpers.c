@@ -36,8 +36,8 @@ void test_init_defaults_MasterFields_ShouldHaveExpectedDefaults(void)
     TEST_ASSERT_EQUAL_INT(2000, config.master.receive_timeout_us);
     TEST_ASSERT_EQUAL_INT(3, config.master.watchdog_timeout_cycles);
     TEST_ASSERT_EQUAL_STRING("info", config.master.log_level);
-    TEST_ASSERT_EQUAL_INT(0, config.master.task_name[0]);
-    TEST_ASSERT_EQUAL_INT(0, config.master.task_cycle_time_us);
+    TEST_ASSERT_EQUAL_INT(90, config.master.task_priority);
+    TEST_ASSERT_TRUE(config.master.safe_close);
 }
 
 void test_init_defaults_DiagnosticsFields_ShouldHaveExpectedDefaults(void)

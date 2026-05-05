@@ -138,6 +138,7 @@ set(PLUGIN_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/ethercat_master.c
     ${CMAKE_CURRENT_SOURCE_DIR}/ethercat_io.c
     ${CMAKE_CURRENT_SOURCE_DIR}/ethercat_proc.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/ethercat_iface_state.c
     ${OPENPLC_ROOT}/core/src/drivers/plugins/native/plugin_logger.c
 )
 

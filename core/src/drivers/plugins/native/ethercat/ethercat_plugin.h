@@ -21,10 +21,11 @@
  *   the PLC base tick.
  *
  *   A background monitor thread (enabled by ECAT_ENABLE_MONITOR_THREAD)
- *   handles slave state checking and recovery outside the scan cycle,
- *   using a cooperative flag protocol to avoid SOEM thread-safety issues.
- *   When the monitor needs SOEM access, the PLC thread skips one exchange
- *   cycle (stale I/O data) rather than blocking.
+ *   handles slave state checking and recovery outside the scan cycle.
+ *   PLC thread and monitor thread serialize SOEM access via a per-instance
+ *   pthread_mutex (soem_lock) initialized with PRIO_INHERIT.  The PLC
+ *   uses pthread_mutex_trylock and skips a cycle (stale I/O data, no
+ *   blocking) whenever the monitor is currently holding the lock.
  *
  * State machine: STOPPED -> IDLE -> SCANNING -> CONFIGURING ->
  *                TRANSITIONING -> OPERATIONAL <-> RECOVERING -> ERROR

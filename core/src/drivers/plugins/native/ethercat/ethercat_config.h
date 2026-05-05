@@ -15,6 +15,7 @@
 #include <stdatomic.h>
 #include <pthread.h>
 
+#include "plugin_logger.h"
 #include "soem/soem.h"
 
 /* Maximum sizes */
@@ -70,8 +71,7 @@ typedef struct {
     uint8_t          subindex;
     uint8_t          bit_length;
     char             name[ECAT_MAX_NAME_LEN];
-    char             data_type[12];    /* "BOOL", "INT16", "REAL", etc. */
-    ecat_data_type_t parsed_type;      /* enum resolved from data_type string */
+    ecat_data_type_t parsed_type;      /* resolved from data_type string in JSON */
 } ecat_pdo_entry_t;
 
 /**
@@ -97,8 +97,7 @@ typedef struct {
     char             index[12];        /* hex string e.g. "0x8000" */
     uint8_t          subindex;
     double           value;            /* stored as double; cast to target type at write time */
-    char             data_type[12];
-    ecat_data_type_t parsed_type;      /* enum resolved from data_type string */
+    ecat_data_type_t parsed_type;      /* resolved from data_type string in JSON */
     char             name[ECAT_MAX_NAME_LEN];
 } ecat_sdo_config_t;
 
@@ -205,6 +204,8 @@ typedef struct {
     ecat_timeouts_t       timeouts;
     ecat_watchdog_t       watchdog;
     ecat_dc_config_t      dc;
+    /* Abort master startup on any SDO write failure (default true). */
+    bool                  strict_sdo;
 } ecat_slave_t;
 
 /**
@@ -225,6 +226,8 @@ typedef struct {
      *  Defaults to 90 — above typical IEC task priorities so the bus
      *  exchange isn't starved by a long PLC scan. */
     int              task_priority;
+    /* Zero outputs and confirm INIT transition on stop_loop (default true). */
+    bool             safe_close;
 } ecat_master_config_t;
 
 /**
@@ -278,11 +281,42 @@ int ecat_config_parse(const char *config_path, ecat_config_t *config);
 int ecat_config_validate(const ecat_config_t *config);
 
 /**
+ * @brief Provide a logger for the config parser to use for diagnostic messages.
+ *
+ * Optional — when not set, the parser falls back to stderr.  Idempotent.
+ * The pointer must remain valid for the lifetime of any subsequent
+ * ecat_config_parse* call (typically the lifetime of the plugin).
+ */
+void ecat_config_set_logger(plugin_logger_t *logger);
+
+/**
+ * @brief Validation mode for interface names.
+ *
+ * Different callers need different rules: NIC tuning / iptables paths must
+ * receive Linux-only names safe for /proc and external binaries; the scan
+ * and test commands accept any name the underlying socket layer accepts,
+ * including Windows NPF device paths like "\Device\NPF_{GUID}".
+ */
+typedef enum {
+    ECAT_IFACE_LINUX_STRICT,   /* alfanum + '_' '-', starts alpha, len 1..15 */
+    ECAT_IFACE_ANY_PLATFORM    /* Linux + Windows NPF chars '\' '{' '}' '.' */
+} ecat_iface_validate_mode_t;
+
+/**
+ * @brief Validate an interface name against the requested mode.
+ *
+ * @param iface NUL-terminated interface name (may be NULL — returns false).
+ * @param mode  ECAT_IFACE_LINUX_STRICT or ECAT_IFACE_ANY_PLATFORM.
+ * @return true if @p iface is a valid identifier under @p mode, false otherwise.
+ */
+bool ecat_iface_validate(const char *iface, ecat_iface_validate_mode_t mode);
+
+/**
  * @brief Check whether an interface name is a safe Linux iface identifier.
  *
- * Accepts only alphanumeric characters plus '_' and '-', must start with an
- * alpha, length 1..IFNAMSIZ-1 (15). Used as a precondition before passing
- * the name to external binaries (ethtool, iptables) or kernel /proc paths.
+ * Thin wrapper kept for backward compatibility — equivalent to
+ * ecat_iface_validate(iface, ECAT_IFACE_LINUX_STRICT).  Prefer the
+ * explicit form in new code.
  *
  * @return true if safe, false otherwise.
  */
@@ -337,9 +371,6 @@ ecat_data_type_t ecat_parse_data_type(const char *str);
 /** Background monitor thread polling interval in milliseconds */
 #define ECAT_MONITOR_INTERVAL_MS    500
 
-/** Timeout in ms to wait for PLC thread to yield SOEM access */
-#define ECAT_SOEM_ACCESS_TIMEOUT_MS 200
-
 /**
  * @brief EtherCAT plugin state machine states
  *
@@ -371,45 +402,6 @@ typedef struct {
     uint32_t error_count;
 } ecat_slave_status_t;
 
-/**
- * @brief Master-level status snapshot for monitoring and diagnostics
- *
- * Updated periodically by the PLC scan cycle under g_status_mutex.
- * Read by execute_command handlers for the "status" and "diagnostics" commands.
- */
-typedef struct {
-    ecat_plugin_state_t plugin_state;
-    int                 slave_count;
-    ecat_slave_status_t slaves[ECAT_MAX_SLAVES];
-    uint64_t            cycle_count;
-    uint64_t            wkc_error_count;
-    /* Work-window timing (mutex+exchange+mutex). avg_cycle_us reports
-     * how long each cycle's work actually took; max_cycle_us is the
-     * worst observed work window. max_exchange_us isolates the SOEM
-     * round-trip from the surrounding mutex copies. */
-    uint64_t            avg_cycle_us;
-    uint64_t            max_cycle_us;
-    uint64_t            max_exchange_us;
-    /* Scheduling timing — answers "are we actually hitting the
-     * configured cycle period?". avg/max/min_period_us is the
-     * observed period between cycle starts (should equal
-     * configured_cycle_us on a healthy RT system). avg/max/min_latency_us
-     * is the wake-up scheduling delay: how much later than its absolute
-     * deadline the bus thread actually started the cycle. Captured by
-     * the bus thread itself, so the numbers are independent of the
-     * monitor thread's snapshot cadence. */
-    uint64_t            avg_period_us;
-    uint64_t            max_period_us;
-    uint64_t            min_period_us;
-    int64_t             avg_latency_us;
-    int64_t             max_latency_us;
-    int64_t             min_latency_us;
-    int                 consecutive_wkc_errors;
-    int                 recovery_attempts;
-    int                 expected_wkc;
-    uint64_t            exchange_skips;
-} ecat_master_status_t;
-
 /*
  * =============================================================================
  * Cycle Diagnostics
@@ -417,35 +409,103 @@ typedef struct {
  */
 
 /**
- * @brief Per-cycle timing diagnostics
+ * @brief EWMA shift for the avg_*_ns counters in ecat_cycle_diag_t.
  *
- * Updated by cycle_start() in the PLC thread.
- * Uses Welford's incremental algorithm for moving averages.
+ * The moving average update is:  avg += (sample - avg) / (1 << SHIFT),
+ * an exponentially-weighted moving average with weight 1 / 2^SHIFT per
+ * sample.  Effective window is ~2^SHIFT samples.
+ *
+ * SHIFT=5 -> window of 32 samples:
+ *   - cycle 250 us -> 8 ms window  (smooths PDO-cycle jitter)
+ *   - cycle 500 us -> 16 ms window
+ *   - cycle 1 ms   -> 32 ms window (smooths transient bus events)
+ *
+ * Trade-off: smaller SHIFT is more responsive but noisier; larger SHIFT
+ * smooths more but lags behind real drift.  5 is the sweet spot for
+ * RT diagnostics where the operator wants "is the bus healthy now?",
+ * not "what was the historical mean?".
+ *
+ * This replaces the integer Welford running mean previously used, which
+ * stalls under integer division once cycle_count grows past ~10^7.
+ */
+#define ECAT_AVG_EWMA_SHIFT 5
+
+/**
+ * @brief Per-interface external state captured by ecat_iface_state_apply().
+ *
+ * Combines NIC-tuning save/restore (ethtool coalescing + offloads) and
+ * IP-stack isolation (iptables INPUT DROP, IPv6 sysctl) into a single
+ * struct, embedded in each ecat_master_instance_t.  See
+ * ethercat_iface_state.h for the apply/revert API.
  */
 typedef struct {
-    uint64_t cycle_count;         /* total cycles executed              */
-    uint64_t wkc_error_count;     /* total WKC errors (wkc < expected)  */
-    uint64_t noframe_count;       /* total EC_NOFRAME (-1) errors       */
-    uint64_t exchange_ns;         /* last send+receive duration (ns)    */
-    uint64_t io_read_ns;          /* last read_inputs duration (ns)     */
-    uint64_t io_write_ns;         /* last write_outputs duration (ns)   */
-    uint64_t total_ns;            /* last full cycle total (ns)         */
-    uint64_t max_exchange_ns;     /* worst-case send+receive            */
-    uint64_t max_total_ns;        /* worst-case total                   */
-    int64_t  avg_total_ns;        /* incremental moving average (Welford) */
-    int64_t  avg_exchange_ns;     /* incremental moving average (Welford) */
-    uint64_t min_exchange_ns;     /* best-case send+receive             */
-    uint64_t min_total_ns;        /* best-case total                    */
-    /* Scheduling timing — answers "are we actually hitting the
-     * configured cycle period, and how late are we waking up?". */
-    uint64_t period_ns;           /* last observed cycle period (ns)    */
-    uint64_t min_period_ns;       /* best-case period                   */
-    uint64_t max_period_ns;       /* worst-case period                  */
-    int64_t  avg_period_ns;       /* incremental moving average         */
-    int64_t  latency_ns;          /* last wake-up scheduling delay (ns) */
-    int64_t  min_latency_ns;      /* best-case wake-up delay            */
-    int64_t  max_latency_ns;      /* worst-case wake-up delay           */
-    int64_t  avg_latency_ns;      /* incremental moving average         */
+    char iface[ECAT_IFNAME_MAX];
+
+    /* IP-stack isolation */
+    bool ipv6_disabled_by_us;
+    bool iptables_added;
+
+    /* NIC tuning -- ethtool -C (coalescing) */
+    bool coalescing_saved;
+    int  rx_usecs;
+    int  tx_usecs;
+
+    /* NIC tuning -- ethtool -K (offloads) */
+    bool offloads_saved;
+    bool gro;
+    bool gso;
+    bool tso;
+} ecat_iface_state_t;
+
+/**
+ * @brief Per-cycle timing diagnostics
+ *
+ * Updated lock-free by the dedicated bus thread.  Single-writer (bus
+ * thread), multi-reader (monitor thread, execute_command handlers).
+ * All fields are _Atomic so the writer never holds a mutex on the hot
+ * path; readers tolerate cross-field tearing because these are
+ * diagnostics, not values used in cross-field arithmetic.
+ *
+ * Two timing stories are tracked side by side:
+ *
+ *   - bus_cycle_ns / *_bus_cycle_ns  — work timing.  Measures the
+ *     EtherCAT bus exchange (ecx_send_processdata +
+ *     ecx_receive_processdata).  The IO memcpys around it are
+ *     intentionally not measured (dozens of ns, dwarfed by the
+ *     exchange).  Answers "how long does each cycle's work take?".
+ *
+ *   - period_ns / latency_ns        — scheduling timing.  period_ns
+ *     is the observed gap between cycle starts (should equal the
+ *     configured cycle on a healthy RT system).  latency_ns is the
+ *     wake-up scheduling delay: how late after its absolute deadline
+ *     the bus thread actually started.  Captured by the bus thread
+ *     itself, so independent of the monitor's snapshot cadence.
+ *     Answers "are we actually hitting our 1 ms cycle, and how late
+ *     are we waking up?".
+ *
+ * avg_*_ns fields are EWMAs (see ECAT_AVG_EWMA_SHIFT), not historical
+ * means.
+ */
+typedef struct {
+    _Atomic(uint64_t) cycle_count;       /* total cycles executed              */
+    _Atomic(uint64_t) wkc_error_count;   /* total WKC errors (wkc < expected)  */
+    _Atomic(uint64_t) noframe_count;     /* total EC_NOFRAME (-1) errors       */
+
+    /* Work timing -- bus exchange duration */
+    _Atomic(uint64_t) bus_cycle_ns;      /* last send+receive duration (ns)    */
+    _Atomic(uint64_t) max_bus_cycle_ns;  /* worst-case send+receive            */
+    _Atomic(uint64_t) min_bus_cycle_ns;  /* best-case send+receive             */
+    _Atomic(int64_t)  avg_bus_cycle_ns;  /* EWMA (see ECAT_AVG_EWMA_SHIFT)     */
+
+    /* Scheduling timing -- period and wake-up latency */
+    _Atomic(uint64_t) period_ns;         /* last observed cycle period (ns)    */
+    _Atomic(uint64_t) max_period_ns;     /* worst-case period                  */
+    _Atomic(uint64_t) min_period_ns;     /* best-case period                   */
+    _Atomic(int64_t)  avg_period_ns;     /* EWMA                               */
+    _Atomic(int64_t)  latency_ns;        /* last wake-up scheduling delay (ns) */
+    _Atomic(int64_t)  max_latency_ns;    /* worst-case wake-up delay           */
+    _Atomic(int64_t)  min_latency_ns;    /* best-case wake-up delay            */
+    _Atomic(int64_t)  avg_latency_ns;    /* EWMA                               */
 } ecat_cycle_diag_t;
 
 /*
@@ -577,32 +637,56 @@ typedef struct {
     ecat_cycle_diag_t diag;
     _Atomic(int) consecutive_wkc_errors;
     _Atomic(int) recovery_attempts;
+    /* Counts ecx_writestate calls during recovery that returned wkc<=0
+     * (request did not reach the slave -- link/cable issue, vs. slave
+     * reachable but rejecting the state).  Distinguishes physical from
+     * configuration recovery failures in the operator UI. */
+    _Atomic(uint32_t) recovery_writestate_failures;
     uint64_t cycle_counter;
 
-    /* Status snapshot for queries via execute_command */
-    ecat_master_status_t status_snapshot;
-    pthread_mutex_t status_mutex;
+    /* Per-slave snapshot for queries via execute_command.
+     *
+     * The slave AL state lives in ecx_context.slavelist[], which is mutated
+     * by the monitor thread during recovery.  Letting the JSON handlers read
+     * slavelist[] directly would force them to take soem_lock, which the PLC
+     * also tries to take on every cycle -- so each query would risk skipping
+     * a PLC cycle.
+     *
+     * Instead the monitor publishes a small snapshot of the slave fields it
+     * needs into slaves_snapshot[] under slaves_mutex (PRIO_INHERIT).  JSON
+     * handlers take that mutex briefly; the PLC never touches it. */
+    ecat_slave_status_t slaves_snapshot[ECAT_MAX_SLAVES];
+    int                 slaves_snapshot_count;
+    pthread_mutex_t     slaves_mutex;
 
 #if ECAT_ENABLE_MONITOR_THREAD
-    /* Monitor thread — per-instance for cooperative SOEM access */
+    /* Monitor thread — per-instance.
+     *
+     * soem_lock serializes SOEM access between the PLC thread (cycle_start)
+     * and the monitor thread (state checks, recovery).  The PLC thread uses
+     * pthread_mutex_trylock and skips the cycle if the monitor is holding
+     * the lock; the monitor takes the lock blockingly.  The lock is
+     * initialized with PRIO_INHERIT to avoid priority inversion.
+     */
     pthread_t monitor_thread;
     _Atomic(bool) monitor_running;
-    _Atomic(bool) soem_pause_requested;
-    _Atomic(bool) soem_paused;
+    pthread_mutex_t soem_lock;
     _Atomic(uint64_t) exchange_skips;
 #endif
 
     /* Dedicated bus thread. Periodic at master.cycle_time_us, SCHED_FIFO
-     * at the configured taskPriority. Drives the synchronous SOEM
+     * at the configured task_priority. Drives the synchronous SOEM
      * exchange independently of the IEC scan threads. Bus cycle stats
      * live on `inst->diag` and reach the editor via the existing
      * /api/discovery/ethercat/{runtime-status,diagnostics} routes. */
     pthread_t              bus_thread;
     _Atomic(bool)          bus_running;
 
-    /* Iface isolation: true means we applied this setting and must revert. */
-    bool iface_iptables_added;
-    bool iface_ipv6_disabled_by_us;
+    /* Per-iface external state (NIC tuning + IP-stack isolation).
+     * Populated by ecat_iface_state_apply(); consumed by
+     * ecat_iface_state_revert().  Includes its own iface name copy so
+     * revert can run after config has been freed. */
+    ecat_iface_state_t iface_state;
 } ecat_master_instance_t;
 
 /**
@@ -640,5 +724,16 @@ const char *ecat_state_to_string(ecat_plugin_state_t state);
  * @return Size in bytes (0 for UNKNOWN/PAD, 1 for BOOL)
  */
 int ecat_data_type_size(ecat_data_type_t dt);
+
+/**
+ * @brief Convert a data type enum to a human-readable name (e.g. "INT16").
+ *
+ * Symmetric with ecat_state_to_string.  Used in log messages so the
+ * structs no longer need to carry the original JSON string.
+ *
+ * @param dt Data type enum value
+ * @return Static string ("UNKNOWN" for invalid or unrecognized values)
+ */
+const char *ecat_data_type_to_string(ecat_data_type_t dt);
 
 #endif /* ETHERCAT_CONFIG_H */

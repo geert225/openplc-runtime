@@ -12,6 +12,7 @@
 
 #include "ethercat_master.h"
 #include "ethercat_proc.h"
+#include "ethercat_iface_state.h"
 #include "soem/soem.h"
 
 #include <ctype.h>
@@ -19,498 +20,24 @@
 #include <string.h>
 #include <stdio.h>
 
-/* Low-latency NIC tuning and socket options (Linux only) */
+/* Low-latency socket option for the SOEM raw socket (Linux only).  All
+ * NIC tuning (ethtool coalescing/offloads) and IP-stack isolation
+ * (iptables, IPv6 sysctl) lives in ethercat_iface_state.{c,h}. */
 #if !defined(__CYGWIN__) && !defined(_WIN32)
 #include <sys/socket.h>
 #define ECAT_BUSY_POLL_US 50
+#endif
 
-/*
- * =============================================================================
- * NIC Settings Save / Restore (with crash-recovery persistence)
- * =============================================================================
- *
- * Before applying low-latency ethtool tuning we capture the original NIC
- * settings and persist them to a file on disk.  On a normal shutdown the
- * settings are restored and the file is removed.  If the process is killed
- * (SIGKILL, OOM, crash), the file survives and the next startup detects it,
- * restoring the NIC before applying fresh tuning.
- *
- * Persistence file: /run/runtime/ecat_nic_saved.conf  (inside tmpfs, so
- * a full system reboot clears it -- at which point the kernel already
- * reloads driver defaults).
- *
- * File format (simple key=value, one per line):
- *   iface=eth0
- *   rx_usecs=100
- *   tx_usecs=50
- *   gro=on
- *   gso=on
- *   tso=on
- */
-
-#include <sys/stat.h>
-#include <unistd.h>
-#include <errno.h>
-
-/** Maximum interface name length (IFNAMSIZ) */
-#define NIC_IFNAME_MAX 16
-
-/** Directory and file used to persist original NIC settings across crashes */
-#define NIC_SAVE_DIR  "/run/runtime"
-/* Per-interface save files are built by nic_save_path() as:
- *   NIC_SAVE_DIR "/ecat_nic_saved_<iface>.conf"  */
-
-typedef struct {
-    char iface[NIC_IFNAME_MAX];  /* interface these settings belong to     */
-    int  saved;                  /* non-zero if values were captured       */
-
-    /* ethtool -C (coalescing) */
-    int  rx_usecs;
-    int  tx_usecs;
-    int  coalescing_saved;       /* non-zero if coalescing values valid    */
-
-    /* ethtool -K (offloads) */
-    int  gro;                    /* 1 = on, 0 = off */
-    int  gso;
-    int  tso;
-    int  offloads_saved;         /* non-zero if offload values valid       */
-} nic_saved_settings_t;
-
-#define ECAT_MAX_NIC_SAVED ECAT_MAX_MASTERS
-static nic_saved_settings_t g_nic_saved[ECAT_MAX_NIC_SAVED];
-static int g_nic_saved_count = 0;
-static pthread_mutex_t g_nic_saved_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-/**
- * @brief Find saved NIC settings by interface name.
- *
- * Caller must hold g_nic_saved_mutex.
- *
- * @return Pointer to the matching entry, or NULL if not found.
- */
-static nic_saved_settings_t *find_nic_saved(const char *iface)
-{
-    for (int i = 0; i < g_nic_saved_count; i++) {
-        if (strcmp(g_nic_saved[i].iface, iface) == 0)
-            return &g_nic_saved[i];
-    }
-    return NULL;
-}
-
-/**
- * @brief Find or allocate a NIC saved settings slot for the given interface.
- *
- * Returns the existing slot if one already exists for this interface,
- * otherwise reserves a new slot. Either way the returned slot is
- * zero-initialized and has the interface name pre-filled.
- *
- * Caller must hold g_nic_saved_mutex.
- *
- * @return Pointer to the slot, or NULL if the array is full.
- */
-static nic_saved_settings_t *get_nic_slot(const char *iface)
-{
-    nic_saved_settings_t *slot = find_nic_saved(iface);
-    if (!slot) {
-        if (g_nic_saved_count >= ECAT_MAX_NIC_SAVED)
-            return NULL;
-        slot = &g_nic_saved[g_nic_saved_count++];
-    }
-
-    memset(slot, 0, sizeof(*slot));
-    strncpy(slot->iface, iface, NIC_IFNAME_MAX - 1);
-    slot->iface[NIC_IFNAME_MAX - 1] = '\0';
-    return slot;
-}
-
-/* ------------------------------------------------------------------ */
-/*  Helpers: ethtool output parsing                                    */
-/* ------------------------------------------------------------------ */
-
-/**
- * @brief Parse a single integer value from an ethtool output line.
- *
- * Looks for a line containing exactly "<key>:" (not "<key>-something:")
- * and reads the integer that follows the colon.  This avoids matching
- * "rx-usecs-irq" when searching for "rx-usecs".
- *
- * @return 0 on success, -1 if not found
- */
-static int parse_ethtool_int(const char *output, const char *key, int *value)
-{
-    size_t key_len = strlen(key);
-    const char *p = output;
-    while ((p = strstr(p, key)) != NULL) {
-        char next = p[key_len];
-        /* Accept only if the key is followed by ':' or whitespace,
-         * not by '-' or another alnum (e.g. "rx-usecs-irq") */
-        if (next == ':' || next == ' ' || next == '\t')
-            break;
-        p += key_len;
-    }
-    if (!p)
-        return -1;
-    p += key_len;
-    while (*p == ':' || *p == ' ' || *p == '\t')
-        p++;
-    if (*p == '\0' || (*p != '-' && !isdigit((unsigned char)*p)))
-        return -1;
-    *value = atoi(p);
-    return 0;
-}
-
-/**
- * @brief Parse an on/off boolean from an ethtool -k output line.
- *
- * Lines look like: "generic-receive-offload: on"
- *
- * @return 0 on success, -1 if not found
- */
-static int parse_ethtool_bool(const char *output, const char *key, int *value)
-{
-    const char *p = strstr(output, key);
-    if (!p)
-        return -1;
-    p += strlen(key);
-    while (*p == ':' || *p == ' ' || *p == '\t')
-        p++;
-    if (strncmp(p, "on", 2) == 0)
-        *value = 1;
-    else
-        *value = 0;
-    return 0;
-}
-
-/* ------------------------------------------------------------------ */
-/*  Persistence: write / read / remove the save file                   */
-/* ------------------------------------------------------------------ */
-
-/**
- * @brief Write the in-memory saved settings to the persistence file.
- *
- * Creates NIC_SAVE_DIR if it does not exist.  The file is written
- * atomically: we write to a temporary path and rename, so a crash
- * mid-write never leaves a half-written file.
- */
-/**
- * @brief Build the per-interface persistence file path.
- *
- * @param iface  Interface name (e.g. "eth0")
- * @param buf    Output buffer
- * @param size   Size of output buffer
- */
-static void nic_save_path(const char *iface, char *buf, size_t size)
-{
-    snprintf(buf, size, NIC_SAVE_DIR "/ecat_nic_saved_%s.conf", iface);
-}
-
-static void persist_nic_settings(const nic_saved_settings_t *ns, plugin_logger_t *logger)
-{
-    /* Ensure the directory exists (may already exist for the log socket) */
-    if (mkdir(NIC_SAVE_DIR, 0755) != 0 && errno != EEXIST) {
-        plugin_logger_warn(logger,
-            "Cannot create %s: %s - NIC settings will not survive a crash",
-            NIC_SAVE_DIR, strerror(errno));
-        return;
-    }
-
-    char save_file[128];
-    nic_save_path(ns->iface, save_file, sizeof(save_file));
-
-    char tmp_path[128];
-    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", save_file);
-
-    FILE *fp = fopen(tmp_path, "w");
-    if (!fp) {
-        plugin_logger_warn(logger,
-            "Cannot write %s: %s - NIC settings will not survive a crash",
-            tmp_path, strerror(errno));
-        return;
-    }
-
-    fprintf(fp, "iface=%s\n", ns->iface);
-
-    if (ns->coalescing_saved) {
-        fprintf(fp, "rx_usecs=%d\n", ns->rx_usecs);
-        fprintf(fp, "tx_usecs=%d\n", ns->tx_usecs);
-    }
-
-    if (ns->offloads_saved) {
-        fprintf(fp, "gro=%s\n", ns->gro ? "on" : "off");
-        fprintf(fp, "gso=%s\n", ns->gso ? "on" : "off");
-        fprintf(fp, "tso=%s\n", ns->tso ? "on" : "off");
-    }
-
-    fflush(fp);
-    fclose(fp);
-
-    /* Atomic rename so we never have a half-written file */
-    if (rename(tmp_path, save_file) != 0) {
-        plugin_logger_warn(logger, "Cannot rename %s -> %s: %s",
-                           tmp_path, save_file, strerror(errno));
-        unlink(tmp_path);
-        return;
-    }
-
-    plugin_logger_info(logger, "NIC settings persisted to %s", save_file);
-}
-
-/**
- * @brief Remove the persistence file (called after a successful restore).
- */
-static void remove_nic_save_file(const char *iface, plugin_logger_t *logger)
-{
-    char save_file[128];
-    nic_save_path(iface, save_file, sizeof(save_file));
-    if (unlink(save_file) == 0) {
-        plugin_logger_debug(logger, "Removed %s", save_file);
-    }
-    /* ENOENT is fine - file already gone */
-}
-
-/**
- * @brief Load saved NIC settings from the persistence file for a given interface.
- *
- * Populates a slot in g_nic_saved from the file contents.
- *
- * @param iface  Interface name to load settings for
- * @param logger Logger instance
- * @return Pointer to the loaded settings, or NULL if no file found / invalid
- */
-static nic_saved_settings_t *load_nic_settings_from_file(const char *iface, plugin_logger_t *logger)
-{
-    char save_file[128];
-    nic_save_path(iface, save_file, sizeof(save_file));
-
-    FILE *fp = fopen(save_file, "r");
-    if (!fp)
-        return NULL;
-
-    nic_saved_settings_t tmp;
-    memset(&tmp, 0, sizeof(tmp));
-
-    char line[128];
-    while (fgets(line, sizeof(line), fp)) {
-        /* Strip trailing newline */
-        size_t len = strlen(line);
-        if (len > 0 && line[len - 1] == '\n')
-            line[len - 1] = '\0';
-
-        char *eq = strchr(line, '=');
-        if (!eq)
-            continue;
-        *eq = '\0';
-        const char *key = line;
-        const char *val = eq + 1;
-
-        if (strcmp(key, "iface") == 0) {
-            strncpy(tmp.iface, val, NIC_IFNAME_MAX - 1);
-            tmp.iface[NIC_IFNAME_MAX - 1] = '\0';
-        } else if (strcmp(key, "rx_usecs") == 0) {
-            tmp.rx_usecs = atoi(val);
-            tmp.coalescing_saved = 1;
-        } else if (strcmp(key, "tx_usecs") == 0) {
-            tmp.tx_usecs = atoi(val);
-            tmp.coalescing_saved = 1;
-        } else if (strcmp(key, "gro") == 0) {
-            tmp.gro = (strcmp(val, "on") == 0) ? 1 : 0;
-            tmp.offloads_saved = 1;
-        } else if (strcmp(key, "gso") == 0) {
-            tmp.gso = (strcmp(val, "on") == 0) ? 1 : 0;
-            tmp.offloads_saved = 1;
-        } else if (strcmp(key, "tso") == 0) {
-            tmp.tso = (strcmp(val, "on") == 0) ? 1 : 0;
-            tmp.offloads_saved = 1;
-        }
-    }
-
-    fclose(fp);
-
-    if (tmp.iface[0] == '\0' || !ecat_is_valid_iface_name(tmp.iface)) {
-        plugin_logger_warn(logger,
-            "Invalid or empty interface in %s - discarding", save_file);
-        remove_nic_save_file(iface, logger);
-        return NULL;
-    }
-
-    /* Allocate a slot and copy the loaded data */
-    pthread_mutex_lock(&g_nic_saved_mutex);
-    nic_saved_settings_t *slot = get_nic_slot(tmp.iface);
-    if (!slot) {
-        pthread_mutex_unlock(&g_nic_saved_mutex);
-        plugin_logger_warn(logger,
-            "No free NIC saved-settings slot for %s - discarding", tmp.iface);
-        remove_nic_save_file(iface, logger);
-        return NULL;
-    }
-
-    *slot = tmp;
-    slot->saved = 1;
-    pthread_mutex_unlock(&g_nic_saved_mutex);
-    return slot;
-}
-
-/* ------------------------------------------------------------------ */
-/*  Core: save, restore, recover from crash                            */
-/* ------------------------------------------------------------------ */
-
-/**
- * @brief Capture current NIC settings and persist to disk.
- */
-static void save_nic_settings(const char *iface, plugin_logger_t *logger)
-{
-    pthread_mutex_lock(&g_nic_saved_mutex);
-    nic_saved_settings_t *ns = get_nic_slot(iface);
-    if (!ns) {
-        pthread_mutex_unlock(&g_nic_saved_mutex);
-        plugin_logger_warn(logger,
-            "%s: no free NIC saved-settings slot - skipping save", iface);
-        return;
-    }
-    pthread_mutex_unlock(&g_nic_saved_mutex);
-
-    /* Capture current NIC settings (slow shell calls -- run without lock) */
-    nic_saved_settings_t local;
-    memset(&local, 0, sizeof(local));
-    strncpy(local.iface, iface, NIC_IFNAME_MAX - 1);
-    local.iface[NIC_IFNAME_MAX - 1] = '\0';
-
-    char output[2048];
-
-    /* Capture coalescing settings */
-    {
-        char *argv[] = { "ethtool", "-c", (char *)iface, NULL };
-        if (ecat_run_argv("ethtool", argv, output, sizeof(output)) == 0) {
-            int ok = 0;
-            ok += (parse_ethtool_int(output, "rx-usecs", &local.rx_usecs) == 0);
-            ok += (parse_ethtool_int(output, "tx-usecs", &local.tx_usecs) == 0);
-            if (ok > 0) {
-                local.coalescing_saved = 1;
-                plugin_logger_info(logger,
-                    "%s: saved coalescing (rx-usecs=%d, tx-usecs=%d)",
-                    iface, local.rx_usecs, local.tx_usecs);
-            }
-        }
-    }
-
-    /* Capture offload settings */
-    {
-        char *argv[] = { "ethtool", "-k", (char *)iface, NULL };
-        if (ecat_run_argv("ethtool", argv, output, sizeof(output)) == 0) {
-            int ok = 0;
-            ok += (parse_ethtool_bool(output, "generic-receive-offload", &local.gro) == 0);
-            ok += (parse_ethtool_bool(output, "generic-segmentation-offload", &local.gso) == 0);
-            ok += (parse_ethtool_bool(output, "tcp-segmentation-offload", &local.tso) == 0);
-            if (ok > 0) {
-                local.offloads_saved = 1;
-                plugin_logger_info(logger,
-                    "%s: saved offloads (gro=%s, gso=%s, tso=%s)",
-                    iface,
-                    local.gro ? "on" : "off",
-                    local.gso ? "on" : "off",
-                    local.tso ? "on" : "off");
-            }
-        }
-    }
-
-    local.saved = 1;
-
-    /* Commit captured values back to the shared slot */
-    pthread_mutex_lock(&g_nic_saved_mutex);
-    *ns = local;
-    pthread_mutex_unlock(&g_nic_saved_mutex);
-
-    /* Persist to disk so a crash does not lose the original values */
-    persist_nic_settings(&local, logger);
-}
-
-/**
- * @brief Apply saved settings back to the NIC and clean up.
- *
- * Works both for the in-memory path (normal shutdown) and for settings
- * loaded from the persistence file (crash recovery).
- */
-static void restore_nic_settings(const char *iface, plugin_logger_t *logger)
-{
-    /* Copy saved settings to stack so ethtool runs without the lock */
-    nic_saved_settings_t local;
-    nic_saved_settings_t *ns;
-
-    pthread_mutex_lock(&g_nic_saved_mutex);
-    ns = find_nic_saved(iface);
-    if (!ns || !ns->saved) {
-        pthread_mutex_unlock(&g_nic_saved_mutex);
-        return;
-    }
-    local = *ns;
-    ns->saved = 0;
-    pthread_mutex_unlock(&g_nic_saved_mutex);
-
-    /* Restore NIC settings (slow exec calls -- run without lock) */
-    if (local.coalescing_saved) {
-        char rx_str[16], tx_str[16];
-        snprintf(rx_str, sizeof(rx_str), "%d", local.rx_usecs);
-        snprintf(tx_str, sizeof(tx_str), "%d", local.tx_usecs);
-        char *argv[] = {
-            "ethtool", "-C", (char *)iface,
-            "rx-usecs", rx_str,
-            "tx-usecs", tx_str,
-            NULL
-        };
-        if (ecat_run_argv("ethtool", argv, NULL, 0) == 0) {
-            plugin_logger_info(logger,
-                "%s: restored coalescing (rx-usecs=%d, tx-usecs=%d)",
-                iface, local.rx_usecs, local.tx_usecs);
-        }
-    }
-
-    if (local.offloads_saved) {
-        char *argv[] = {
-            "ethtool", "-K", (char *)iface,
-            "gro", local.gro ? "on" : "off",
-            "gso", local.gso ? "on" : "off",
-            "tso", local.tso ? "on" : "off",
-            NULL
-        };
-        if (ecat_run_argv("ethtool", argv, NULL, 0) == 0) {
-            plugin_logger_info(logger,
-                "%s: restored offloads (gro=%s, gso=%s, tso=%s)",
-                iface,
-                local.gro ? "on" : "off",
-                local.gso ? "on" : "off",
-                local.tso ? "on" : "off");
-        }
-    }
-
-    remove_nic_save_file(iface, logger);
-    plugin_logger_info(logger, "%s: NIC settings restored to original values", iface);
-}
-
-/**
- * @brief Recover NIC settings left over from a previous crash.
- *
- * If the persistence file exists it means the previous process died
- * before it could restore the NIC.  Load the file and apply the
- * saved settings now, before we capture fresh ones and re-tune.
- */
-static void recover_nic_settings(const char *iface, plugin_logger_t *logger)
-{
-    nic_saved_settings_t *ns = load_nic_settings_from_file(iface, logger);
-    if (!ns)
-        return;
-
-    char save_file[128];
-    nic_save_path(iface, save_file, sizeof(save_file));
-
-    plugin_logger_warn(logger,
-        "Found stale NIC settings file (%s) - previous process likely crashed. "
-        "Restoring %s to original settings before re-tuning.",
-        save_file, iface);
-
-    restore_nic_settings(iface, logger);
-}
-
-#endif /* !__CYGWIN__ && !_WIN32 */
+/* SDO encoding (encode_sdo_value below) memcpys host bytes directly into
+ * the EtherCAT wire buffer, which the spec defines as little-endian.
+ * Supported targets (linux/amd64, linux/arm64, linux/arm/v7) are all LE.
+ * If a future port targets a big-endian host, this build fails here --
+ * fix by inserting htole32/htole64 calls in encode_sdo_value before the
+ * memcpy, rather than letting SDO writes silently corrupt slave configs. */
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__)
+_Static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
+               "EtherCAT SDO encoding requires a little-endian host");
+#endif
 
 /*
  * =============================================================================
@@ -518,7 +45,9 @@ static void recover_nic_settings(const char *iface, plugin_logger_t *logger)
  * =============================================================================
  */
 
-/** Number of retries when polling for OPERATIONAL state */
+/** Minimum retry count when polling for OPERATIONAL state.  The actual
+ *  retry count scales with min_sm_wd / total budget so the cadence stays
+ *  inside the smallest configured SM watchdog (see transition_to_op). */
 #define ECAT_OP_POLL_RETRIES 10
 
 /*
@@ -602,62 +131,6 @@ int ecat_master_validate_topology(ecat_master_instance_t *inst, plugin_logger_t 
  * =============================================================================
  */
 
-/**
- * @brief Apply low-latency ethtool settings to the EtherCAT network interface.
- *
- * Disables IRQ coalescing and receive offloads (GRO/GSO/TSO) so that
- * EtherCAT frames are delivered to userspace immediately instead of being
- * batched by the NIC driver.  Called once during master init, before the
- * SOEM raw socket is opened.  Requires ethtool on the host; fails silently
- * if the command is not available or the driver does not support a setting.
- */
-static void tune_nic(const char *iface, plugin_logger_t *logger)
-{
-#if !defined(__CYGWIN__) && !defined(_WIN32)
-    if (!ecat_is_valid_iface_name(iface)) {
-        plugin_logger_warn(logger, "Skipping NIC tuning: invalid interface name '%s'", iface);
-        return;
-    }
-
-    /* If a previous process crashed, restore the NIC first */
-    recover_nic_settings(iface, logger);
-
-    /* Save current settings so they can be restored on close */
-    save_nic_settings(iface, logger);
-
-    /* Disable IRQ coalescing - deliver frames immediately */
-    {
-        char *argv[] = {
-            "ethtool", "-C", (char *)iface,
-            "rx-usecs", "0",
-            "tx-usecs", "0",
-            NULL
-        };
-        if (ecat_run_argv("ethtool", argv, NULL, 0) == 0) {
-            plugin_logger_info(logger,
-                "%s: IRQ coalescing disabled (rx-usecs=0 tx-usecs=0)", iface);
-        }
-    }
-
-    /* Disable receive offloads that batch/merge packets */
-    {
-        char *argv[] = {
-            "ethtool", "-K", (char *)iface,
-            "gro", "off",
-            "gso", "off",
-            "tso", "off",
-            NULL
-        };
-        if (ecat_run_argv("ethtool", argv, NULL, 0) == 0) {
-            plugin_logger_info(logger, "%s: GRO/GSO/TSO offloads disabled", iface);
-        }
-    }
-#else
-    (void)iface;
-    (void)logger;
-#endif
-}
-
 int ecat_master_open_and_scan(ecat_master_instance_t *inst, plugin_logger_t *logger)
 {
     const ecat_config_t *config = &inst->config;
@@ -667,8 +140,9 @@ int ecat_master_open_and_scan(ecat_master_instance_t *inst, plugin_logger_t *log
     memset(inst->iomap, 0, sizeof(inst->iomap));
     inst->iomap_used_size = 0;
 
-    /* Step 0: Tune NIC for low-latency EtherCAT frame delivery */
-    tune_nic(config->master.interface, logger);
+    /* Step 0: Apply per-iface external state (NIC tuning + IP-stack
+     * isolation).  Reverted in ecat_master_close. */
+    ecat_iface_state_apply(&inst->iface_state, config->master.interface, logger);
 
     /* Step 1: Initialize SOEM on the configured network interface */
     plugin_logger_info(logger, "Opening network interface: %s", config->master.interface);
@@ -796,6 +270,45 @@ int ecat_master_open_and_scan(ecat_master_instance_t *inst, plugin_logger_t *log
  * =============================================================================
  */
 
+/**
+ * @brief Encode a double-typed SDO value into wire bytes for the target type.
+ *
+ * Three paths cover all 11 supported types: REAL32, REAL64, and integer.
+ * Integer types share a common int64_t cast and a memcpy of the LSBs --
+ * parse_sdo's range check guarantees the cast is in-range, so no UB on
+ * the truncation.  Host little-endian is enforced at file scope by the
+ * _Static_assert above; a future big-endian port fails the build there.
+ *
+ * @param dt     Target wire type (must be a valid known type)
+ * @param in     Source value (already range-validated by the parser)
+ * @param out    Output buffer, at least @p ecat_data_type_size(dt) bytes
+ * @return Number of bytes written, or 0 if @p dt is unknown/PAD
+ */
+static int encode_sdo_value(ecat_data_type_t dt, double in, uint8_t out[8])
+{
+    int sz = ecat_data_type_size(dt);
+    if (sz <= 0)
+        return 0;
+
+    memset(out, 0, 8);
+
+    if (dt == ECAT_DTYPE_REAL32) {
+        float v = (float)in;
+        memcpy(out, &v, sizeof(v));
+        return 4;
+    }
+    if (dt == ECAT_DTYPE_REAL64) {
+        memcpy(out, &in, sizeof(in));
+        return 8;
+    }
+
+    /* Integer path (BOOL/INT8/UINT8/.../UINT64): one cast to int64_t,
+     * then memcpy the low @p sz bytes -- little-endian on supported hosts. */
+    int64_t i = (int64_t)in;
+    memcpy(out, &i, (size_t)sz);
+    return sz;
+}
+
 int ecat_master_write_sdos(ecat_master_instance_t *inst, int slave_pos,
                            const ecat_sdo_config_t *sdos,
                            int sdo_count, int sdo_timeout_ms,
@@ -814,6 +327,16 @@ int ecat_master_write_sdos(ecat_master_instance_t *inst, int slave_pos,
     if (sdo_count == 0)
         return 0;
 
+    /* Slaves without CoE mailbox cannot accept SDO writes; refuse early
+     * with a clear message instead of letting every ecx_SDOwrite return
+     * wkc=0. */
+    if ((inst->ecx_context.slavelist[slave_pos].mbx_proto & 0x04) == 0) {
+        plugin_logger_error(logger,
+            "Slave %d: %d SDO(s) configured but slave does not support CoE mailbox",
+            slave_pos, sdo_count);
+        return -1;
+    }
+
     int written = 0;
 
     for (int i = 0; i < sdo_count; i++) {
@@ -822,45 +345,30 @@ int ecat_master_write_sdos(ecat_master_instance_t *inst, int slave_pos,
         /* Parse index from hex string */
         uint16_t index = (uint16_t)strtol(sdo->index, NULL, 16);
 
-        /* Determine data size from data type */
+        /* parse_sdo rejects UNKNOWN/PAD so encode_sdo_value() returning
+         * 0 here is a parser regression rather than user input -- skip
+         * the SDO defensively rather than crash. */
         ecat_data_type_t dt = sdo->parsed_type;
-        int size = ecat_data_type_size(dt);
-        if (size <= 0) {
-            plugin_logger_warn(logger,
-                "Slave %d SDO 0x%04X:%d: unknown data type '%s', assuming 4 bytes",
-                slave_pos, index, sdo->subindex, sdo->data_type);
-            size = 4;
-            dt = ECAT_DTYPE_INT32;
-        }
-
-        /* Encode the double value into the correct wire type */
         uint8_t value_buf[8];
-        memset(value_buf, 0, sizeof(value_buf));
-
-        switch (dt) {
-        case ECAT_DTYPE_BOOL:
-        case ECAT_DTYPE_UINT8:  { uint8_t  v = (uint8_t)sdo->value;  memcpy(value_buf, &v, sizeof(v)); break; }
-        case ECAT_DTYPE_INT8:   { int8_t   v = (int8_t)sdo->value;   memcpy(value_buf, &v, sizeof(v)); break; }
-        case ECAT_DTYPE_UINT16: { uint16_t v = (uint16_t)sdo->value; memcpy(value_buf, &v, sizeof(v)); break; }
-        case ECAT_DTYPE_INT16:  { int16_t  v = (int16_t)sdo->value;  memcpy(value_buf, &v, sizeof(v)); break; }
-        case ECAT_DTYPE_UINT32: { uint32_t v = (uint32_t)sdo->value; memcpy(value_buf, &v, sizeof(v)); break; }
-        case ECAT_DTYPE_INT32:  { int32_t  v = (int32_t)sdo->value;  memcpy(value_buf, &v, sizeof(v)); break; }
-        case ECAT_DTYPE_UINT64: { uint64_t v = (uint64_t)sdo->value; memcpy(value_buf, &v, sizeof(v)); break; }
-        case ECAT_DTYPE_INT64:  { int64_t  v = (int64_t)sdo->value;  memcpy(value_buf, &v, sizeof(v)); break; }
-        case ECAT_DTYPE_REAL32: { float    v = (float)sdo->value;    memcpy(value_buf, &v, sizeof(v)); break; }
-        case ECAT_DTYPE_REAL64: { double   v = sdo->value;           memcpy(value_buf, &v, sizeof(v)); break; }
-        default:                { int32_t  v = (int32_t)sdo->value;  memcpy(value_buf, &v, sizeof(v)); break; }
+        int size = encode_sdo_value(dt, sdo->value, value_buf);
+        if (size <= 0) {
+            plugin_logger_error(logger,
+                "Slave %d SDO 0x%04X:%d: unknown data type '%s' -- skipping (parser regression?)",
+                slave_pos, index, sdo->subindex,
+                ecat_data_type_to_string(dt));
+            continue;
         }
 
+        const char *dt_name = ecat_data_type_to_string(dt);
         if (dt == ECAT_DTYPE_REAL32 || dt == ECAT_DTYPE_REAL64) {
             plugin_logger_debug(logger,
                 "Slave %d: writing SDO 0x%04X:%d = %g (%s, %d bytes)",
-                slave_pos, index, sdo->subindex, sdo->value, sdo->data_type, size);
+                slave_pos, index, sdo->subindex, sdo->value, dt_name, size);
         } else {
             plugin_logger_debug(logger,
                 "Slave %d: writing SDO 0x%04X:%d = %lld (%s, %d bytes)",
                 slave_pos, index, sdo->subindex, (long long)(int64_t)sdo->value,
-                sdo->data_type, size);
+                dt_name, size);
         }
 
         /* Use per-slave SDO timeout if configured, otherwise SOEM default */
@@ -882,9 +390,15 @@ int ecat_master_write_sdos(ecat_master_instance_t *inst, int slave_pos,
         }
     }
 
+    if (written < sdo_count) {
+        plugin_logger_warn(logger,
+            "Slave %d: only %d/%d SDOs written successfully",
+            slave_pos, written, sdo_count);
+        return -1;
+    }
     plugin_logger_info(logger, "Slave %d: %d/%d SDOs written successfully",
                        slave_pos, written, sdo_count);
-    return written;
+    return 0;
 }
 
 /*
@@ -904,13 +418,23 @@ int ecat_master_write_sdos(ecat_master_instance_t *inst, int slave_pos,
  * Default divider 0x09C2 = 2498 -> (2498+2)*25ns = 62.5us per tick.
  * To set watchdog to X ms: ticks = X * 1000 / 62.5 = X * 16
  *
+ * SM watchdog is treated as a critical configuration when @p strict is
+ * true: if the FPWR returns wkc<=0, the slave would run with the
+ * EEPROM-default watchdog (often disabled), defeating the operator's
+ * intent.  PDI watchdog is always best-effort -- many slaves do not
+ * support that register and return wkc=0 legitimately.
+ *
+ * @param inst      Master instance
  * @param slave_pos 1-based slave position on the bus
  * @param wd        Watchdog configuration
+ * @param strict    Abort startup on SM watchdog write failure
  * @param logger    Plugin logger instance
+ * @return 0 on success, -1 on SM watchdog write failure with @p strict
  */
-static void ecat_master_configure_watchdog(ecat_master_instance_t *inst, int slave_pos,
-                                           const ecat_watchdog_t *wd,
-                                           plugin_logger_t *logger)
+static int ecat_master_configure_watchdog(ecat_master_instance_t *inst, int slave_pos,
+                                          const ecat_watchdog_t *wd,
+                                          bool strict,
+                                          plugin_logger_t *logger)
 {
     /* Maximum watchdog timeout in ms that fits in a uint16_t register
      * with the default divider (1 tick = 62.5 us -> ticks = ms * 16).
@@ -936,8 +460,15 @@ static void ecat_master_configure_watchdog(ecat_master_instance_t *inst, int sla
         wkc = ecx_FPWR(&inst->ecx_context.port, configadr, 0x0420,
                             sizeof(sm_wd_ticks), &sm_wd_ticks, EC_TIMEOUTRET);
         if (wkc <= 0) {
+            if (strict) {
+                plugin_logger_error(logger,
+                    "Slave %d: failed to write SM watchdog register 0x0420 (wkc=%d) -- "
+                    "slave would run with EEPROM-default watchdog (often disabled)",
+                    slave_pos, wkc);
+                return -1;
+            }
             plugin_logger_warn(logger,
-                "Slave %d: failed to write SM watchdog register 0x0420 (wkc=%d)",
+                "Slave %d: SM watchdog write failed (wkc=%d), strict_sdo=false -- continuing",
                 slave_pos, wkc);
         } else {
             plugin_logger_debug(logger,
@@ -950,8 +481,8 @@ static void ecat_master_configure_watchdog(ecat_master_instance_t *inst, int sla
             slave_pos);
     }
 
-    /* PDI watchdog register 0x0402 - only write if explicitly enabled,
-     * as many slaves do not support PDI watchdog and return wkc=0. */
+    /* PDI watchdog register 0x0402 - many slaves do not support this
+     * register and return wkc=0 legitimately, so always best-effort. */
     if (wd->pdi_watchdog_enabled) {
         uint16_t pdi_wd_ticks = 0;
         if (wd->pdi_watchdog_ms > 0) {
@@ -968,7 +499,8 @@ static void ecat_master_configure_watchdog(ecat_master_instance_t *inst, int sla
                         sizeof(pdi_wd_ticks), &pdi_wd_ticks, EC_TIMEOUTRET);
         if (wkc <= 0) {
             plugin_logger_warn(logger,
-                "Slave %d: failed to write PDI watchdog register 0x0402 (wkc=%d)",
+                "Slave %d: PDI watchdog write returned wkc=%d (many slaves do not "
+                "support this register -- typically benign)",
                 slave_pos, wkc);
         } else {
             plugin_logger_debug(logger,
@@ -980,6 +512,8 @@ static void ecat_master_configure_watchdog(ecat_master_instance_t *inst, int sla
             "Slave %d: PDI watchdog disabled, skipping register write",
             slave_pos);
     }
+
+    return 0;
 }
 
 /**
@@ -1077,33 +611,59 @@ int ecat_master_configure(ecat_master_instance_t *inst, plugin_logger_t *logger)
         return -1;
     }
 
-    /* Step 4: Map process data (IO map) */
+    /* Step 4: Map process data (IO map).  ecx_config_map_group returns
+     * the IOmap size in bytes -- 0 means SOEM could not lay out PDOs
+     * (typically SII corrupted, mailbox stuck, or slave not responding
+     * to FPRD).  Without this check we would silently enter SAFE-OP/OP
+     * with an empty IOmap and produce wkc=0 every cycle. */
     plugin_logger_info(logger, "Mapping process data...");
 
-    ecx_config_map_group(&inst->ecx_context, &inst->iomap, 0);
-
-    ec_groupt *grp = &inst->ecx_context.grouplist[0];
-
-    /* Check that total I/O fits in the IOmap buffer */
-    uint32_t total_io = (uint32_t)grp->Obytes + (uint32_t)grp->Ibytes;
-    if (total_io > ECAT_IOMAP_SIZE) {
-        plugin_logger_error(logger, "IOmap overflow: need %u bytes, have %d",
-                            total_io, ECAT_IOMAP_SIZE);
+    int io_size = ecx_config_map_group(&inst->ecx_context, &inst->iomap, 0);
+    if (io_size <= 0) {
+        plugin_logger_error(logger,
+            "ecx_config_map_group returned %d -- process data mapping failed "
+            "(likely SII / mailbox issue)", io_size);
+        return -1;
+    }
+    if (io_size > ECAT_IOMAP_SIZE) {
+        plugin_logger_error(logger, "IOmap overflow: need %d bytes, have %d",
+                            io_size, ECAT_IOMAP_SIZE);
         return -1;
     }
 
-    inst->iomap_used_size = (size_t)total_io;
+    inst->iomap_used_size = (size_t)io_size;
+
+    /* Cross-check: the per-group totals should add up to the same value
+     * SOEM returned.  A mismatch is a SOEM bug or our config is racy --
+     * not fatal but worth surfacing. */
+    ec_groupt *grp = &inst->ecx_context.grouplist[0];
+    uint32_t grp_total = (uint32_t)grp->Obytes + (uint32_t)grp->Ibytes;
+    if ((int)grp_total != io_size) {
+        plugin_logger_warn(logger,
+            "IOmap size mismatch: ecx returned %d but grp totals=%u "
+            "(Obytes=%d Ibytes=%d)",
+            io_size, grp_total, grp->Obytes, grp->Ibytes);
+    }
 
     plugin_logger_info(logger, "IO map: %d output bytes, %d input bytes, %d segments",
                        grp->Obytes, grp->Ibytes, grp->nsegments);
 
-    /* Step 5: Configure watchdogs per slave */
+    /* Step 5: Configure watchdogs per slave.  Reuses slave->strict_sdo --
+     * a slave that wants strict SDO writes also wants strict SM watchdog
+     * writes; both are critical configuration the operator pinned in JSON. */
     plugin_logger_info(logger, "Configuring per-slave watchdogs...");
     for (int i = 0; i < config->slave_count; i++) {
         const ecat_slave_t *slave = &config->slaves[i];
         int pos = slave->position;
-        if (pos >= 1 && pos <= inst->ecx_context.slavecount) {
-            ecat_master_configure_watchdog(inst, pos, &slave->watchdog, logger);
+        if (pos < 1 || pos > inst->ecx_context.slavecount)
+            continue;
+        if (ecat_master_configure_watchdog(inst, pos, &slave->watchdog,
+                                           slave->strict_sdo, logger) != 0) {
+            plugin_logger_error(logger,
+                "Master '%s': Slave %d (%s): SM watchdog config failed and "
+                "strict_sdo=true -- aborting startup",
+                inst->name, pos, slave->name);
+            return -1;
         }
     }
 
@@ -1177,13 +737,46 @@ int ecat_master_transition_to_op(ecat_master_instance_t *inst, plugin_logger_t *
     inst->ecx_context.slavelist[0].state = EC_STATE_OPERATIONAL;
     ecx_writestate(&inst->ecx_context, 0);
 
-    /* Poll for OP state with process data exchange between checks */
-    int op_reached = 0;
-    int poll_timeout_us = max_safeop_timeout_us / ECAT_OP_POLL_RETRIES;
+    /* Poll for OP state with process data exchange between checks.
+     *
+     * Cadence is bounded by the smallest configured SM watchdog: a SAFE-OP
+     * slave's SM2 watchdog starts counting on SAFE-OP entry and trips with
+     * AL Status 0x001B if the master stops writing for longer than
+     * sm_watchdog_ms.  Cap the per-iteration statecheck timeout to a
+     * quarter of that smallest watchdog so the trickle of exchanges keeps
+     * SM2 rearmed throughout the SAFE-OP -> OP poll, regardless of how
+     * generous safeop_to_op_timeout_ms is set per slave. */
+    int min_sm_wd_us = 0;
+    for (int i = 0; i < config->slave_count; i++) {
+        const ecat_watchdog_t *wd = &config->slaves[i].watchdog;
+        if (wd->sm_watchdog_enabled && wd->sm_watchdog_ms > 0) {
+            int wd_us = wd->sm_watchdog_ms * 1000;
+            if (min_sm_wd_us == 0 || wd_us < min_sm_wd_us)
+                min_sm_wd_us = wd_us;
+        }
+    }
+    /* Default ESC SM watchdog is 100 ms.  Use it when no slave has an
+     * explicit watchdog configured. */
+    if (min_sm_wd_us == 0)
+        min_sm_wd_us = 100 * 1000;
+
+    int poll_timeout_us = min_sm_wd_us / 4;
     if (poll_timeout_us < EC_TIMEOUTRET)
         poll_timeout_us = EC_TIMEOUTRET;
 
-    for (int retry = 0; retry < ECAT_OP_POLL_RETRIES; retry++) {
+    /* Total polling budget is the longest configured safeop->op timeout.
+     * Derive the retry count from the cadence we need. */
+    int retries = max_safeop_timeout_us / poll_timeout_us;
+    if (retries < ECAT_OP_POLL_RETRIES)
+        retries = ECAT_OP_POLL_RETRIES;
+
+    plugin_logger_debug(logger,
+        "OP poll cadence: timeout=%d us, retries=%d "
+        "(min SM watchdog among slaves=%d us)",
+        poll_timeout_us, retries, min_sm_wd_us);
+
+    int op_reached = 0;
+    for (int retry = 0; retry < retries; retry++) {
         ecx_send_processdata(&inst->ecx_context);
         ecx_receive_processdata(&inst->ecx_context, EC_TIMEOUTRET);
         ecx_statecheck(&inst->ecx_context, 0, EC_STATE_OPERATIONAL, poll_timeout_us);
@@ -1196,8 +789,9 @@ int ecat_master_transition_to_op(ecat_master_instance_t *inst, plugin_logger_t *
 
     if (!op_reached) {
         plugin_logger_error(logger,
-            "Not all slaves reached OPERATIONAL state after %d retries",
-            ECAT_OP_POLL_RETRIES);
+            "Not all slaves reached OPERATIONAL state after %d retries "
+            "(poll_timeout=%d us)",
+            retries, poll_timeout_us);
 
         /* Log individual slave states for debugging */
         ecx_readstate(&inst->ecx_context);
@@ -1228,23 +822,63 @@ int ecat_master_transition_to_op(ecat_master_instance_t *inst, plugin_logger_t *
 void ecat_master_close(ecat_master_instance_t *inst, plugin_logger_t *logger)
 {
     if (inst->soem_initialized) {
-        /* Transition all slaves to INIT state */
+        /* Step 1: drive outputs to zero before the transition (safe-close).
+         * For drives, valves and active-high IO this leaves the slave in a
+         * safe state immediately, before its SM watchdog has a chance to
+         * fire.  Skip when there is no IOmap yet (close on early-startup
+         * failure path). */
+        if (inst->config.master.safe_close && inst->iomap_used_size > 0) {
+            plugin_logger_info(logger,
+                "Zeroing outputs and sending final processdata before close");
+            memset(inst->iomap, 0, inst->iomap_used_size);
+            ecx_send_processdata(&inst->ecx_context);
+            int wkc = ecx_receive_processdata(&inst->ecx_context, EC_TIMEOUTRET);
+            if (wkc <= 0) {
+                plugin_logger_warn(logger,
+                    "Final processdata returned wkc=%d -- outputs may not have "
+                    "reached slaves; falling back to slave SM watchdog", wkc);
+            }
+        }
+
+        /* Step 2: request INIT and confirm the transition.  Discarding
+         * wkc here meant slaves could remain in OP/SAFE-OP after stop_loop
+         * if the broadcast did not reach them. */
         plugin_logger_info(logger, "Transitioning slaves to INIT state...");
         inst->ecx_context.slavelist[0].state = EC_STATE_INIT;
-        ecx_writestate(&inst->ecx_context, 0);
+        int init_wkc = ecx_writestate(&inst->ecx_context, 0);
+        if (init_wkc <= 0) {
+            plugin_logger_error(logger,
+                "writestate(INIT) returned wkc=%d -- slaves may remain in "
+                "OP/SAFE-OP until their SM watchdog expires", init_wkc);
+        } else {
+            /* Short timeout -- not worth waiting safeop_to_op here. */
+            ecx_statecheck(&inst->ecx_context, 0, EC_STATE_INIT, EC_TIMEOUTSTATE);
+            ecx_readstate(&inst->ecx_context);
+            int stuck = 0;
+            for (int i = 1; i <= inst->ecx_context.slavecount; i++) {
+                uint16_t st = inst->ecx_context.slavelist[i].state;
+                if (st != EC_STATE_INIT) {
+                    plugin_logger_warn(logger,
+                        "Slave %d (%s): did not reach INIT (state=0x%04X) -- "
+                        "fallback to slave SM watchdog",
+                        i, inst->ecx_context.slavelist[i].name, st);
+                    stuck++;
+                }
+            }
+            if (stuck == 0) {
+                plugin_logger_info(logger, "All slaves confirmed in INIT");
+            }
+        }
 
-        /* Close the network interface */
+        /* Step 3: close the network interface */
         ecx_close(&inst->ecx_context);
         inst->soem_initialized = 0;
     }
 
-    /* Always attempt to restore NIC settings, even if SOEM init had failed
-     * after tune_nic() already modified the interface. The restore function
-     * checks the saved flag internally and is a no-op when there is
-     * nothing to undo. */
-#if !defined(__CYGWIN__) && !defined(_WIN32)
-    restore_nic_settings(inst->config.master.interface, logger);
-#endif
+    /* Always attempt to revert iface state, even if SOEM init had failed
+     * after we already modified the interface.  Revert reads in-memory
+     * flags and is a no-op when nothing was applied. */
+    ecat_iface_state_revert(&inst->iface_state, logger);
 
     /* Clear IO map */
     memset(inst->iomap, 0, sizeof(inst->iomap));
@@ -1280,13 +914,6 @@ const ec_slavet *ecat_master_get_slave(ecat_master_instance_t *inst, int positio
     return &inst->ecx_context.slavelist[position];
 }
 
-int ecat_master_is_operational(ecat_master_instance_t *inst)
-{
-    if (!inst->soem_initialized)
-        return 0;
-    return (inst->ecx_context.slavelist[0].state == EC_STATE_OPERATIONAL) ? 1 : 0;
-}
-
 uint16_t ecat_master_get_slave_state(ecat_master_instance_t *inst, int position)
 {
     if (position < 1 || position > inst->ecx_context.slavecount)
@@ -1294,25 +921,38 @@ uint16_t ecat_master_get_slave_state(ecat_master_instance_t *inst, int position)
     return inst->ecx_context.slavelist[position].state;
 }
 
-int ecat_master_request_state(ecat_master_instance_t *inst, int position, uint16_t state, plugin_logger_t *logger)
-{
-    if (position < 1 || position > inst->ecx_context.slavecount) {
-        plugin_logger_error(logger, "Invalid slave position %d for state request", position);
-        return -1;
-    }
-
-    inst->ecx_context.slavelist[position].state = state;
-    ecx_writestate(&inst->ecx_context, (uint16)position);
-
-    plugin_logger_debug(logger, "Requested state 0x%04X for slave %d", state, position);
-    return 0;
-}
-
 /*
  * =============================================================================
  * Slave Recovery
  * =============================================================================
  */
+
+/**
+ * @brief Issue ecx_writestate during recovery, capturing wkc.
+ *
+ * wkc<=0 means the request did not reach the slave (link/cable issue,
+ * not a config problem).  Tally these into recovery_writestate_failures
+ * so the operator can distinguish "physical recovery failure" from
+ * "slave reachable but rejecting state" in the diagnostics.
+ *
+ * @return ecx_writestate's wkc (positive on success, <=0 on no response)
+ */
+static int writestate_with_check(ecat_master_instance_t *inst, int position,
+                                  uint16_t target_state, plugin_logger_t *logger)
+{
+    inst->ecx_context.slavelist[position].state = target_state;
+    int wkc = ecx_writestate(&inst->ecx_context, (uint16)position);
+    if (wkc <= 0) {
+        atomic_fetch_add_explicit(&inst->recovery_writestate_failures, 1,
+                                  memory_order_relaxed);
+        plugin_logger_warn(logger,
+            "Slave %d (%s): writestate(0x%04X) wkc=%d -- request did not "
+            "reach slave (link/cable issue?)",
+            position, inst->ecx_context.slavelist[position].name,
+            target_state, wkc);
+    }
+    return wkc;
+}
 
 int ecat_master_recover_slave(ecat_master_instance_t *inst, int position, plugin_logger_t *logger)
 {
@@ -1335,12 +975,10 @@ int ecat_master_recover_slave(ecat_master_instance_t *inst, int position, plugin
             "Slave %d (%s): SAFE_OP+ERROR (ALstatus=0x%04X), sending ACK",
             position, slave->name, slave->ALstatuscode);
 
-        slave->state = EC_STATE_SAFE_OP + EC_STATE_ACK;
-        ecx_writestate(&inst->ecx_context, (uint16)position);
+        writestate_with_check(inst, position, EC_STATE_SAFE_OP + EC_STATE_ACK, logger);
 
         /* Now request OP */
-        slave->state = EC_STATE_OPERATIONAL;
-        ecx_writestate(&inst->ecx_context, (uint16)position);
+        writestate_with_check(inst, position, EC_STATE_OPERATIONAL, logger);
 
         /* Check if it worked */
         ecx_statecheck(&inst->ecx_context, (uint16)position,
@@ -1359,8 +997,7 @@ int ecat_master_recover_slave(ecat_master_instance_t *inst, int position, plugin
         plugin_logger_info(logger, "Slave %d (%s): in SAFE_OP, requesting OP",
                            position, slave->name);
 
-        slave->state = EC_STATE_OPERATIONAL;
-        ecx_writestate(&inst->ecx_context, (uint16)position);
+        writestate_with_check(inst, position, EC_STATE_OPERATIONAL, logger);
 
         ecx_statecheck(&inst->ecx_context, (uint16)position,
                         EC_STATE_OPERATIONAL, EC_TIMEOUTRET);
