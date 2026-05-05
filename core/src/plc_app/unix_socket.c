@@ -49,7 +49,7 @@ static void *transition_worker(void *arg)
 
 // Start a background thread that performs the (potentially slow) state transition.
 // Returns true if the thread was spawned, false on error.
-static bool begin_transition(PLCState target)
+bool plc_begin_transition(PLCState target)
 {
     PLCState *arg = malloc(sizeof(PLCState));
     if (!arg)
@@ -166,7 +166,7 @@ void handle_unix_socket_commands(const char *command, char *response, size_t res
         PLCState current_state = plc_get_state();
         if (current_state == PLC_STATE_RUNNING)
         {
-            if (begin_transition(PLC_STATE_STOPPED))
+            if (plc_begin_transition(PLC_STATE_STOPPED))
                 strncpy(response, "STOP:OK\n", response_size);
             else
                 strncpy(response, "STOP:ERROR\n", response_size);
@@ -181,7 +181,7 @@ void handle_unix_socket_commands(const char *command, char *response, size_t res
         PLCState current_state = plc_get_state();
         if (current_state != PLC_STATE_RUNNING)
         {
-            if (begin_transition(PLC_STATE_RUNNING))
+            if (plc_begin_transition(PLC_STATE_RUNNING))
                 strncpy(response, "START:OK\n", response_size);
             else
                 strncpy(response, "START:ERROR\n", response_size);
@@ -195,6 +195,10 @@ void handle_unix_socket_commands(const char *command, char *response, size_t res
     else if (strcmp(command, "STATS") == 0)
     {
         format_timing_stats_response(response, response_size);
+        // Splice in any plugin-contributed statistics. Safe no-op when no
+        // plugin exports get_stats.
+        if (g_plugin_driver)
+            plugin_driver_append_stats_json(g_plugin_driver, response, response_size);
     }
     else if (strncmp(command, "DEBUG:", 6) == 0)
     {

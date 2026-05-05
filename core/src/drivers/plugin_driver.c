@@ -15,6 +15,8 @@
 
 #include "../plc_app/image_tables.h"
 #include "../plc_app/journal_buffer.h"
+#include "../plc_app/plc_state_manager.h"
+#include "../plc_app/unix_socket.h"
 #include "../plc_app/utils/log.h"
 #include "../plc_app/utils/utils.h"
 #include "plugin_config.h"
@@ -149,6 +151,28 @@ static uint8_t plugin_debug_write(uint8_t arr, uint16_t elem,
                : 0x81; // STATUS_OUT_OF_BOUNDS
 }
 
+// Plugin-invoked async PLC stop. Logs the reason at error level and kicks
+// off a detached state-transition worker via the same path the unix-socket
+// STOP command uses — the transition flag blocks overlapping commands, and
+// all plugins get their stop_loop / cleanup hooks called in the normal
+// order. Non-blocking by design: the caller's I/O thread returns
+// immediately, then continues running for the brief window until the
+// plugin's own stop_loop is invoked. Plugins that enter fault-stopped state
+// are expected to short-circuit their I/O during that window.
+static void plugin_request_plc_stop(const char *reason)
+{
+    log_error("[PLUGIN] stop requested: %s", reason ? reason : "(no reason given)");
+    if (plc_get_state() != PLC_STATE_RUNNING)
+    {
+        log_warn("[PLUGIN] stop request ignored — PLC is not running");
+        return;
+    }
+    if (!plc_begin_transition(PLC_STATE_STOPPED))
+    {
+        log_error("[PLUGIN] failed to start stop transition");
+    }
+}
+
 
 // Python capsule destructor for runtime args
 // Breakpoint here to debug capsule issues
@@ -243,6 +267,29 @@ int plugin_driver_update_config(plugin_driver_t *driver, const char *config_file
         if (configs[w].type == PLUGIN_TYPE_PYTHON)
         {
             has_python_plugin = 1;
+        }
+
+        // Load or reload symbols for native plugins.
+        // New plugins (native_plugin == NULL) need initial symbol loading.
+        // Existing plugins need reloading if their .so was recompiled (VPP plugins
+        // are compiled from source on every upload and the .so changes on disk).
+        if (configs[w].type == PLUGIN_TYPE_NATIVE)
+        {
+            if (driver->plugins[w].native_plugin != NULL)
+            {
+                // Close old handle and reload — the .so may have been recompiled
+                if (driver->plugins[w].native_plugin->handle)
+                {
+                    dlclose(driver->plugins[w].native_plugin->handle);
+                }
+                free(driver->plugins[w].native_plugin);
+                driver->plugins[w].native_plugin = NULL;
+            }
+            if (native_plugin_get_symbols(&driver->plugins[w]) != 0)
+            {
+                log_warn("Failed to load symbols for native plugin '%s' (may not be available yet)",
+                         configs[w].name);
+            }
         }
     }
     return 0;
@@ -728,6 +775,9 @@ void *generate_structured_args_with_driver(plugin_type_t type, plugin_driver_t *
     args->journal_write_dint = plugin_journal_write_dint;
     args->journal_write_lint = plugin_journal_write_lint;
 
+    // Plugin-initiated async PLC stop (for unrecoverable hardware faults).
+    args->request_plc_stop = plugin_request_plc_stop;
+
     // PLC base tick time. Runtime owns base_tick_ns; on first plugin init
     // (before symbols_init) it carries the 20 ms default, so plugins must
     // guard against the value being smaller than their needed resolution.
@@ -1044,6 +1094,10 @@ int native_plugin_get_symbols(plugin_instance_t *plugin)
                  plugin->config.path);
     }
 
+    native_bundle->get_stats = (plugin_get_stats_func_t)dlsym(handle, "get_stats");
+    // get_stats is fully optional — plugins that don't publish statistics
+    // simply don't export it. No warning.
+
     // Store the native bundle and handle in the plugin instance
     plugin->native_plugin = native_bundle;
 
@@ -1055,6 +1109,7 @@ int native_plugin_get_symbols(plugin_instance_t *plugin)
     log_info("  - cycle_end: %s", native_bundle->cycle_end ? "(PASS)" : "(FAIL)");
     log_info("  - cleanup: %s", native_bundle->cleanup ? "(PASS)" : "(FAIL)");
     log_info("  - execute_command: %s", native_bundle->execute_command ? "(PASS)" : "(FAIL)");
+    log_info("  - get_stats: %s", native_bundle->get_stats ? "(PASS)" : "(FAIL)");
 
     return 0;
 }
@@ -1154,6 +1209,141 @@ int plugin_driver_execute_command(plugin_driver_t *driver, const char *plugin_na
 
     snprintf(response, response_size, "{\"error\":\"plugin '%s' not found\"}", plugin_name);
     return -1;
+}
+
+// ===================================================================
+// Plugin-contributed statistics aggregation
+// ===================================================================
+//
+// Called from the STATS response path. Takes an already-formatted JSON
+// response ending in "}\n" (or "}"), asks each native plugin that
+// exports get_stats to produce a JSON object snippet, and splices them
+// into a "plugin_stats" member before the closing brace.
+//
+// Per-plugin budget: PLUGIN_STATS_SLOT_BUDGET bytes.
+// Combined budget:  PLUGIN_STATS_TOTAL_BUDGET bytes.
+// Output is best-effort: malformed plugin output (doesn't start with
+// '{' and end with '}') is silently dropped, overflow truncates, and
+// the core STATS response is always preserved.
+#define PLUGIN_STATS_SLOT_BUDGET   1024
+#define PLUGIN_STATS_TOTAL_BUDGET  8192
+
+size_t plugin_driver_append_stats_json(plugin_driver_t *driver, char *buffer,
+                                       size_t buffer_size)
+{
+    if (!buffer || buffer_size == 0)
+        return 0;
+
+    size_t len = strlen(buffer);
+
+    // Detect and strip a trailing newline — we'll re-add it after splicing.
+    int had_newline = 0;
+    if (len > 0 && buffer[len - 1] == '\n')
+    {
+        had_newline = 1;
+        buffer[--len] = '\0';
+    }
+
+    // Expect the core STATS payload to end in '}'. If it doesn't, the
+    // response is malformed and we won't risk making it worse.
+    if (len == 0 || buffer[len - 1] != '}')
+    {
+        if (had_newline && len + 1 < buffer_size)
+        {
+            buffer[len] = '\n';
+            buffer[len + 1] = '\0';
+            len++;
+        }
+        return len;
+    }
+
+    if (!driver || driver->plugin_count == 0)
+    {
+        if (had_newline && len + 1 < buffer_size)
+        {
+            buffer[len] = '\n';
+            buffer[len + 1] = '\0';
+            len++;
+        }
+        return len;
+    }
+
+    // Build the ,"plugin_stats":{...} section in a scratch buffer so we
+    // can commit-or-rollback atomically if it would overflow the response.
+    char scratch[PLUGIN_STATS_TOTAL_BUDGET];
+    size_t spos = 0;
+    int emitted = 0;
+
+    for (int i = 0; i < driver->plugin_count; i++)
+    {
+        plugin_instance_t *p = &driver->plugins[i];
+        if (p->config.type != PLUGIN_TYPE_NATIVE)
+            continue;
+        if (!p->native_plugin || !p->native_plugin->get_stats)
+            continue;
+
+        char slot[PLUGIN_STATS_SLOT_BUDGET];
+        slot[0] = '\0';
+        if (p->native_plugin->get_stats(slot, sizeof(slot)) != 0)
+            continue;
+
+        size_t slen = strnlen(slot, sizeof(slot));
+        if (slen < 2 || slot[0] != '{' || slot[slen - 1] != '}')
+            continue; // malformed — drop silently
+
+        int n = snprintf(scratch + spos, sizeof(scratch) - spos, "%s\"%s\":%s",
+                         emitted ? "," : "", p->config.name, slot);
+        if (n < 0 || (size_t)n >= sizeof(scratch) - spos)
+            break; // scratch full; commit what we have
+
+        spos += (size_t)n;
+        emitted = 1;
+    }
+
+    if (!emitted)
+    {
+        if (had_newline && len + 1 < buffer_size)
+        {
+            buffer[len] = '\n';
+            buffer[len + 1] = '\0';
+            len++;
+        }
+        return len;
+    }
+
+    // Splice: overwrite the closing '}' with ,"plugin_stats":{...}} and
+    // re-append the newline if present.
+    size_t insert_pos = len - 1;
+    int n = snprintf(buffer + insert_pos, buffer_size - insert_pos,
+                     ",\"plugin_stats\":{%s}}%s", scratch, had_newline ? "\n" : "");
+    if (n < 0)
+    {
+        // snprintf failure — restore newline and bail.
+        if (had_newline && len + 1 < buffer_size)
+        {
+            buffer[len] = '\n';
+            buffer[len + 1] = '\0';
+            len++;
+        }
+        return len;
+    }
+    if ((size_t)n >= buffer_size - insert_pos)
+    {
+        // Would overflow the response buffer; roll back by restoring the '}'
+        // and the newline.
+        buffer[insert_pos] = '}';
+        buffer[insert_pos + 1] = '\0';
+        len = insert_pos + 1;
+        if (had_newline && len + 1 < buffer_size)
+        {
+            buffer[len] = '\n';
+            buffer[len + 1] = '\0';
+            len++;
+        }
+        return len;
+    }
+
+    return insert_pos + (size_t)n;
 }
 
 // Cleanup Python plugin

@@ -43,11 +43,11 @@ set(SNAP7_LIB_SOURCES
 )
 
 # =============================================================================
-# cJSON Library (embedded for JSON configuration parsing)
+# cJSON Library (shared utility for all native plugins)
 # =============================================================================
 
 set(CJSON_SOURCES
-    ${CMAKE_CURRENT_SOURCE_DIR}/cjson/cJSON.c
+    ${OPENPLC_ROOT}/core/src/drivers/plugins/native/cjson/cJSON.c
 )
 
 # =============================================================================
@@ -69,7 +69,7 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/snap7/core
     ${CMAKE_CURRENT_SOURCE_DIR}/snap7/sys
     ${CMAKE_CURRENT_SOURCE_DIR}/snap7/lib
-    ${CMAKE_CURRENT_SOURCE_DIR}/cjson
+    ${OPENPLC_ROOT}/core/src/drivers/plugins/native/cjson
     ${OPENPLC_ROOT}/core/src/drivers
     ${OPENPLC_ROOT}/core/src/drivers/plugins/native
     ${OPENPLC_ROOT}/core/src/lib

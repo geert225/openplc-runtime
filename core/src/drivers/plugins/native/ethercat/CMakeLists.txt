@@ -121,11 +121,11 @@ endif()
 add_subdirectory(${SOEM_DIR} ${CMAKE_CURRENT_BINARY_DIR}/soem)
 
 # =============================================================================
-# cJSON Library (embedded for JSON configuration parsing)
+# cJSON Library (shared utility for all native plugins)
 # =============================================================================
 
 set(CJSON_SOURCES
-    ${CMAKE_CURRENT_SOURCE_DIR}/cjson/cJSON.c
+    ${OPENPLC_ROOT}/core/src/drivers/plugins/native/cjson/cJSON.c
 )
 
 # =============================================================================
@@ -157,7 +157,7 @@ add_library(ethercat_plugin SHARED
 
 target_include_directories(ethercat_plugin PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/cjson
+    ${OPENPLC_ROOT}/core/src/drivers/plugins/native/cjson
     ${OPENPLC_ROOT}/core/src/drivers
     ${OPENPLC_ROOT}/core/src/drivers/plugins/native
     ${OPENPLC_ROOT}/core/src/lib

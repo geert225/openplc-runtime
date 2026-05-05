@@ -16,7 +16,6 @@
 #include "image_tables.h"
 #include "plc_state_manager.h"
 #include "plcapp_manager.h"
-#include "scan_cycle_manager.h"
 #include "unix_socket.h"
 #include "utils/log.h"
 #include "utils/utils.h"

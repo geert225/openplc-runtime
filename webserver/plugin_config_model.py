@@ -371,5 +371,50 @@ class PluginsConfiguration:
                     plugin.enabled = False
                     plugins_updated += 1
                     updates.append(f"Disabled plugin '{plugin.name}' (no config file found)")
-        
+
         return plugins_updated, updates
+
+    def has_plugin(self, name: str) -> bool:
+        """Check if a plugin with the given name exists in the configuration."""
+        return any(p.name == name for p in self.plugins)
+
+    def add_plugin(self, name: str, path: str, enabled: bool,
+                   plugin_type: PluginType, config_path: str = "",
+                   venv_path: str = "") -> None:
+        """
+        Add a new plugin entry to the configuration.
+
+        Args:
+            name: Plugin identifier
+            path: Path to plugin binary (.so) or script (.py)
+            enabled: Whether the plugin should be enabled
+            plugin_type: PYTHON or NATIVE
+            config_path: Path to plugin-specific config file
+            venv_path: Virtual environment path (Python plugins only)
+        """
+        plugin = PluginConfig(
+            name=name,
+            path=path,
+            enabled=enabled,
+            plugin_type=plugin_type,
+            config_path=config_path,
+            venv_path=venv_path,
+        )
+        self.plugins.append(plugin)
+
+    def update_plugin_path(self, name: str, path: str) -> bool:
+        """
+        Update the binary path for an existing plugin.
+
+        Args:
+            name: Plugin identifier
+            path: New path to plugin binary
+
+        Returns:
+            True if the plugin was found and updated, False otherwise
+        """
+        for plugin in self.plugins:
+            if plugin.name == name:
+                plugin.path = path
+                return True
+        return False

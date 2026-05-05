@@ -11,7 +11,7 @@ from typing import Final
 
 from webserver.runtimemanager import RuntimeManager
 from webserver.logger import get_logger, LogParser
-from webserver.plugin_config_model import PluginsConfiguration, PluginConfig
+from webserver.plugin_config_model import PluginsConfiguration, PluginConfig, PluginType
 
 logger, _ = get_logger("runtime", use_buffer=True)
 
@@ -214,6 +214,53 @@ def update_plugin_configurations(generated_dir: str = "core/generated"):
             else:
                 build_state.log(f"[WARNING] {message}\n")
 
+    # Handle VPP plugin registration
+    # VPP plugins are compiled from source on-target. If a compiled VPP plugin
+    # .so exists in the build directory, register it in plugins.conf.
+    build_dir = os.path.join(generated_dir, "build") if generated_dir != "core/generated" else "build"
+    vpp_plugin_dir = os.path.join(generated_dir, "vpp_plugin")
+    vpp_sos = glob.glob(os.path.join(build_dir, "lib*_plugin.so"))
+
+    if os.path.exists(vpp_plugin_dir) and vpp_sos:
+        for so_path in vpp_sos:
+            # Extract plugin name: "libsynergy_plugin.so" -> "synergy"
+            so_basename = os.path.basename(so_path)
+            plugin_name = so_basename.replace("lib", "").replace("_plugin.so", "")
+
+            # Find matching config file
+            config_path = os.path.join(conf_dir, f"{plugin_name}.json")
+            if not os.path.exists(config_path):
+                build_state.log(f"[WARNING] VPP plugin {plugin_name}: no config file found at {config_path}\n")
+                continue
+
+            if not plugins_config.has_plugin(plugin_name):
+                # First-time deployment: add new entry
+                plugins_config.add_plugin(
+                    name=plugin_name,
+                    path=so_path,
+                    enabled=True,
+                    plugin_type=PluginType.NATIVE,
+                    config_path=config_path,
+                )
+                plugins_updated += 1
+                build_state.log(f"[INFO] Registered new VPP plugin '{plugin_name}' from {so_path}\n")
+            else:
+                # Update existing entry with new paths and enable
+                plugins_config.update_plugin_path(plugin_name, so_path)
+                for p in plugins_config.plugins:
+                    if p.name == plugin_name:
+                        p.config_path = config_path
+                        if not p.enabled:
+                            p.enabled = True
+                            plugins_updated += 1
+                        break
+                build_state.log(f"[INFO] Updated VPP plugin '{plugin_name}' path to {so_path}\n")
+    elif not os.path.exists(vpp_plugin_dir):
+        # No VPP plugin in this upload — disable any previously registered VPP plugins
+        # that no longer have a matching config file (already handled by
+        # update_plugins_from_config_dir above, since their config won't be in conf/)
+        pass
+
     # Save the updated configuration
     if plugins_config.to_file(plugins_conf_path):
         build_state.log(f"[INFO] Plugin configuration update complete. {plugins_updated} plugins updated.\n")
@@ -235,30 +282,6 @@ def update_plugin_configurations(generated_dir: str = "core/generated"):
                 build_state.log(f"[WARNING] {issue}\n")
     else:
         build_state.log("[ERROR] Failed to save updated plugin configuration\n")
-
-
-def _wait_for_plc_state(runtime_manager: RuntimeManager, expected: str, timeout_s: float) -> bool:
-    """Poll status_plc() until the runtime reports the expected state or
-    timeout elapses. Returns True on match. Used to confirm the new
-    program reached RUNNING after start_plc().
-
-    ``stop_plc()`` and ``start_plc()`` go over a Unix socket with a 500 ms
-    response window. The runtime ACKs the command before its teardown /
-    bring-up actually finishes (tasks stop, plugins shut down, .so
-    unloads, then for start: .so loads, plugins init, tasks spawn).
-    Without waiting for the actual state transition, run_compile would
-    race: cleanup script + start_plc would fire while the runtime is
-    still tearing the previous program down, and the new .so load
-    silently fails.
-    """
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        resp = runtime_manager.status_plc()
-        # Response format from the runtime is "STATUS:RUNNING\n" / "STATUS:STOPPED\n".
-        if resp and expected in resp.upper():
-            return True
-        time.sleep(0.1)
-    return False
 
 
 def _wait_for_plc_idle(runtime_manager: RuntimeManager, timeout_s: float) -> bool:
@@ -409,23 +432,26 @@ def run_compile(runtime_manager: RuntimeManager, cwd: str = "core/generated", cl
         build_state.status = BuildStatus.FAILED
         build_state.exit_code = 1
 
-    # Restart PLC only if both compile and cleanup succeeded.
-    if compile_ok and cleanup_ok:
+    if build_state.status == BuildStatus.SUCCESS:
+        # Re-run plugin configuration now that compile.sh has produced any
+        # VPP plugin .so files. The pre-compile call at upload time can only
+        # register pre-built plugins; VPP plugins are compiled on-target
+        # during run_compile, so their entries in plugins.conf have to be
+        # written after the compile step succeeds.
+        #
+        # Hold status back in COMPILING while we finalize plugins.conf so
+        # the editor doesn't poll SUCCESS and send START before the VPP
+        # plugin entry is written.
+        build_state.status = BuildStatus.COMPILING
+        update_plugin_configurations(cwd)
+        build_state.status = BuildStatus.SUCCESS
+
+        # Reset crash tracking after a successful build — the program changed,
+        # so any previous crash pattern no longer applies. Do NOT auto-start
+        # the PLC here: the editor is responsible for sending START once it
+        # has confirmed a clean build, which gives it control over retries
+        # when the previous STOP transition is still finishing (COMMAND:BUSY
+        # window).
         runtime_manager.reset_crash_tracking()
-        build_state.log("[INFO] Starting PLC...\n")
-        start_resp = runtime_manager.start_plc()
-        # start_plc returns "START:OK\n" on success or "START:ERROR\n"
-        # / None on failure. Surface that in the build log so the user
-        # can tell whether the runtime accepted the new program.
-        if start_resp and "OK" in start_resp.upper():
-            if _wait_for_plc_state(runtime_manager, "RUNNING", timeout_s=15.0):
-                build_state.log("[INFO] PLC running\n")
-            else:
-                build_state.log(
-                    "[WARNING] PLC started but did not reach RUNNING state within 15s. "
-                    "Check the runtime logs for crash or load errors.\n"
-                )
-        else:
-            build_state.log(f"[ERROR] start_plc failed: {start_resp!r}\n")
     else:
         build_state.log("[WARNING] PLC program has not been updated because the build failed\n")
