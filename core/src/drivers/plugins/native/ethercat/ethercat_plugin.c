@@ -29,8 +29,17 @@
  *   - The legacy cycle_start/cycle_end plugin hooks are gone.
  */
 
+/* _GNU_SOURCE pulls in glibc extensions used by the bus thread:
+ *   - pthread_setname_np()  for `top` / `htop` thread naming
+ *   - pthread_kill()        for SIGUSR1 wake-up on stop
+ * Must come before any system header. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <ctype.h>
 #include <errno.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -51,6 +60,11 @@
 #include "ethercat_proc.h"
 #include "soem/soem.h"   /* osal_get_monotonic_time, ec_timet */
 #include "cjson/cJSON.h"  /* JSON parsing for execute_command */
+
+/* Forward declaration: ecat_bus_thread is defined alongside the bus
+ * loop further down in the file but referenced first by
+ * start_single_master via pthread_create. */
+static void *ecat_bus_thread(void *arg);
 
 /*
  * =============================================================================
