@@ -221,8 +221,10 @@ typedef struct {
     int              receive_timeout_us;
     int              watchdog_timeout_cycles;
     char             log_level[8];
-    char             task_name[ECAT_MAX_NAME_LEN];
-    int              task_cycle_time_us;
+    /** SCHED_FIFO priority for the dedicated bus thread (1-99).
+     *  Defaults to 90 — above typical IEC task priorities so the bus
+     *  exchange isn't starved by a long PLC scan. */
+    int              task_priority;
 } ecat_master_config_t;
 
 /**
@@ -543,12 +545,11 @@ typedef struct {
     int expected_wkc;
     int receive_timeout_us;
 
-    /* Diagnostics (updated by cycle_start in PLC thread) */
+    /* Diagnostics (updated by the bus thread) */
     ecat_cycle_diag_t diag;
     _Atomic(int) consecutive_wkc_errors;
     _Atomic(int) recovery_attempts;
     uint64_t cycle_counter;
-    unsigned int tick_divisor;
 
     /* Status snapshot for queries via execute_command */
     ecat_master_status_t status_snapshot;
@@ -562,6 +563,23 @@ typedef struct {
     _Atomic(bool) soem_paused;
     _Atomic(uint64_t) exchange_skips;
 #endif
+
+    /* Dedicated bus thread. Periodic at master.cycle_time_us, SCHED_FIFO
+     * at the configured taskPriority. Drives the synchronous SOEM
+     * exchange independently of the IEC scan threads. The IEC tasks
+     * never invoke this plugin's cycle_start hook anymore. */
+    pthread_t              bus_thread;
+    _Atomic(bool)          bus_running;
+    /* Per-bus scan/cycle/latency tracker. Storage is sized via the
+     * runtime's `tracker_size` thunk and accessed only through the
+     * `tracker_*` thunks on `plugin_runtime_args_t` — the concrete
+     * `scan_cycle_tracker_t` layout is private to the runtime. We
+     * register it under name "ecat-<master>" so the STATS endpoint
+     * includes it alongside the IEC task entries. 256 bytes is a
+     * comfortable upper bound for the current struct (mutex + 32 B
+     * stats); checked at startup against `tracker_size()`. */
+    void                  *bus_tracker;
+    char                   tracker_name[ECAT_MAX_NAME_LEN + 8];
 
     /* Iface isolation: true means we applied this setting and must revert. */
     bool iface_iptables_added;

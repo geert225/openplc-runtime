@@ -15,6 +15,7 @@
 
 #include "../plc_app/image_tables.h"
 #include "../plc_app/journal_buffer.h"
+#include "../plc_app/scan_cycle_manager.h"
 #include "../plc_app/utils/log.h"
 #include "../plc_app/utils/utils.h"
 #include "plugin_config.h"
@@ -147,6 +148,45 @@ static uint8_t plugin_debug_write(uint8_t arr, uint16_t elem,
     return ext_strucpp_debug_write
                ? ext_strucpp_debug_write(arr, elem, bytes, len)
                : 0x81; // STATUS_OUT_OF_BOUNDS
+}
+
+// Thunks that bridge plugin function-pointer signatures (void *tracker)
+// to the typed scan_cycle_manager API. Plugins allocate `tracker_size`
+// bytes, init with their period, register under a stable name, drive
+// start/end around their work, and unregister + cleanup on shutdown.
+static size_t plugin_tracker_size(void)
+{
+    return sizeof(scan_cycle_tracker_t);
+}
+
+static int plugin_tracker_init(void *tracker, int64_t interval_ns)
+{
+    return scan_cycle_tracker_init((scan_cycle_tracker_t *)tracker, interval_ns);
+}
+
+static void plugin_tracker_cleanup(void *tracker)
+{
+    scan_cycle_tracker_cleanup((scan_cycle_tracker_t *)tracker);
+}
+
+static void plugin_tracker_start(void *tracker)
+{
+    scan_cycle_tracker_start((scan_cycle_tracker_t *)tracker);
+}
+
+static void plugin_tracker_end(void *tracker)
+{
+    scan_cycle_tracker_end((scan_cycle_tracker_t *)tracker);
+}
+
+static int plugin_tracker_register(const char *name, void *tracker)
+{
+    return scan_cycle_tracker_register(name, (scan_cycle_tracker_t *)tracker);
+}
+
+static void plugin_tracker_unregister(void *tracker)
+{
+    scan_cycle_tracker_unregister((scan_cycle_tracker_t *)tracker);
 }
 
 // Python capsule destructor for runtime args
@@ -731,6 +771,17 @@ void *generate_structured_args_with_driver(plugin_type_t type, plugin_driver_t *
     // (before symbols_init) it carries the 20 ms default, so plugins must
     // guard against the value being smaller than their needed resolution.
     args->base_tick_ns = base_tick_ns;
+
+    // Scan-cycle tracker thunks. Plugins that drive their own periodic
+    // threads (EtherCAT bus thread today) use these to surface their
+    // cycle timing in the STATS endpoint alongside the IEC task entries.
+    args->tracker_size       = plugin_tracker_size;
+    args->tracker_init       = plugin_tracker_init;
+    args->tracker_cleanup    = plugin_tracker_cleanup;
+    args->tracker_start      = plugin_tracker_start;
+    args->tracker_end        = plugin_tracker_end;
+    args->tracker_register   = plugin_tracker_register;
+    args->tracker_unregister = plugin_tracker_unregister;
 
     // printf("[PLUGIN]: Runtime args initialized:\n");
     // printf("[PLUGIN]:   buffer_size = %d\n", args->buffer_size);

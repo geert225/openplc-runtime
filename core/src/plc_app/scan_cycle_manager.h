@@ -62,9 +62,19 @@ void scan_cycle_tracker_end(scan_cycle_tracker_t *tracker);
  * completed at least one full cycle (snapshot is meaningful). */
 bool scan_cycle_tracker_snapshot(scan_cycle_tracker_t *tracker, plc_timing_stats_t *out);
 
-/* Format the multi-task STATS response. Walks plc_tasks[] and emits
- * `STATS:{"tasks":[{...},{...}]}`. Returns chars written excluding the
- * null terminator. */
+/* Register a tracker under a stable name so it appears in the STATS
+ * response alongside the IEC task entries. Used by native plugins that
+ * spawn their own periodic threads (e.g. the EtherCAT bus thread) so
+ * their cycle timing is observable from the editor. The tracker pointer
+ * must outlive the registration; the plugin is responsible for calling
+ * `scan_cycle_tracker_unregister` before the tracker is destroyed.
+ * Returns 0 on success, non-zero on out-of-room or duplicate name. */
+int scan_cycle_tracker_register(const char *name, scan_cycle_tracker_t *tracker);
+void scan_cycle_tracker_unregister(scan_cycle_tracker_t *tracker);
+
+/* Format the multi-task STATS response. Walks plc_tasks[] plus the
+ * registered plugin trackers and emits `STATS:{"tasks":[{...},{...}]}`.
+ * Returns chars written excluding the null terminator. */
 int format_timing_stats_response(char *buffer, size_t buffer_size);
 
 #ifdef __cplusplus

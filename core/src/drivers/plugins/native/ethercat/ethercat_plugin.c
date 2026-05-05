@@ -16,11 +16,17 @@
  * Phase 3: Synchronous process data exchange within PLC scan cycle
  *
  * Architecture:
- *   - Process data exchange runs synchronously inside the PLC scan cycle
- *     via cycle_start/cycle_end hooks, sharing the PLC thread's timing.
- *   - cycle_start: writes outputs, exchanges process data, reads inputs
- *   - cycle_end: (no-op, outputs are sent at the start of the next cycle)
- *   - No separate EtherCAT thread or shadow buffer is needed.
+ *   - Each master owns a dedicated `ecat_bus_thread` running at
+ *     SCHED_FIFO with the configured taskPriority. The thread sleeps
+ *     absolutely (CLOCK_MONOTONIC + TIMER_ABSTIME) to its next deadline
+ *     so jitter stays bounded.
+ *   - Per cycle: brief mutex window to copy outputs PLC→IOmap, release
+ *     mutex, run the SOEM exchange (no PLC mutex held), brief mutex
+ *     window again to copy inputs IOmap→PLC. Splits the I/O window so
+ *     IEC scan tasks aren't blocked across the network round-trip.
+ *   - Per-master scan_cycle_tracker registered with the runtime so
+ *     STATS reports bus cycle timing alongside the IEC tasks.
+ *   - The legacy cycle_start/cycle_end plugin hooks are gone.
  */
 
 #include <ctype.h>
@@ -801,13 +807,51 @@ static int start_single_master(ecat_master_instance_t *inst)
     }
 #endif
 
+    /* Allocate and register the per-master scan-cycle tracker so the bus
+     * cycle timing surfaces in STATS. Sized via the runtime thunk so the
+     * concrete struct layout stays opaque to the plugin. */
+    if (g_runtime_args.tracker_size && g_runtime_args.tracker_init) {
+        size_t tsize = g_runtime_args.tracker_size();
+        inst->bus_tracker = calloc(1, tsize);
+        if (inst->bus_tracker) {
+            int64_t interval_ns = (int64_t)inst->config.master.cycle_time_us * 1000LL;
+            if (interval_ns <= 0) interval_ns = 1000000LL;
+            if (g_runtime_args.tracker_init(inst->bus_tracker, interval_ns) != 0) {
+                plugin_logger_warn(&g_logger,
+                    "Master '%s': tracker_init failed — bus stats will be unavailable",
+                    inst->name);
+                free(inst->bus_tracker);
+                inst->bus_tracker = NULL;
+            } else {
+                snprintf(inst->tracker_name, sizeof inst->tracker_name,
+                         "ecat-%s", inst->name);
+                if (g_runtime_args.tracker_register) {
+                    g_runtime_args.tracker_register(inst->tracker_name, inst->bus_tracker);
+                }
+            }
+        }
+    }
+
     /* Silence the IP stack on the EtherCAT NIC. Reverted in stop_single_master. */
     apply_iface_isolation(inst, &g_logger);
 
+    /* Spawn the dedicated bus thread. SCHED_FIFO + absolute clock_nanosleep
+     * driving the SOEM exchange at master.cycle_time_us. */
+    atomic_store(&inst->bus_running, true);
+    if (pthread_create(&inst->bus_thread, NULL, ecat_bus_thread, inst) != 0) {
+        plugin_logger_error(&g_logger,
+            "Master '%s': Failed to create bus thread: %s",
+            inst->name, strerror(errno));
+        atomic_store(&inst->bus_running, false);
+        atomic_store(&inst->plugin_state, ECAT_STATE_ERROR);
+        return -1;
+    }
+
     plugin_logger_info(&g_logger,
         "Master '%s': [state: OPERATIONAL] EtherCAT master started "
-        "(synchronous exchange, monitor=%s)",
-        inst->name, ECAT_ENABLE_MONITOR_THREAD ? "enabled" : "disabled");
+        "(dedicated bus thread, cycle=%d us, monitor=%s)",
+        inst->name, inst->config.master.cycle_time_us,
+        ECAT_ENABLE_MONITOR_THREAD ? "enabled" : "disabled");
 
     return 0;
 }
@@ -831,6 +875,29 @@ static void stop_single_master(ecat_master_instance_t *inst)
     plugin_logger_info(&g_logger,
         "Master '%s': Stopping (current state: %s)...",
         inst->name, ecat_state_to_string(state));
+
+    /* Stop the bus thread first so no further SOEM exchange races with
+     * teardown. Signal via the running flag, then SIGUSR1 to wake any
+     * in-flight clock_nanosleep, then join. */
+    if (atomic_load(&inst->bus_running)) {
+        atomic_store(&inst->bus_running, false);
+        pthread_kill(inst->bus_thread, SIGUSR1);
+        pthread_join(inst->bus_thread, NULL);
+        plugin_logger_debug(&g_logger,
+            "Master '%s': Bus thread joined", inst->name);
+    }
+
+    /* Unregister and free the cycle tracker. */
+    if (inst->bus_tracker) {
+        if (g_runtime_args.tracker_unregister) {
+            g_runtime_args.tracker_unregister(inst->bus_tracker);
+        }
+        if (g_runtime_args.tracker_cleanup) {
+            g_runtime_args.tracker_cleanup(inst->bus_tracker);
+        }
+        free(inst->bus_tracker);
+        inst->bus_tracker = NULL;
+    }
 
 #if ECAT_ENABLE_MONITOR_THREAD
     /* Stop the monitor thread before closing the master */
@@ -877,32 +944,33 @@ static void stop_single_master(ecat_master_instance_t *inst)
 }
 
 /**
- * @brief Run one cycle for a single master instance
+ * @brief Perform one EtherCAT cycle for a single master instance
  *
- * Performs synchronous EtherCAT process data exchange:
- *   1. Writes PLC outputs (from previous cycle) into the real IOmap
- *   2. Exchanges process data with all slaves via SOEM
- *   3. Reads received inputs from the IOmap into PLC input buffers
- *   4. Tracks WKC errors (no blocking SOEM calls)
+ * Called by the dedicated bus thread on every cycle. Splits the I/O
+ * window into two short mutex windows separated by the actual SOEM
+ * exchange (which is the slow part — tens to hundreds of microseconds
+ * for typical networks):
  *
- * @param inst Per-master instance
+ *   1. lock buffer_mutex → copy PLC outputs into IOmap → unlock
+ *   2. SOEM exchange (no mutex held — IEC tasks can run during it)
+ *   3. lock buffer_mutex → copy IOmap inputs into PLC buffers → unlock
+ *   4. Update WKC + diagnostics
+ *
+ * The IOmap is owned by the plugin (this thread + monitor thread via
+ * `request_soem_access`) so it never crosses the PLC mutex.
+ *
+ * Returns true on a successful exchange, false on a skip (e.g. the
+ * monitor thread holds exclusive SOEM access right now).
  */
-static void cycle_start_single(ecat_master_instance_t *inst)
+static bool ecat_run_one_cycle(ecat_master_instance_t *inst)
 {
     int state = atomic_load(&inst->plugin_state);
     if (state != ECAT_STATE_OPERATIONAL && state != ECAT_STATE_RECOVERING)
-        return;
-
-    /* Task-based scheduling: skip cycles that don't align with the task interval.
-     * tick_divisor is always >= 1; when 1 the modulo is always 0 (no skip). */
-    if ((inst->cycle_counter % inst->tick_divisor) != 0) {
-        inst->cycle_counter++;
-        return;
-    }
+        return false;
 
     uint8_t *iomap = ecat_master_get_iomap(inst);
     if (!iomap)
-        return;
+        return false;
 
 #if ECAT_ENABLE_MONITOR_THREAD
     /* If the monitor thread needs exclusive SOEM access, yield this cycle.
@@ -910,14 +978,23 @@ static void cycle_start_single(ecat_master_instance_t *inst)
     if (atomic_load(&inst->soem_pause_requested)) {
         atomic_store(&inst->soem_paused, true);
         atomic_fetch_add(&inst->exchange_skips, 1);
-        return;
+        return false;
     }
 #endif
 
-    /* 1. Write PLC outputs to IOmap (from previous cycle's computation) */
+    /* 1. Lock briefly, snapshot outputs from PLC buffers into the IOmap.
+     *    This is a pure memcpy — microseconds — so we don't hold the
+     *    image-tables mutex across the SOEM exchange. */
+    if (g_runtime_args.mutex_take && g_runtime_args.buffer_mutex) {
+        g_runtime_args.mutex_take(g_runtime_args.buffer_mutex);
+    }
     ecat_io_write_outputs_fast(&inst->transfer_list, iomap);
+    if (g_runtime_args.mutex_give && g_runtime_args.buffer_mutex) {
+        g_runtime_args.mutex_give(g_runtime_args.buffer_mutex);
+    }
 
-    /* 2. Exchange process data with slaves (synchronous) */
+    /* 2. Exchange process data with slaves (synchronous, NO mutex held).
+     *    IEC scan tasks can read/write IO during this window. */
     ec_timet t0, t1;
     osal_get_monotonic_time(&t0);
     int wkc = ecat_master_exchange_processdata(inst, inst->receive_timeout_us);
@@ -925,8 +1002,15 @@ static void cycle_start_single(ecat_master_instance_t *inst)
 
     inst->diag.exchange_ns = elapsed_ns(&t0, &t1);
 
-    /* 3. Read received inputs into PLC buffers */
+    /* 3. Lock again briefly, copy received inputs from IOmap into PLC
+     *    buffers. */
+    if (g_runtime_args.mutex_take && g_runtime_args.buffer_mutex) {
+        g_runtime_args.mutex_take(g_runtime_args.buffer_mutex);
+    }
     ecat_io_read_inputs_fast(&inst->transfer_list, iomap);
+    if (g_runtime_args.mutex_give && g_runtime_args.buffer_mutex) {
+        g_runtime_args.mutex_give(g_runtime_args.buffer_mutex);
+    }
 
     inst->cycle_counter++;
 
@@ -1001,6 +1085,87 @@ static void cycle_start_single(ecat_master_instance_t *inst)
             total_cycles > 0
                 ? (inst->diag.wkc_error_count * 100.0 / total_cycles) : 0.0);
     }
+    return true;
+}
+
+/* SIGUSR1 wakes the bus thread out of clock_nanosleep so a stop request
+ * lands within microseconds instead of after a full sleep period. */
+static void ecat_bus_sigusr1_noop(int sig)
+{
+    (void)sig;
+}
+
+/**
+ * @brief Bus thread body — periodic SOEM exchange driver
+ *
+ * Runs at SCHED_FIFO with the configured taskPriority. Sleeps absolutely
+ * (CLOCK_MONOTONIC + TIMER_ABSTIME) to the next deadline so jitter stays
+ * bounded. Each tick: tracker_start → ecat_run_one_cycle → tracker_end →
+ * advance deadline. Tracker timing is reported via the runtime's STATS
+ * endpoint under the registered "ecat-<master>" name.
+ */
+static void *ecat_bus_thread(void *arg)
+{
+    ecat_master_instance_t *inst = (ecat_master_instance_t *)arg;
+
+    /* Set thread name for top/htop debugging. */
+    char tname[16];
+    snprintf(tname, sizeof tname, "ecat-%s", inst->name);
+    pthread_setname_np(pthread_self(), tname);
+
+    /* Apply SCHED_FIFO at the configured priority. Fall back to the
+     * default scheduler with a warning rather than refusing to run. */
+    int prio = inst->config.master.task_priority;
+    if (prio < 1)  prio = 1;
+    if (prio > 99) prio = 99;
+    struct sched_param sp = {0};
+    sp.sched_priority = prio;
+    if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0) {
+        plugin_logger_warn(&g_logger,
+            "Bus thread '%s': SCHED_FIFO(%d) failed: %s — running with default scheduling",
+            inst->name, prio, strerror(errno));
+    } else {
+        plugin_logger_info(&g_logger,
+            "Bus thread '%s': SCHED_FIFO priority %d", inst->name, prio);
+    }
+
+    /* SIGUSR1 wake-up signal so stop_loop can break us out of nanosleep. */
+    struct sigaction sa = {0};
+    sa.sa_handler = ecat_bus_sigusr1_noop;
+    sigaction(SIGUSR1, &sa, NULL);
+
+    int64_t interval_ns =
+        (int64_t)inst->config.master.cycle_time_us * 1000LL;
+    if (interval_ns <= 0) interval_ns = 1000000LL; /* 1 ms safety floor */
+
+    struct timespec next_wakeup;
+    clock_gettime(CLOCK_MONOTONIC, &next_wakeup);
+
+    while (atomic_load(&inst->bus_running)) {
+        if (g_runtime_args.tracker_start && inst->bus_tracker) {
+            g_runtime_args.tracker_start(inst->bus_tracker);
+        }
+
+        ecat_run_one_cycle(inst);
+
+        if (g_runtime_args.tracker_end && inst->bus_tracker) {
+            g_runtime_args.tracker_end(inst->bus_tracker);
+        }
+
+        next_wakeup.tv_nsec += (long)(interval_ns % 1000000000LL);
+        next_wakeup.tv_sec  += (time_t)(interval_ns / 1000000000LL);
+        if (next_wakeup.tv_nsec >= 1000000000L) {
+            next_wakeup.tv_nsec -= 1000000000L;
+            next_wakeup.tv_sec  += 1;
+        }
+        int rc = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_wakeup, NULL);
+        if (rc == EINTR) continue; /* SIGUSR1 wake — loop will re-check bus_running */
+    }
+
+    plugin_logger_info(&g_logger,
+        "Bus thread '%s': stopped after %llu cycles",
+        inst->name, (unsigned long long)inst->cycle_counter);
+    return NULL;
 }
 
 /*
@@ -1087,23 +1252,10 @@ int init(void *args)
             return -1;
         }
 
-        /* Calculate tick divisor for task-based scheduling.
-         * A divisor of 1 means "execute every cycle" (the default). */
-        inst->tick_divisor = 1;
-        if (inst->config.master.task_cycle_time_us > 0 &&
-            g_runtime_args.base_tick_ns > 0) {
-            unsigned long long task_ns =
-                (unsigned long long)inst->config.master.task_cycle_time_us * 1000ULL;
-            unsigned int divisor = (unsigned int)(task_ns / g_runtime_args.base_tick_ns);
-            if (divisor > 1)
-                inst->tick_divisor = divisor;
-            plugin_logger_info(&g_logger,
-                "Master[%d] '%s': task=%s, task_cycle=%d us, base_tick=%llu ns, divisor=%u",
-                i, inst->name, inst->config.master.task_name,
-                inst->config.master.task_cycle_time_us,
-                (unsigned long long)g_runtime_args.base_tick_ns,
-                inst->tick_divisor);
-        }
+        /* Bus timing is now driven by the dedicated bus thread spawned
+         * in start_single_master, ticking absolutely at
+         * master.cycle_time_us under SCHED_FIFO. The legacy
+         * tick_divisor / IEC-task-anchored model is gone. */
 
         atomic_store(&inst->plugin_state, ECAT_STATE_IDLE);
 
@@ -1301,30 +1453,12 @@ void cleanup(void)
     plugin_logger_info(&g_logger, "EtherCAT plugin cleanup complete");
 }
 
-/**
- * @brief Called at the start of each PLC scan cycle
- *
- * Iterates all master instances and performs synchronous process data
- * exchange for each one that is in OPERATIONAL or RECOVERING state.
- */
-void cycle_start(void)
-{
-    for (int i = 0; i < g_master_count; i++) {
-        cycle_start_single(&g_masters[i]);
-    }
-}
-
-/**
- * @brief Called at the end of each PLC scan cycle
- *
- * Output data is written to the IOmap at the beginning of cycle_start()
- * (before the exchange), so this hook is intentionally a no-op.
- */
-void cycle_end(void)
-{
-    /* Outputs are written at the start of the next cycle_start() so they
-     * are sent in the same SOEM exchange that receives fresh inputs. */
-}
+/* Note: the legacy `cycle_start` / `cycle_end` plugin entry points
+ * have been removed. Bus timing is now owned by the per-master
+ * `ecat_bus_thread`, ticking absolutely at master.cycle_time_us under
+ * SCHED_FIFO. The plugin driver loads the .so via dlsym and tolerates
+ * missing cycle hooks (logged as "(optional)" at startup), so dropping
+ * the symbols is a no-op for the loader. */
 
 /*
  * =============================================================================
