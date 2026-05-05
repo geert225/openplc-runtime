@@ -1,15 +1,27 @@
 /**
  * @file ethercat_iface_state.c
- * @brief Implementation of ethercat_iface_state.h (consolidated NIC tuning
- *        + IP-stack isolation with crash-recovery persistence).
+ * @brief Implementation of ethercat_iface_state.h.
  *
- * On Linux this file owns three external mechanisms:
- *   - ethtool -C / -K   (NIC coalescing and offloads)
- *   - iptables -I/-D    (drop IP traffic on the EtherCAT NIC)
- *   - sysctl IPv6       (disable_ipv6 on the NIC)
+ * This module owns the NIC tuning the EtherCAT bus thread depends on:
+ *   - ethtool -C  (interrupt coalescing: rx-usecs / tx-usecs = 0)
+ *   - ethtool -K  (offload aggregation: GRO / GSO / TSO off)
+ *
+ * Both are runtime-only NIC settings (not persisted across reboots by
+ * the OS), so the only correctness concern is making sure a graceful
+ * shutdown — and a *crashed* runtime's next start — both restore them
+ * to the values that were in effect before the master was brought up.
+ * That's what the `/run/runtime/ecat_iface_<iface>.state` file is for:
+ * we write the captured "before" values there, and the next apply call
+ * checks for a leftover file and rolls back before re-applying.
  *
  * On non-Linux platforms apply/revert are no-ops; the SOEM raw socket
  * is the only thing that interacts with the NIC there.
+ *
+ * Earlier versions of this module also disabled IPv6 and inserted an
+ * iptables INPUT DROP rule on the EtherCAT NIC — those took out the
+ * user's only management path on single-NIC systems and were removed.
+ * The legacy state files those versions wrote are still detected on
+ * apply (`migrate_legacy_iso`) and rolled back, so upgrades self-heal.
  */
 
 #include "ethercat_iface_state.h"
@@ -30,59 +42,10 @@
 #define ECAT_IFACE_STATE_DIR  "/run/runtime"
 #define ECAT_IFACE_STATE_FMT  ECAT_IFACE_STATE_DIR "/ecat_iface_%s.state"
 
-/* Legacy persistence files from the pre-consolidation versions.  Detected
- * on apply, reverted, and removed before we proceed with the unified flow. */
+/* Legacy persistence files from earlier versions. Detected on apply,
+ * reverted, and removed before the current flow runs. */
 #define ECAT_LEGACY_NIC_FMT   ECAT_IFACE_STATE_DIR "/ecat_nic_saved_%s.conf"
 #define ECAT_LEGACY_ISO_FMT   ECAT_IFACE_STATE_DIR "/ecat_iface_iso_%s.state"
-
-/* ------------------------------------------------------------------ */
-/*  ipv6 sysctl                                                        */
-/* ------------------------------------------------------------------ */
-
-static int read_ipv6_disabled(const char *iface)
-{
-    char path[160];
-    snprintf(path, sizeof(path),
-             "/proc/sys/net/ipv6/conf/%s/disable_ipv6", iface);
-    FILE *f = fopen(path, "r");
-    if (!f) return -1;
-    int v = -1;
-    if (fscanf(f, "%d", &v) != 1) v = -1;
-    fclose(f);
-    return v;
-}
-
-static int write_ipv6_disabled(const char *iface, int value)
-{
-    char path[160];
-    snprintf(path, sizeof(path),
-             "/proc/sys/net/ipv6/conf/%s/disable_ipv6", iface);
-    FILE *f = fopen(path, "w");
-    if (!f) return -1;
-    int rc = (fprintf(f, "%d\n", value) > 0) ? 0 : -1;
-    fclose(f);
-    return rc;
-}
-
-/* ------------------------------------------------------------------ */
-/*  iptables                                                           */
-/* ------------------------------------------------------------------ */
-
-static int iptables_delete(const char *iface)
-{
-    char *argv[] = {
-        "iptables", "-D", "INPUT", "-i", (char *)iface, "-j", "DROP", NULL
-    };
-    return ecat_run_argv("iptables", argv, NULL, 0);
-}
-
-static int iptables_insert(const char *iface)
-{
-    char *argv[] = {
-        "iptables", "-I", "INPUT", "1", "-i", (char *)iface, "-j", "DROP", NULL
-    };
-    return ecat_run_argv("iptables", argv, NULL, 0);
-}
 
 /* ------------------------------------------------------------------ */
 /*  ethtool output parsing                                             */
@@ -126,7 +89,7 @@ static int parse_ethtool_bool(const char *output, const char *key, int *value)
 }
 
 /* ------------------------------------------------------------------ */
-/*  NIC capture / apply                                                */
+/*  NIC capture / apply / restore                                      */
 /* ------------------------------------------------------------------ */
 
 static void capture_nic_settings(ecat_iface_state_t *s, plugin_logger_t *logger)
@@ -276,8 +239,6 @@ static void persist_state(const ecat_iface_state_t *s, plugin_logger_t *logger)
     }
 
     fprintf(fp, "iface=%s\n", s->iface);
-    fprintf(fp, "iptables_added=%d\n", s->iptables_added ? 1 : 0);
-    fprintf(fp, "ipv6_disabled_by_us=%d\n", s->ipv6_disabled_by_us ? 1 : 0);
     if (s->coalescing_saved) {
         fprintf(fp, "rx_usecs=%d\n", s->rx_usecs);
         fprintf(fp, "tx_usecs=%d\n", s->tx_usecs);
@@ -331,11 +292,7 @@ static bool load_state(const char *iface, ecat_iface_state_t *s)
         *eq = '\0';
         const char *key = line;
         const char *val = eq + 1;
-        if (strcmp(key, "iptables_added") == 0) {
-            s->iptables_added = (atoi(val) != 0);
-        } else if (strcmp(key, "ipv6_disabled_by_us") == 0) {
-            s->ipv6_disabled_by_us = (atoi(val) != 0);
-        } else if (strcmp(key, "rx_usecs") == 0) {
+        if (strcmp(key, "rx_usecs") == 0) {
             s->rx_usecs = atoi(val);
             s->coalescing_saved = true;
         } else if (strcmp(key, "tx_usecs") == 0) {
@@ -415,9 +372,37 @@ static void migrate_legacy_nic(const char *iface, plugin_logger_t *logger)
 }
 
 /*
- * If an iface-isolation file from the pre-consolidation version exists,
- * parse it, undo iptables / ipv6, and remove the file.
+ * If an iface-isolation file from a previous version exists (the one
+ * that recorded iptables INPUT DROP and IPv6 sysctl flips), undo what
+ * it describes and delete it.  Done as a pure migration concern: this
+ * runtime never inserts iptables rules nor flips IPv6 sysctls itself.
+ *
+ * Run with `iptables -t filter -D INPUT -i <iface> -j DROP` and write
+ * 0 back to the IPv6 disable_ipv6 sysctl.  Both ops are best-effort —
+ * if iptables isn't present (e.g. nftables-only host) or the IPv6
+ * sysfs path doesn't exist, just skip and remove the stale file so
+ * the warning doesn't repeat on every restart.
  */
+static int legacy_iptables_delete(const char *iface)
+{
+    char *argv[] = {
+        "iptables", "-D", "INPUT", "-i", (char *)iface, "-j", "DROP", NULL
+    };
+    return ecat_run_argv("iptables", argv, NULL, 0);
+}
+
+static int legacy_write_ipv6_disabled(const char *iface, int value)
+{
+    char path[160];
+    snprintf(path, sizeof(path),
+             "/proc/sys/net/ipv6/conf/%s/disable_ipv6", iface);
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+    int rc = (fprintf(f, "%d\n", value) > 0) ? 0 : -1;
+    fclose(f);
+    return rc;
+}
+
 static void migrate_legacy_iso(const char *iface, plugin_logger_t *logger)
 {
     char path[160];
@@ -450,9 +435,9 @@ static void migrate_legacy_iso(const char *iface, plugin_logger_t *logger)
     fclose(fp);
 
     if (ipt)
-        iptables_delete(iface);
+        legacy_iptables_delete(iface);
     if (ipv6)
-        write_ipv6_disabled(iface, 0);
+        legacy_write_ipv6_disabled(iface, 0);
     unlink(path);
 }
 
@@ -468,18 +453,12 @@ static void recover_from_crash(const char *iface, plugin_logger_t *logger)
 
     plugin_logger_warn(logger,
         "Found stale iface state for %s "
-        "(iptables=%d, ipv6=%d, coalescing_saved=%d, offloads_saved=%d) - "
+        "(coalescing_saved=%d, offloads_saved=%d) - "
         "previous process likely crashed.  Reverting before re-applying.",
         iface,
-        (int)prev.iptables_added, (int)prev.ipv6_disabled_by_us,
         (int)prev.coalescing_saved, (int)prev.offloads_saved);
 
-    if (prev.iptables_added)
-        iptables_delete(iface);
-    if (prev.ipv6_disabled_by_us)
-        write_ipv6_disabled(iface, 0);
     restore_nic_settings(&prev, logger);
-
     remove_state_file(iface);
 }
 
@@ -498,8 +477,8 @@ void ecat_iface_state_apply(ecat_iface_state_t *state, const char *iface,
     if (!ecat_iface_validate(iface, ECAT_IFACE_LINUX_STRICT)) {
         plugin_logger_warn(logger,
             "iface '%s' not a valid Linux interface name -- "
-            "NIC tuning (ethtool) and IP-stack isolation (iptables, IPv6) "
-            "are disabled for this master.  Jitter may be higher.",
+            "NIC tuning (ethtool) is disabled for this master.  "
+            "Jitter may be higher.",
             iface);
         return;
     }
@@ -517,33 +496,6 @@ void ecat_iface_state_apply(ecat_iface_state_t *state, const char *iface,
     /* Capture the live NIC settings before we change them */
     capture_nic_settings(state, logger);
 
-    /* IPv6: only flip if currently enabled, so we never undo an operator
-     * setting that was already disabled. */
-    int ipv6 = read_ipv6_disabled(iface);
-    if (ipv6 == 0) {
-        if (write_ipv6_disabled(iface, 1) == 0) {
-            state->ipv6_disabled_by_us = true;
-            plugin_logger_info(logger,
-                "%s: disabled IPv6 (jitter isolation)", iface);
-        } else {
-            plugin_logger_warn(logger,
-                "%s: could not disable IPv6", iface);
-        }
-    } else if (ipv6 == 1) {
-        plugin_logger_debug(logger, "%s: IPv6 already disabled", iface);
-    }
-
-    /* Delete-then-insert keeps the rule unique across re-runs */
-    iptables_delete(iface);
-    if (iptables_insert(iface) == 0) {
-        state->iptables_added = true;
-        plugin_logger_info(logger,
-            "%s: inserted iptables INPUT DROP (jitter isolation)", iface);
-    } else {
-        plugin_logger_warn(logger,
-            "%s: iptables -I INPUT failed -- isolation skipped", iface);
-    }
-
     /* Apply low-latency NIC tuning */
     apply_low_latency_nic(iface, logger);
 
@@ -557,17 +509,6 @@ void ecat_iface_state_revert(ecat_iface_state_t *state, plugin_logger_t *logger)
         return;
 
     /* Only undo what we applied, in reverse order */
-    if (state->iptables_added) {
-        iptables_delete(state->iface);
-        plugin_logger_info(logger,
-            "%s: removed iptables INPUT DROP", state->iface);
-        state->iptables_added = false;
-    }
-    if (state->ipv6_disabled_by_us) {
-        write_ipv6_disabled(state->iface, 0);
-        plugin_logger_info(logger, "%s: re-enabled IPv6", state->iface);
-        state->ipv6_disabled_by_us = false;
-    }
     restore_nic_settings(state, logger);
     state->coalescing_saved = false;
     state->offloads_saved = false;

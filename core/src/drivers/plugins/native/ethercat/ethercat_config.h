@@ -429,19 +429,21 @@ typedef struct {
 #define ECAT_AVG_EWMA_SHIFT 5
 
 /**
- * @brief Per-interface external state captured by ecat_iface_state_apply().
+ * @brief Per-interface NIC tuning state captured by ecat_iface_state_apply().
  *
- * Combines NIC-tuning save/restore (ethtool coalescing + offloads) and
- * IP-stack isolation (iptables INPUT DROP, IPv6 sysctl) into a single
- * struct, embedded in each ecat_master_instance_t.  See
- * ethercat_iface_state.h for the apply/revert API.
+ * Holds the pre-EtherCAT NIC settings (ethtool coalescing + offloads) so
+ * `ecat_iface_state_revert()` can roll them back on graceful shutdown,
+ * and so the next runtime start can recover from a crash. Embedded in
+ * each `ecat_master_instance_t`. See ethercat_iface_state.h for the
+ * apply/revert API.
+ *
+ * IP-stack isolation (iptables INPUT DROP, IPv6 sysctl) used to live
+ * here too; it was removed because it took out the user's only
+ * management path on single-NIC systems (Pi 4) and the win it bought
+ * — a few µs of softirq pressure relief — wasn't worth the cost.
  */
 typedef struct {
     char iface[ECAT_IFNAME_MAX];
-
-    /* IP-stack isolation */
-    bool ipv6_disabled_by_us;
-    bool iptables_added;
 
     /* NIC tuning -- ethtool -C (coalescing) */
     bool coalescing_saved;
