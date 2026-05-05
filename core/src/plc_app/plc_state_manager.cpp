@@ -510,6 +510,11 @@ extern "C" int load_plc_program(PluginManager *pm)
             plc_state = PLC_STATE_ERROR;
             pthread_mutex_unlock(&state_mutex);
             log_info("PLC State: ERROR");
+            // Drop the manager so the next RUNNING transition re-runs
+            // find_libplc_file. See the comment on the dlopen-failure
+            // branch below for the full reasoning.
+            if (pm == plc_program) plc_program = NULL;
+            plugin_manager_destroy(pm);
             return -1;
         }
 
@@ -522,6 +527,14 @@ extern "C" int load_plc_program(PluginManager *pm)
         plc_state = PLC_STATE_EMPTY;
         pthread_mutex_unlock(&state_mutex);
         log_info("PLC State: EMPTY");
+        // Without this, plc_program survives the failed dlopen with a
+        // stale so_path. The build script rotates the libplc filename
+        // (libplc_<ns_timestamp>.so) on every successful build, so the
+        // next "Start PLC" would reuse the deleted path and fail with
+        // `cannot open shared object file`. Drop the manager and let
+        // plc_set_state(RUNNING) re-run find_libplc_file next time.
+        if (pm == plc_program) plc_program = NULL;
+        plugin_manager_destroy(pm);
         return -1;
     }
 }
