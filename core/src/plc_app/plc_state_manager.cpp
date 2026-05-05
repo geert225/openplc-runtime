@@ -390,7 +390,14 @@ void *plc_cycle_thread(void *arg)
                 ctx->cpu_affinity_mask = 0;       /* Phase 8 will plumb this from CPU_AFFINITY */
                 ctx->is_fastest_task   = false;   /* set below */
                 ctx->task_handle       = &tk;
-                std::snprintf(ctx->name, sizeof ctx->name, "plc-task-%zu", flat_idx);
+                if (tk.name && tk.name[0] != '\0')
+                {
+                    std::snprintf(ctx->name, sizeof ctx->name, "%s", tk.name);
+                }
+                else
+                {
+                    std::snprintf(ctx->name, sizeof ctx->name, "plc-task-%zu", flat_idx);
+                }
                 ctx->heartbeat.store(now_t, std::memory_order_relaxed);
                 ctx->local_tick.store(0,    std::memory_order_relaxed);
                 if (scan_cycle_tracker_init(&ctx->tracker, ctx->interval_ns) != 0)
