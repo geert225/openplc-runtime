@@ -1,27 +1,18 @@
 /**
  * @file ethercat_iface_state.h
- * @brief Unified per-interface external-state manager for the EtherCAT plugin.
+ * @brief Per-interface NIC-tuning state manager for the EtherCAT plugin.
  *
- * Consolidates two mechanisms that previously lived in separate places
- * with the same shape:
- *
- *   - NIC tuning save/restore (ethtool -c / -k / -C / -K).
- *     Originally in ethercat_master.c (~460 lines).
- *
- *   - IP-stack isolation (iptables INPUT DROP, IPv6 sysctl flip).
- *     Originally in ethercat_plugin.c (~280 lines).
- *
- * Both shared the same crash-recovery pattern (atomic write+rename in
- * /run/runtime, file-on-disk serves as a reliquia after a SIGKILL or
- * OOM so the next start can roll back what was applied).  This module
- * folds them into a single state struct, a single persistence file per
- * interface, and a single apply/revert pair.
+ * Saves the NIC's pre-EtherCAT settings (ethtool -c / -k coalescing
+ * and offloads), applies the low-latency tuning the bus thread needs
+ * (rx/tx-usecs=0, GRO/GSO/TSO off), and persists the captured "before"
+ * values to /run/runtime so a crashed runtime's next start can revert
+ * the system to its original state.
  *
  * Persistence file:  /run/runtime/ecat_iface_<iface>.state
  *
- * Migration: legacy files (ecat_nic_saved_<iface>.conf,
- * ecat_iface_iso_<iface>.state) from earlier versions are detected on
- * apply, reverted, and removed before the unified flow runs.
+ * Migration: legacy NIC state file (ecat_nic_saved_<iface>.conf) from
+ * the pre-consolidation version of this module is detected on apply,
+ * reverted, and removed before the current flow runs.
  */
 
 #ifndef ETHERCAT_IFACE_STATE_H
@@ -35,15 +26,14 @@ extern "C" {
 #endif
 
 /**
- * @brief Apply low-latency NIC tuning + IP-stack isolation.
+ * @brief Apply low-latency NIC tuning.
  *
  * Sequence:
- *   1. Migrate legacy state files (older format) and revert anything
- *      they describe.
+ *   1. Migrate the legacy NIC state file (older format) and revert
+ *      anything it describes.
  *   2. Recover from the unified state file if a previous run crashed.
- *   3. Capture current NIC settings.
- *   4. Apply low-latency settings (rx/tx usecs = 0, GRO/GSO/TSO off,
- *      iptables INPUT DROP, disable_ipv6 = 1).
+ *   3. Capture current NIC settings (ethtool -c / -k).
+ *   4. Apply low-latency settings (rx/tx-usecs = 0, GRO/GSO/TSO off).
  *   5. Persist the captured "before" values to /run/runtime so a crash
  *      lets the next start undo what we just applied.
  *

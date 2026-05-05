@@ -2,10 +2,10 @@
  * @file ethercat_proc.h
  * @brief Process-spawn helpers for the EtherCAT plugin.
  *
- * Wraps fork+execvp so the plugin can invoke external binaries (ethtool,
- * iptables) without going through a shell. Argv elements are passed
- * verbatim to execvp, so user-controlled strings (e.g. the configured
- * NIC interface name) cannot be reinterpreted as shell metacharacters.
+ * Wraps fork+execvp so the plugin can invoke external binaries (ethtool)
+ * without going through a shell. Argv elements are passed verbatim to
+ * execvp, so user-controlled strings (e.g. the configured NIC interface
+ * name) cannot be reinterpreted as shell metacharacters.
  */
 
 #ifndef ETHERCAT_PROC_H

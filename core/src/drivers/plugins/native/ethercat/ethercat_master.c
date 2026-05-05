@@ -20,9 +20,9 @@
 #include <string.h>
 #include <stdio.h>
 
-/* Low-latency socket option for the SOEM raw socket (Linux only).  All
- * NIC tuning (ethtool coalescing/offloads) and IP-stack isolation
- * (iptables, IPv6 sysctl) lives in ethercat_iface_state.{c,h}. */
+/* Low-latency socket option for the SOEM raw socket (Linux only).
+ * Per-interface NIC tuning (ethtool coalescing/offloads) lives in
+ * ethercat_iface_state.{c,h}. */
 #if !defined(__CYGWIN__) && !defined(_WIN32)
 #include <sys/socket.h>
 #define ECAT_BUSY_POLL_US 50
