@@ -704,6 +704,17 @@ static int start_single_master(ecat_master_instance_t *inst)
     inst->cycle_counter = 0;
     diag_reset(&inst->diag);
 
+    /* Time-based EWMA window in samples — chosen so the wall-clock
+     * smoothing window matches ECAT_AVG_TARGET_WINDOW_NS regardless of
+     * the configured cycle rate. Same scheme as scan_cycle_tracker. */
+    {
+        int64_t cycle_ns = (int64_t)inst->config.master.cycle_time_us * 1000LL;
+        inst->avg_window = (cycle_ns > 0)
+            ? (ECAT_AVG_TARGET_WINDOW_NS / cycle_ns)
+            : 1;
+        if (inst->avg_window < 1) inst->avg_window = 1;
+    }
+
     atomic_store(&inst->plugin_state, ECAT_STATE_OPERATIONAL);
 
     /* Send one initial exchange to populate the IOmap with slave data */
@@ -801,8 +812,8 @@ static void stop_single_master(ecat_master_instance_t *inst)
         atomic_load_explicit(&inst->diag.cycle_count, memory_order_relaxed);
     uint64_t final_wkc_errors =
         atomic_load_explicit(&inst->diag.wkc_error_count, memory_order_relaxed);
-    int64_t  final_avg =
-        atomic_load_explicit(&inst->diag.avg_bus_cycle_ns, memory_order_relaxed);
+    int64_t  final_sum =
+        atomic_load_explicit(&inst->diag.avg_bus_cycle_ns_sum, memory_order_relaxed);
     uint64_t final_min =
         atomic_load_explicit(&inst->diag.min_bus_cycle_ns, memory_order_relaxed);
     uint64_t final_max =
@@ -810,6 +821,9 @@ static void stop_single_master(ecat_master_instance_t *inst)
 
     if (final_cycle_count > 0 || final_wkc_errors > 0) {
         uint64_t total_cycles = final_cycle_count + final_wkc_errors;
+        int64_t  final_avg_ns = (inst->avg_window > 0)
+            ? final_sum / inst->avg_window
+            : 0;
         /* min sentinel UINT64_MAX -> "n/a" */
         unsigned long long min_us = (final_min == UINT64_MAX) ? 0
                                   : (unsigned long long)(final_min / 1000);
@@ -820,7 +834,7 @@ static void stop_single_master(ecat_master_instance_t *inst)
             (unsigned long long)total_cycles,
             (unsigned long long)final_cycle_count,
             (unsigned long long)final_wkc_errors,
-            (long long)(final_avg / 1000),
+            (long long)(final_avg_ns / 1000),
             min_us,
             (unsigned long long)(final_max / 1000));
     }
@@ -954,17 +968,16 @@ static bool ecat_run_one_cycle(ecat_master_instance_t *inst)
 
     atomic_fetch_add_explicit(&inst->diag.cycle_count, 1, memory_order_relaxed);
 
-    /* EWMA: avg += (sample - avg) / 2^SHIFT.  Tracks recent-window jitter
-     * instead of a historical mean (which the previous integer-Welford
-     * loop stalled at once cycle_count grew large).  Division (not signed
-     * right shift) keeps the math portable -- the compiler emits the same
-     * sar sequence on supported targets without invoking the IDB on
-     * negative-operand right shift. */
-    int64_t cur_avg = atomic_load_explicit(&inst->diag.avg_bus_cycle_ns,
+    /* Time-based EWMA: store an approximate sum of the last N samples,
+     * update with `sum += sample - sum/N`, recover avg as `sum/N` on
+     * read.  N = inst->avg_window, fixed for the master's lifetime so
+     * the wall-clock smoothing window stays constant regardless of
+     * cycle rate.  Sum form avoids the integer-precision stall that
+     * `avg += (sample - avg)/N` hits when delta < N. */
+    int64_t cur_sum = atomic_load_explicit(&inst->diag.avg_bus_cycle_ns_sum,
                                            memory_order_relaxed);
-    int64_t delta = (int64_t)exchange_ns - cur_avg;
-    cur_avg += delta / (1 << ECAT_AVG_EWMA_SHIFT);
-    atomic_store_explicit(&inst->diag.avg_bus_cycle_ns, cur_avg,
+    cur_sum += (int64_t)exchange_ns - cur_sum / inst->avg_window;
+    atomic_store_explicit(&inst->diag.avg_bus_cycle_ns_sum, cur_sum,
                           memory_order_relaxed);
 
     /* Min/max: single-writer, no CAS needed. */
@@ -1031,9 +1044,9 @@ static inline uint64_t ts_to_ns(const struct timespec *ts)
  *   - latency_ns: actual_wake[N] - expected_wake[N]; how much later
  *     than its deadline the bus thread actually started running.
  *
- * Updates use the same lock-free atomic + EWMA scheme as bus_cycle_ns
- * (see ECAT_AVG_EWMA_SHIFT).  Single-writer (this thread); JSON readers
- * pull the values lock-free.
+ * Updates use the same lock-free atomic + time-based EWMA scheme as
+ * bus_cycle_ns (see ECAT_AVG_TARGET_WINDOW_NS).  Single-writer (this
+ * thread); JSON readers pull the values lock-free.
  */
 static void *ecat_bus_thread(void *arg)
 {
@@ -1104,11 +1117,11 @@ static void *ecat_bus_thread(void *arg)
             atomic_store_explicit(&inst->diag.max_latency_ns, latency_ns,
                                   memory_order_relaxed);
 
-        /* EWMA — same shape as avg_bus_cycle_ns (see ECAT_AVG_EWMA_SHIFT). */
-        int64_t cur_avg_lat = atomic_load_explicit(&inst->diag.avg_latency_ns,
+        /* Time-based EWMA — same scheme as avg_bus_cycle_ns_sum. */
+        int64_t cur_lat_sum = atomic_load_explicit(&inst->diag.avg_latency_ns_sum,
                                                    memory_order_relaxed);
-        cur_avg_lat += (latency_ns - cur_avg_lat) / (1 << ECAT_AVG_EWMA_SHIFT);
-        atomic_store_explicit(&inst->diag.avg_latency_ns, cur_avg_lat,
+        cur_lat_sum += latency_ns - cur_lat_sum / inst->avg_window;
+        atomic_store_explicit(&inst->diag.avg_latency_ns_sum, cur_lat_sum,
                               memory_order_relaxed);
 
         if (have_prev_wake) {
@@ -1127,11 +1140,10 @@ static void *ecat_bus_thread(void *arg)
                 atomic_store_explicit(&inst->diag.max_period_ns, period_ns,
                                       memory_order_relaxed);
 
-            int64_t cur_avg_per = atomic_load_explicit(&inst->diag.avg_period_ns,
+            int64_t cur_per_sum = atomic_load_explicit(&inst->diag.avg_period_ns_sum,
                                                        memory_order_relaxed);
-            cur_avg_per += ((int64_t)period_ns - cur_avg_per)
-                           / (1 << ECAT_AVG_EWMA_SHIFT);
-            atomic_store_explicit(&inst->diag.avg_period_ns, cur_avg_per,
+            cur_per_sum += (int64_t)period_ns - cur_per_sum / inst->avg_window;
+            atomic_store_explicit(&inst->diag.avg_period_ns_sum, cur_per_sum,
                                   memory_order_relaxed);
         }
         prev_wake_ns   = actual_wake_ns;
@@ -1783,14 +1795,15 @@ static void load_diag_view(const ecat_master_instance_t *inst,
     out->noframe_count = atomic_load_explicit(&inst->diag.noframe_count,
                                               memory_order_relaxed);
 
-    /* Single bus_cycle_ns measurement is exposed under both legacy names
-     * (avg/min/max_cycle_us and min/max_exchange_us) for JSON compatibility
-     * with the Editor.  Both pairs reflect the same exchange (send+receive)
-     * timing — the duplicated naming is preserved to avoid breaking the
-     * existing JSON contract. */
-    int64_t avg = atomic_load_explicit(&inst->diag.avg_bus_cycle_ns,
-                                       memory_order_relaxed);
-    out->avg_cycle_us = (uint64_t)(avg / 1000);
+    /* Time-based EWMA: divide the stored sum by the master's avg_window
+     * to recover the moving average.  Single bus_cycle_ns measurement
+     * is exposed under both legacy names (avg/min/max_cycle_us and
+     * min/max_exchange_us) for JSON compatibility with the Editor. */
+    int64_t window = inst->avg_window > 0 ? inst->avg_window : 1;
+
+    int64_t bus_sum = atomic_load_explicit(&inst->diag.avg_bus_cycle_ns_sum,
+                                           memory_order_relaxed);
+    out->avg_cycle_us = (uint64_t)((bus_sum / window) / 1000);
 
     uint64_t min_bcn = atomic_load_explicit(&inst->diag.min_bus_cycle_ns,
                                             memory_order_relaxed);
@@ -1805,24 +1818,24 @@ static void load_diag_view(const ecat_master_instance_t *inst,
     out->max_exchange_us = max_us;
 
     /* Scheduling stats — captured by the bus thread itself. */
-    int64_t  avg_per_ns = atomic_load_explicit(&inst->diag.avg_period_ns,
+    int64_t  per_sum    = atomic_load_explicit(&inst->diag.avg_period_ns_sum,
                                                memory_order_relaxed);
     uint64_t min_per_ns = atomic_load_explicit(&inst->diag.min_period_ns,
                                                memory_order_relaxed);
     uint64_t max_per_ns = atomic_load_explicit(&inst->diag.max_period_ns,
                                                memory_order_relaxed);
-    int64_t  avg_lat_ns = atomic_load_explicit(&inst->diag.avg_latency_ns,
+    int64_t  lat_sum    = atomic_load_explicit(&inst->diag.avg_latency_ns_sum,
                                                memory_order_relaxed);
     int64_t  min_lat_ns = atomic_load_explicit(&inst->diag.min_latency_ns,
                                                memory_order_relaxed);
     int64_t  max_lat_ns = atomic_load_explicit(&inst->diag.max_latency_ns,
                                                memory_order_relaxed);
 
-    out->avg_period_us  = avg_per_ns / 1000;
+    out->avg_period_us  = (per_sum / window) / 1000;
     out->max_period_us  = (int64_t)(max_per_ns / 1000);
     out->min_period_us  = (min_per_ns == UINT64_MAX) ? 0
                                                      : (int64_t)(min_per_ns / 1000);
-    out->avg_latency_us = avg_lat_ns / 1000;
+    out->avg_latency_us = (lat_sum / window) / 1000;
     out->max_latency_us = max_lat_ns / 1000;
     out->min_latency_us = (min_lat_ns == INT64_MAX) ? 0 : min_lat_ns / 1000;
 }

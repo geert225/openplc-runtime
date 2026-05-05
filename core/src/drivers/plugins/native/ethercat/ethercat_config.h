@@ -409,26 +409,22 @@ typedef struct {
  */
 
 /**
- * @brief EWMA shift for the avg_*_ns counters in ecat_cycle_diag_t.
+ * @brief Target wall-clock window for the time-based EWMA averages, in ns.
  *
- * The moving average update is:  avg += (sample - avg) / (1 << SHIFT),
- * an exponentially-weighted moving average with weight 1 / 2^SHIFT per
- * sample.  Effective window is ~2^SHIFT samples.
+ * Matches the editor's polling cadence so the displayed average stays
+ * stable between consecutive polls and tracks recent drift rather than
+ * decorrelating into "a random number between min and max".  Each master
+ * derives its sample-count window N at start_single_master from
+ * `master.cycle_time_us` and stores it on `inst->avg_window`.  The IEC
+ * scan-cycle tracker uses the same scheme; both systems read consistently.
  *
- * SHIFT=5 -> window of 32 samples:
- *   - cycle 250 us -> 8 ms window  (smooths PDO-cycle jitter)
- *   - cycle 500 us -> 16 ms window
- *   - cycle 1 ms   -> 32 ms window (smooths transient bus events)
+ * Per-cycle update:  sum += sample - sum / N
+ * Read:              avg = sum / N
  *
- * Trade-off: smaller SHIFT is more responsive but noisier; larger SHIFT
- * smooths more but lags behind real drift.  5 is the sweet spot for
- * RT diagnostics where the operator wants "is the bus healthy now?",
- * not "what was the historical mean?".
- *
- * This replaces the integer Welford running mean previously used, which
- * stalls under integer division once cycle_count grows past ~10^7.
+ * Stored as a sum (rather than the incremental `avg += (sample - avg)/N`
+ * shape) because at small deltas the latter rounds to zero and stalls.
  */
-#define ECAT_AVG_EWMA_SHIFT 5
+#define ECAT_AVG_TARGET_WINDOW_NS 2000000000LL
 
 /**
  * @brief Per-interface NIC tuning state captured by ecat_iface_state_apply().
@@ -480,8 +476,12 @@ typedef struct {
  *     Answers "are we actually hitting our 1 ms cycle, and how late
  *     are we waking up?".
  *
- * avg_*_ns fields are EWMAs (see ECAT_AVG_EWMA_SHIFT), not historical
- * means.
+ * The avg_*_ns_sum fields are time-based EWMA accumulators (see
+ * ECAT_AVG_TARGET_WINDOW_NS) — each holds an approximate sum of the last
+ * `inst->avg_window` samples.  Readers divide by `avg_window` to recover
+ * the moving average.  Window is computed from the configured cycle time
+ * at master start so the wall-clock smoothing stays consistent across
+ * different cycle rates.
  */
 typedef struct {
     _Atomic(uint64_t) cycle_count;       /* total cycles executed              */
@@ -489,20 +489,20 @@ typedef struct {
     _Atomic(uint64_t) noframe_count;     /* total EC_NOFRAME (-1) errors       */
 
     /* Work timing -- bus exchange duration */
-    _Atomic(uint64_t) bus_cycle_ns;      /* last send+receive duration (ns)    */
-    _Atomic(uint64_t) max_bus_cycle_ns;  /* worst-case send+receive            */
-    _Atomic(uint64_t) min_bus_cycle_ns;  /* best-case send+receive             */
-    _Atomic(int64_t)  avg_bus_cycle_ns;  /* EWMA (see ECAT_AVG_EWMA_SHIFT)     */
+    _Atomic(uint64_t) bus_cycle_ns;          /* last send+receive duration (ns) */
+    _Atomic(uint64_t) max_bus_cycle_ns;      /* worst-case send+receive         */
+    _Atomic(uint64_t) min_bus_cycle_ns;      /* best-case send+receive          */
+    _Atomic(int64_t)  avg_bus_cycle_ns_sum;  /* EWMA accumulator; avg = sum/N   */
 
     /* Scheduling timing -- period and wake-up latency */
-    _Atomic(uint64_t) period_ns;         /* last observed cycle period (ns)    */
-    _Atomic(uint64_t) max_period_ns;     /* worst-case period                  */
-    _Atomic(uint64_t) min_period_ns;     /* best-case period                   */
-    _Atomic(int64_t)  avg_period_ns;     /* EWMA                               */
-    _Atomic(int64_t)  latency_ns;        /* last wake-up scheduling delay (ns) */
-    _Atomic(int64_t)  max_latency_ns;    /* worst-case wake-up delay           */
-    _Atomic(int64_t)  min_latency_ns;    /* best-case wake-up delay            */
-    _Atomic(int64_t)  avg_latency_ns;    /* EWMA                               */
+    _Atomic(uint64_t) period_ns;             /* last observed cycle period (ns) */
+    _Atomic(uint64_t) max_period_ns;         /* worst-case period               */
+    _Atomic(uint64_t) min_period_ns;         /* best-case period                */
+    _Atomic(int64_t)  avg_period_ns_sum;     /* EWMA accumulator; avg = sum/N   */
+    _Atomic(int64_t)  latency_ns;            /* last wake-up scheduling delay   */
+    _Atomic(int64_t)  max_latency_ns;        /* worst-case wake-up delay        */
+    _Atomic(int64_t)  min_latency_ns;        /* best-case wake-up delay         */
+    _Atomic(int64_t)  avg_latency_ns_sum;    /* EWMA accumulator; avg = sum/N   */
 } ecat_cycle_diag_t;
 
 /*
@@ -678,6 +678,11 @@ typedef struct {
      * /api/discovery/ethercat/{runtime-status,diagnostics} routes. */
     pthread_t              bus_thread;
     _Atomic(bool)          bus_running;
+
+    /* Time-based EWMA window in samples; computed from cycle_time_us at
+     * start_single_master so the wall-clock smoothing window matches
+     * ECAT_AVG_TARGET_WINDOW_NS regardless of configured cycle rate. */
+    int64_t                avg_window;
 
     /* Per-iface external state (NIC tuning + IP-stack isolation).
      * Populated by ecat_iface_state_apply(); consumed by

@@ -16,6 +16,12 @@
 // minutes of continuous operation.
 #define OPENPLC_CLOCK CLOCK_MONOTONIC
 
+// Target wall-clock window for the time-based EWMA averages, in microseconds.
+// Matches the editor's 2 s polling cadence so the displayed avg stays stable
+// between polls and tracks recent drift rather than freezing as a Welford
+// historical mean would after ~10^7 cycles.
+#define EWMA_TARGET_WINDOW_US 2000000
+
 static uint64_t ts_now_us(void)
 {
     struct timespec ts;
@@ -31,6 +37,12 @@ int scan_cycle_tracker_init(scan_cycle_tracker_t *tracker, int64_t interval_ns)
     tracker->stats.cycle_time_min    = INT64_MAX;
     tracker->stats.cycle_latency_min = INT64_MAX;
     tracker->interval_ns             = interval_ns;
+
+    int64_t interval_us = interval_ns / 1000;
+    tracker->avg_window =
+        (interval_us > 0) ? (EWMA_TARGET_WINDOW_US / interval_us) : 1;
+    if (tracker->avg_window < 1) tracker->avg_window = 1;
+
     return init_rt_mutex(&tracker->mutex);
 }
 
@@ -63,13 +75,15 @@ void scan_cycle_tracker_start(scan_cycle_tracker_t *tracker)
     plc_timing_stats_t *s = &tracker->stats;
     if (cycle_time_us < s->cycle_time_min) s->cycle_time_min = cycle_time_us;
     if (cycle_time_us > s->cycle_time_max) s->cycle_time_max = cycle_time_us;
-    s->cycle_time_avg += (cycle_time_us - s->cycle_time_avg) / s->scan_count;
+    tracker->cycle_time_sum +=
+        cycle_time_us - tracker->cycle_time_sum / tracker->avg_window;
 
     // Cycle latency: how far past the projected wakeup we landed
     int64_t latency_us = (int64_t)(now_us - tracker->expected_start_us);
     if (latency_us < s->cycle_latency_min) s->cycle_latency_min = latency_us;
     if (latency_us > s->cycle_latency_max) s->cycle_latency_max = latency_us;
-    s->cycle_latency_avg += (latency_us - s->cycle_latency_avg) / s->scan_count;
+    tracker->cycle_latency_sum +=
+        latency_us - tracker->cycle_latency_sum / tracker->avg_window;
 
     tracker->last_start_us = now_us;
     tracker->expected_start_us += (uint64_t)(tracker->interval_ns / 1000);
@@ -89,7 +103,8 @@ void scan_cycle_tracker_end(scan_cycle_tracker_t *tracker)
     plc_timing_stats_t *s = &tracker->stats;
     if (scan_time_us < s->scan_time_min) s->scan_time_min = scan_time_us;
     if (scan_time_us > s->scan_time_max) s->scan_time_max = scan_time_us;
-    s->scan_time_avg += (scan_time_us - s->scan_time_avg) / s->scan_count;
+    tracker->scan_time_sum +=
+        scan_time_us - tracker->scan_time_sum / tracker->avg_window;
 
     if (now_us > tracker->expected_start_us)
     {
@@ -103,7 +118,10 @@ bool scan_cycle_tracker_snapshot(scan_cycle_tracker_t *tracker, plc_timing_stats
 {
     if (!tracker || !out) return false;
     pthread_mutex_lock(&tracker->mutex);
-    memcpy(out, &tracker->stats, sizeof(*out));
+    *out = tracker->stats;
+    out->scan_time_avg     = tracker->scan_time_sum     / tracker->avg_window;
+    out->cycle_time_avg    = tracker->cycle_time_sum    / tracker->avg_window;
+    out->cycle_latency_avg = tracker->cycle_latency_sum / tracker->avg_window;
     pthread_mutex_unlock(&tracker->mutex);
     return out->scan_count > 0;
 }

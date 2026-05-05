@@ -34,10 +34,22 @@ typedef struct
  *
  * `interval_ns` is this task's scheduling period, used to project the
  * next-expected start time so latency = actual_start - expected_start
- * stays meaningful across tasks with different periods. */
+ * stays meaningful across tasks with different periods.
+ *
+ * Averages use a time-based EWMA targeting a wall-clock window that
+ * matches the editor's polling cadence (so the displayed avg doesn't
+ * decorrelate between consecutive polls). Each `*_sum` field holds an
+ * approximate sum of the last `avg_window` samples; the per-cycle update
+ * is `sum += sample - sum/avg_window` and the read is `avg = sum/avg_window`.
+ * This accumulator-then-divide form avoids the integer-precision stall
+ * of the incremental `avg += (sample - avg)/N` shape when delta < N. */
 typedef struct
 {
     plc_timing_stats_t stats;
+    int64_t            scan_time_sum;
+    int64_t            cycle_time_sum;
+    int64_t            cycle_latency_sum;
+    int64_t            avg_window;        /* N = target_window_us / interval_us, >= 1 */
     uint64_t           expected_start_us;
     uint64_t           last_start_us;
     int64_t            interval_ns;
