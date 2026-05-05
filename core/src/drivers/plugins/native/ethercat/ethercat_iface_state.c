@@ -16,12 +16,6 @@
  *
  * On non-Linux platforms apply/revert are no-ops; the SOEM raw socket
  * is the only thing that interacts with the NIC there.
- *
- * Earlier versions of this module also disabled IPv6 and inserted an
- * iptables INPUT DROP rule on the EtherCAT NIC — those took out the
- * user's only management path on single-NIC systems and were removed.
- * The legacy state files those versions wrote are still detected on
- * apply (`migrate_legacy_iso`) and rolled back, so upgrades self-heal.
  */
 
 #include "ethercat_iface_state.h"
@@ -42,10 +36,10 @@
 #define ECAT_IFACE_STATE_DIR  "/run/runtime"
 #define ECAT_IFACE_STATE_FMT  ECAT_IFACE_STATE_DIR "/ecat_iface_%s.state"
 
-/* Legacy persistence files from earlier versions. Detected on apply,
- * reverted, and removed before the current flow runs. */
+/* Legacy NIC-tuning state file from the pre-consolidation version of
+ * this module. Detected on apply, reverted, and removed before the
+ * current flow runs. */
 #define ECAT_LEGACY_NIC_FMT   ECAT_IFACE_STATE_DIR "/ecat_nic_saved_%s.conf"
-#define ECAT_LEGACY_ISO_FMT   ECAT_IFACE_STATE_DIR "/ecat_iface_iso_%s.state"
 
 /* ------------------------------------------------------------------ */
 /*  ethtool output parsing                                             */
@@ -371,76 +365,6 @@ static void migrate_legacy_nic(const char *iface, plugin_logger_t *logger)
     unlink(path);
 }
 
-/*
- * If an iface-isolation file from a previous version exists (the one
- * that recorded iptables INPUT DROP and IPv6 sysctl flips), undo what
- * it describes and delete it.  Done as a pure migration concern: this
- * runtime never inserts iptables rules nor flips IPv6 sysctls itself.
- *
- * Run with `iptables -t filter -D INPUT -i <iface> -j DROP` and write
- * 0 back to the IPv6 disable_ipv6 sysctl.  Both ops are best-effort —
- * if iptables isn't present (e.g. nftables-only host) or the IPv6
- * sysfs path doesn't exist, just skip and remove the stale file so
- * the warning doesn't repeat on every restart.
- */
-static int legacy_iptables_delete(const char *iface)
-{
-    char *argv[] = {
-        "iptables", "-D", "INPUT", "-i", (char *)iface, "-j", "DROP", NULL
-    };
-    return ecat_run_argv("iptables", argv, NULL, 0);
-}
-
-static int legacy_write_ipv6_disabled(const char *iface, int value)
-{
-    char path[160];
-    snprintf(path, sizeof(path),
-             "/proc/sys/net/ipv6/conf/%s/disable_ipv6", iface);
-    FILE *f = fopen(path, "w");
-    if (!f) return -1;
-    int rc = (fprintf(f, "%d\n", value) > 0) ? 0 : -1;
-    fclose(f);
-    return rc;
-}
-
-static void migrate_legacy_iso(const char *iface, plugin_logger_t *logger)
-{
-    char path[160];
-    snprintf(path, sizeof(path), ECAT_LEGACY_ISO_FMT, iface);
-    FILE *fp = fopen(path, "r");
-    if (!fp)
-        return;
-
-    plugin_logger_warn(logger,
-        "Found legacy iface-isolation file %s - reverting and migrating", path);
-
-    bool ipt = false, ipv6 = false;
-    char line[128];
-    while (fgets(line, sizeof(line), fp)) {
-        size_t len = strlen(line);
-        if (len > 0 && line[len - 1] == '\n')
-            line[len - 1] = '\0';
-        char *eq = strchr(line, '=');
-        if (!eq)
-            continue;
-        *eq = '\0';
-        const char *key = line;
-        const char *val = eq + 1;
-        if (strcmp(key, "iptables_added") == 0) {
-            ipt = (atoi(val) != 0);
-        } else if (strcmp(key, "ipv6_disabled_by_us") == 0) {
-            ipv6 = (atoi(val) != 0);
-        }
-    }
-    fclose(fp);
-
-    if (ipt)
-        legacy_iptables_delete(iface);
-    if (ipv6)
-        legacy_write_ipv6_disabled(iface, 0);
-    unlink(path);
-}
-
 /* ------------------------------------------------------------------ */
 /*  Crash recovery from the unified state file                         */
 /* ------------------------------------------------------------------ */
@@ -488,7 +412,6 @@ void ecat_iface_state_apply(ecat_iface_state_t *state, const char *iface,
 
     /* Migrate any leftover state from prior versions (best-effort) */
     migrate_legacy_nic(iface, logger);
-    migrate_legacy_iso(iface, logger);
 
     /* Recover from a crash of the current-format file */
     recover_from_crash(iface, logger);

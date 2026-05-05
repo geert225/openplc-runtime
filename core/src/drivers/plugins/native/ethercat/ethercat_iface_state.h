@@ -10,11 +10,9 @@
  *
  * Persistence file:  /run/runtime/ecat_iface_<iface>.state
  *
- * Migration: legacy files (ecat_nic_saved_<iface>.conf,
- * ecat_iface_iso_<iface>.state) from earlier versions — the latter
- * recorded iptables INPUT DROP + IPv6 sysctl flips, since removed —
- * are detected on apply, reverted, and removed before the current
- * flow runs.  This makes upgrades from any prior version self-heal.
+ * Migration: legacy NIC state file (ecat_nic_saved_<iface>.conf) from
+ * the pre-consolidation version of this module is detected on apply,
+ * reverted, and removed before the current flow runs.
  */
 
 #ifndef ETHERCAT_IFACE_STATE_H
@@ -31,9 +29,8 @@ extern "C" {
  * @brief Apply low-latency NIC tuning.
  *
  * Sequence:
- *   1. Migrate legacy state files (older formats, including the
- *      iptables/IPv6 isolation file written by previous versions) and
- *      revert anything they describe.
+ *   1. Migrate the legacy NIC state file (older format) and revert
+ *      anything it describes.
  *   2. Recover from the unified state file if a previous run crashed.
  *   3. Capture current NIC settings (ethtool -c / -k).
  *   4. Apply low-latency settings (rx/tx-usecs = 0, GRO/GSO/TSO off).

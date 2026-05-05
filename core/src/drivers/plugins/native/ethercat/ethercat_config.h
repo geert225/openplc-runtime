@@ -290,10 +290,10 @@ void ecat_config_set_logger(plugin_logger_t *logger);
 /**
  * @brief Validation mode for interface names.
  *
- * Different callers need different rules: NIC tuning / iptables paths must
- * receive Linux-only names safe for /proc and external binaries; the scan
- * and test commands accept any name the underlying socket layer accepts,
- * including Windows NPF device paths like "\Device\NPF_{GUID}".
+ * Different callers need different rules: NIC tuning paths must receive
+ * Linux-only names safe for /proc and external binaries (ethtool); the
+ * scan and test commands accept any name the underlying socket layer
+ * accepts, including Windows NPF device paths like "\Device\NPF_{GUID}".
  */
 typedef enum {
     ECAT_IFACE_LINUX_STRICT,   /* alfanum + '_' '-', starts alpha, len 1..15 */
@@ -436,11 +436,6 @@ typedef struct {
  * and so the next runtime start can recover from a crash. Embedded in
  * each `ecat_master_instance_t`. See ethercat_iface_state.h for the
  * apply/revert API.
- *
- * IP-stack isolation (iptables INPUT DROP, IPv6 sysctl) used to live
- * here too; it was removed because it took out the user's only
- * management path on single-NIC systems (Pi 4) and the win it bought
- * — a few µs of softirq pressure relief — wasn't worth the cost.
  */
 typedef struct {
     char iface[ECAT_IFNAME_MAX];

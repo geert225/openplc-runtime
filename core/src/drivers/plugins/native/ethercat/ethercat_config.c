@@ -909,9 +909,9 @@ int ecat_config_parse_all(const char *config_path,
     cJSON_Delete(root);
 
     /* Refuse configs where two masters share the same network interface.
-     * Per-iface external state (NIC tuning + iptables + ipv6) in
-     * ethercat_iface_state.c is single-owner; two masters on the same iface
-     * produce corrupted persistence on crash recovery. */
+     * Per-iface NIC tuning state in ethercat_iface_state.c is
+     * single-owner; two masters on the same iface produce corrupted
+     * persistence on crash recovery. */
     for (int i = 0; i < count; i++) {
         for (int j = i + 1; j < count; j++) {
             if (strcmp(instances[i].config.master.interface,
