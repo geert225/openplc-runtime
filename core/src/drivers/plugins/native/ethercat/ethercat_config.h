@@ -290,10 +290,10 @@ void ecat_config_set_logger(plugin_logger_t *logger);
 /**
  * @brief Validation mode for interface names.
  *
- * Different callers need different rules: NIC tuning / iptables paths must
- * receive Linux-only names safe for /proc and external binaries; the scan
- * and test commands accept any name the underlying socket layer accepts,
- * including Windows NPF device paths like "\Device\NPF_{GUID}".
+ * Different callers need different rules: NIC tuning paths must receive
+ * Linux-only names safe for /proc and external binaries (ethtool); the
+ * scan and test commands accept any name the underlying socket layer
+ * accepts, including Windows NPF device paths like "\Device\NPF_{GUID}".
  */
 typedef enum {
     ECAT_IFACE_LINUX_STRICT,   /* alfanum + '_' '-', starts alpha, len 1..15 */
@@ -429,19 +429,16 @@ typedef struct {
 #define ECAT_AVG_EWMA_SHIFT 5
 
 /**
- * @brief Per-interface external state captured by ecat_iface_state_apply().
+ * @brief Per-interface NIC tuning state captured by ecat_iface_state_apply().
  *
- * Combines NIC-tuning save/restore (ethtool coalescing + offloads) and
- * IP-stack isolation (iptables INPUT DROP, IPv6 sysctl) into a single
- * struct, embedded in each ecat_master_instance_t.  See
- * ethercat_iface_state.h for the apply/revert API.
+ * Holds the pre-EtherCAT NIC settings (ethtool coalescing + offloads) so
+ * `ecat_iface_state_revert()` can roll them back on graceful shutdown,
+ * and so the next runtime start can recover from a crash. Embedded in
+ * each `ecat_master_instance_t`. See ethercat_iface_state.h for the
+ * apply/revert API.
  */
 typedef struct {
     char iface[ECAT_IFNAME_MAX];
-
-    /* IP-stack isolation */
-    bool ipv6_disabled_by_us;
-    bool iptables_added;
 
     /* NIC tuning -- ethtool -C (coalescing) */
     bool coalescing_saved;
