@@ -74,6 +74,25 @@ typedef struct PlcTaskCtx
 extern PlcTaskCtx *plc_tasks;
 extern size_t      plc_task_count;
 
+/* Lifecycle lock for plc_tasks / plc_task_count.
+ *
+ * The plc_cycle_thread owns the array — it allocates after walking the
+ * configuration (load) and frees after joining task threads (stop).
+ * Concurrently, the unix-socket thread services STATS by iterating the
+ * array under format_timing_stats_response. is_transitioning gates new
+ * commands but doesn't bracket an in-flight STATS call: a plugin-initiated
+ * stop can fire mid-iteration, free plc_tasks, and the STATS reader
+ * dereferences freed memory.
+ *
+ * Readers (STATS) hold this lock for the duration of the iteration.
+ * The writer (plc_cycle_thread) holds it while allocating, while
+ * publishing the count, and while freeing. STOP itself doesn't need the
+ * lock: task threads exit via plc_state observation; the lock only
+ * brackets the array swap. Held briefly enough that adding latency to
+ * STATS during a STOP transition is acceptable. */
+void plc_tasks_reader_lock(void);
+void plc_tasks_reader_unlock(void);
+
 /**
  * @brief Get the current PLC state.
  * @return PLCState The current PLC state

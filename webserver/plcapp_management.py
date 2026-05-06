@@ -217,9 +217,13 @@ def update_plugin_configurations(generated_dir: str = "core/generated"):
     # Handle VPP plugin registration
     # VPP plugins are compiled from source on-target. If a compiled VPP plugin
     # .so exists in the build directory, register it in plugins.conf.
+    # VPP outputs live under build/vpp/ (a dedicated subdir) so the lookup
+    # glob can't accidentally match a future built-in plugin .so dropped
+    # into build/ — see compile.sh for the matching layout.
     build_dir = os.path.join(generated_dir, "build") if generated_dir != "core/generated" else "build"
     vpp_plugin_dir = os.path.join(generated_dir, "vpp_plugin")
-    vpp_sos = glob.glob(os.path.join(build_dir, "lib*_plugin.so"))
+    vpp_output_dir = os.path.join(build_dir, "vpp")
+    vpp_sos = glob.glob(os.path.join(vpp_output_dir, "lib*_plugin.so"))
 
     if os.path.exists(vpp_plugin_dir) and vpp_sos:
         for so_path in vpp_sos:
@@ -442,16 +446,27 @@ def run_compile(runtime_manager: RuntimeManager, cwd: str = "core/generated", cl
         # Hold status back in COMPILING while we finalize plugins.conf so
         # the editor doesn't poll SUCCESS and send START before the VPP
         # plugin entry is written.
+        #
+        # Wrap in try/except: if update_plugin_configurations raises (e.g.,
+        # malformed plugins.conf, OS error rewriting it), we MUST flip
+        # status to FAILED. Without this, a raised exception bubbles out
+        # of run_compile leaving build_state.status pinned at COMPILING,
+        # and the editor's polling loop hangs forever waiting for a
+        # terminal status.
         build_state.status = BuildStatus.COMPILING
-        update_plugin_configurations(cwd)
-        build_state.status = BuildStatus.SUCCESS
-
-        # Reset crash tracking after a successful build — the program changed,
-        # so any previous crash pattern no longer applies. Do NOT auto-start
-        # the PLC here: the editor is responsible for sending START once it
-        # has confirmed a clean build, which gives it control over retries
-        # when the previous STOP transition is still finishing (COMMAND:BUSY
-        # window).
-        runtime_manager.reset_crash_tracking()
+        try:
+            update_plugin_configurations(cwd)
+            build_state.status = BuildStatus.SUCCESS
+            # Reset crash tracking after a successful build — the program
+            # changed, so any previous crash pattern no longer applies. Do
+            # NOT auto-start the PLC here: the editor is responsible for
+            # sending START once it has confirmed a clean build, which
+            # gives it control over retries when the previous STOP
+            # transition is still finishing (COMMAND:BUSY window).
+            runtime_manager.reset_crash_tracking()
+        except Exception as e:
+            build_state.log(f"[ERROR] Failed to update plugin configurations: {e}\n")
+            build_state.status = BuildStatus.FAILED
+            build_state.exit_code = 1
     else:
         build_state.log("[WARNING] PLC program has not been updated because the build failed\n")

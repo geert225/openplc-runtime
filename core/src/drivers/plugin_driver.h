@@ -54,6 +54,12 @@ typedef struct plugin_instance_s
     plugin_funct_bundle_t *native_plugin;
     // pthread_t thread;
     int running;
+    /* Set after a successful init() call; cleared by cleanup. Tracked
+     * separately from `running` so a partial init failure (e.g.,
+     * pthread_create on the cycle thread fails AFTER plugin_driver_init
+     * succeeded) can roll back only the plugins that actually got
+     * initialised, not those still untouched. */
+    int initialized;
     plugin_config_t config;
 } plugin_instance_t;
 
@@ -70,6 +76,14 @@ plugin_driver_t *plugin_driver_create(void);
 int plugin_driver_load_config(plugin_driver_t *driver, const char *config_file);
 int plugin_driver_update_config(plugin_driver_t *driver, const char *config_file);
 int plugin_driver_init(plugin_driver_t *driver);
+/* Mirror of plugin_driver_init: walks plugins[] in reverse order and calls
+ * the matching cleanup hook on every plugin whose `initialized` flag is
+ * set, then clears the flag. Used to roll back a partial init when a
+ * later step (e.g., spawning the cycle thread) fails — without this, a
+ * subsequent INIT cycle re-runs plugin init() on top of half-allocated
+ * state and duplicates threads/sockets. Safe to call when no plugins are
+ * initialised. Returns the count of plugins it cleaned up. */
+int plugin_driver_cleanup_init(plugin_driver_t *driver);
 int plugin_driver_start(plugin_driver_t *driver);
 int plugin_driver_stop(plugin_driver_t *driver);
 void plugin_driver_destroy(plugin_driver_t *driver);

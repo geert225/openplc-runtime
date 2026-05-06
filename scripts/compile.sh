@@ -70,14 +70,21 @@ make -j"$(nproc)" -f scripts/Makefile.strucpp
 # -----------------------------------------------------------------------
 VPP_PLUGIN_DIR="$GENERATED_DIR/vpp_plugin"
 VPP_CHECKSUM_FILE="$VPP_PLUGIN_DIR/checksum.sha256"
-VPP_CACHED_CHECKSUM="$BUILD_PATH/vpp_plugin_checksum.sha256"
+# VPP outputs land in a dedicated subdir of BUILD_PATH so the cleanup
+# glob below can scope itself to VPP-only artefacts. If a future built-in
+# plugin ships as a .so dropped into BUILD_PATH directly, the old
+# "$BUILD_PATH/lib*_plugin.so" glob would have rm'd it on every upload
+# without a vpp_plugin subtree present.
+VPP_OUTPUT_DIR="$BUILD_PATH/vpp"
+VPP_CACHED_CHECKSUM="$VPP_OUTPUT_DIR/checksum.sha256"
 
 if [ -d "$VPP_PLUGIN_DIR" ] && [ -f "$VPP_PLUGIN_DIR/Makefile" ]; then
     NEEDS_COMPILE=1
+    mkdir -p "$VPP_OUTPUT_DIR"
 
     if [ -f "$VPP_CHECKSUM_FILE" ] && [ -f "$VPP_CACHED_CHECKSUM" ]; then
         if diff -q "$VPP_CHECKSUM_FILE" "$VPP_CACHED_CHECKSUM" > /dev/null 2>&1; then
-            if ls "$BUILD_PATH"/lib*_plugin.so 1>/dev/null 2>&1; then
+            if ls "$VPP_OUTPUT_DIR"/lib*_plugin.so 1>/dev/null 2>&1; then
                 echo "[INFO] VPP plugin source unchanged (checksum match), skipping recompilation"
                 NEEDS_COMPILE=0
             fi
@@ -89,7 +96,7 @@ if [ -d "$VPP_PLUGIN_DIR" ] && [ -f "$VPP_PLUGIN_DIR/Makefile" ]; then
         PLUGIN_INCLUDE="-I $(pwd)/core/src/drivers -I $(pwd)/core/src/drivers/plugins/native -I $(pwd)/core/src/drivers/plugins/native/cjson -I $(pwd)/core/src/plc_app -I $(pwd)/core/lib"
         make -C "$VPP_PLUGIN_DIR" \
             INCLUDE_DIRS="$PLUGIN_INCLUDE" \
-            OUTPUT_DIR="$(pwd)/$BUILD_PATH" \
+            OUTPUT_DIR="$(pwd)/$VPP_OUTPUT_DIR" \
             RUNTIME_ROOT="$(pwd)"
 
         if [ -f "$VPP_CHECKSUM_FILE" ]; then
@@ -98,10 +105,12 @@ if [ -d "$VPP_PLUGIN_DIR" ] && [ -f "$VPP_PLUGIN_DIR/Makefile" ]; then
         echo "[INFO] VPP plugin compiled successfully"
     fi
 else
-    # No VPP plugin in this upload — clean up any previously compiled
-    # VPP plugin so a stale .so doesn't get picked up by the loader.
-    if ls "$BUILD_PATH"/lib*_plugin.so 1>/dev/null 2>&1; then
-        echo "[INFO] No VPP plugin in upload, removing previously compiled VPP plugin(s)"
-        rm -f "$BUILD_PATH"/lib*_plugin.so "$VPP_CACHED_CHECKSUM"
+    # No VPP plugin in this upload — clean up the entire VPP output dir
+    # so a stale .so doesn't get picked up by the loader. Scoping the rm
+    # to VPP_OUTPUT_DIR (instead of a glob in BUILD_PATH) keeps cleanup
+    # isolated from anything else that ends up in BUILD_PATH.
+    if [ -d "$VPP_OUTPUT_DIR" ]; then
+        echo "[INFO] No VPP plugin in upload, removing $VPP_OUTPUT_DIR"
+        rm -rf "$VPP_OUTPUT_DIR"
     fi
 fi

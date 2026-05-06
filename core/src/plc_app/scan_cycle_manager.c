@@ -189,6 +189,14 @@ int format_timing_stats_response(char *buffer, size_t buffer_size)
     if (n < 0) return 0;
     offset += (size_t)n;
 
+    /* Hold plc_tasks_reader_lock for the whole iteration. is_transitioning
+     * gates new commands but does not bracket an in-flight STATS call —
+     * a plugin-initiated STOP can fire while we're mid-loop, the bootstrap
+     * thread joins task threads and frees plc_tasks[], and we'd then read
+     * freed memory (or worse, lock a destroyed tracker mutex). The lock
+     * makes the alloc/free critical section in plc_cycle_thread mutually
+     * exclusive with the iteration here. */
+    plc_tasks_reader_lock();
     for (size_t i = 0; i < plc_task_count; ++i)
     {
         if (i > 0)
@@ -203,6 +211,7 @@ int format_timing_stats_response(char *buffer, size_t buffer_size)
         offset += (size_t)n;
         if (offset >= buffer_size) break;
     }
+    plc_tasks_reader_unlock();
 
     n = snprintf(buffer + offset, buffer_size - offset, "]}\n");
     if (n > 0) offset += (size_t)n;

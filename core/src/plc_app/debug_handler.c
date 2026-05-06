@@ -37,6 +37,11 @@
  * body. */
 #define VARIDX_SIZE 1024
 
+/* MD5 hex strings are exactly 32 chars + null. Bounding the read both by
+ * the expected length and pos<MAX guards against a malformed .so that
+ * exports a non-terminated strucpp_program_md5. */
+#define MD5_HEX_LEN 32
+
 static inline bool debug_symbols_ready(void)
 {
     return ext_strucpp_debug_array_count != NULL &&
@@ -44,6 +49,16 @@ static inline bool debug_symbols_ready(void)
            ext_strucpp_debug_size        != NULL &&
            ext_strucpp_debug_set         != NULL &&
            ext_strucpp_debug_read        != NULL;
+}
+
+/* Defense-in-depth bounds check on the array index that arrived over the
+ * wire. The editor's STruC++ codegen validates `arr` inside its debug
+ * thunks, but a malformed .so could OOB-read its internal table.  Runtime
+ * gate first: reject `arr >= array_count` here so the .so only sees
+ * indices it claimed to support. */
+static inline bool debug_arr_in_range(uint8_t arr)
+{
+    return arr < ext_strucpp_debug_array_count();
 }
 
 static inline void write_u32_be(uint8_t *p, uint32_t v)
@@ -119,6 +134,11 @@ static void debugSetTrace(uint8_t *frame, size_t *frame_len, size_t length)
     uint16_t val_len = read_u16_be(&frame[5]);
     const uint8_t *val_ptr = (val_len > 0) ? &frame[7] : NULL;
 
+    if (!debug_arr_in_range(arr))
+    {
+        respond_short(frame, frame_len, MB_FC_DEBUG_SET, MB_DEBUG_ERROR_OUT_OF_BOUNDS);
+        return;
+    }
     if (val_len > (MAX_DEBUG_FRAME - 7))
     {
         respond_short(frame, frame_len, MB_FC_DEBUG_SET, MB_DEBUG_ERROR_OUT_OF_BOUNDS);
@@ -151,6 +171,12 @@ static void debugGetTrace(uint8_t *frame, size_t *frame_len, size_t length)
     uint8_t  arr   = frame[1];
     uint16_t start = read_u16_be(&frame[2]);
     uint16_t end   = read_u16_be(&frame[4]);
+
+    if (!debug_arr_in_range(arr))
+    {
+        respond_short(frame, frame_len, MB_FC_DEBUG_GET, MB_DEBUG_ERROR_OUT_OF_BOUNDS);
+        return;
+    }
     uint16_t arr_len = ext_strucpp_debug_elem_count(arr);
 
     if (arr_len == 0 || start >= arr_len || end >= arr_len || start > end)
@@ -249,6 +275,12 @@ static void debugGetTraceList(uint8_t *frame, size_t *frame_len, size_t length)
         uint8_t  arr  = local_index[i * 3 + 0];
         uint16_t elem = ((uint16_t)local_index[i * 3 + 1] << 8) | local_index[i * 3 + 2];
 
+        if (!debug_arr_in_range(arr))
+        {
+            last_req_idx = i;
+            continue;
+        }
+
         uint16_t var_size = ext_strucpp_debug_size(arr, elem);
         if (var_size == 0)
         {
@@ -292,7 +324,9 @@ static void debugGetMd5(uint8_t *frame, size_t *frame_len, size_t length)
     frame[1] = MB_DEBUG_SUCCESS;
 
     size_t pos = 2;
-    for (size_t i = 0; ext_strucpp_program_md5[i] != '\0' && pos < MAX_DEBUG_FRAME - 2; ++i)
+    for (size_t i = 0;
+         i < MD5_HEX_LEN && ext_strucpp_program_md5[i] != '\0' && pos < MAX_DEBUG_FRAME - 2;
+         ++i)
     {
         frame[pos++] = (uint8_t)ext_strucpp_program_md5[i];
     }

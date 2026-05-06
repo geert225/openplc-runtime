@@ -51,9 +51,27 @@ extern plugin_driver_t   *plugin_driver;
 
 /* -----------------------------------------------------------------------
  * Per-task storage. Allocated when a program loads, freed on stop.
+ *
+ * plc_tasks_lock serialises lifecycle (alloc/publish/free) against
+ * readers (STATS handler in scan_cycle_manager). See plc_state_manager.h
+ * for the contract. Read-only once published until the next STOP, so the
+ * lock is held only briefly on the writer side and for one iteration on
+ * the reader side. Not a recursive lock — callers must not nest.
  * --------------------------------------------------------------------- */
 PlcTaskCtx *plc_tasks      = nullptr;
 size_t      plc_task_count = 0;
+
+static pthread_mutex_t plc_tasks_lock = PTHREAD_MUTEX_INITIALIZER;
+
+extern "C" void plc_tasks_reader_lock(void)
+{
+    pthread_mutex_lock(&plc_tasks_lock);
+}
+
+extern "C" void plc_tasks_reader_unlock(void)
+{
+    pthread_mutex_unlock(&plc_tasks_lock);
+}
 
 /* The bootstrap thread doesn't run any IEC task body — it does setup,
  * spawns task threads, waits, and joins. We still want crash recovery
@@ -65,10 +83,10 @@ static volatile sig_atomic_t bootstrap_crash_sig     = 0;
 static volatile sig_atomic_t bootstrap_holding_mutex = 0;
 static volatile sig_atomic_t plc_crash_signal        = 0;
 
-/* SIGUSR1 wakes blocked clock_nanosleep so task threads can observe
- * the STOPPED state and exit. The handler is a no-op — EINTR is the
- * actual mechanism. */
-static void sigusr1_noop(int sig) { (void)sig; }
+/* The SIGUSR1 wake handler is installed once at process init in
+ * plc_main.c (handle_sigusr1). Every task thread relies on EINTR from
+ * pthread_kill(target, SIGUSR1) to break out of clock_nanosleep on
+ * stop — the handler body itself is a no-op. */
 
 static void plc_crash_handler(int sig)
 {
@@ -155,8 +173,12 @@ static void *plc_task_thread(void *arg)
 
     while (plc_get_state() == PLC_STATE_RUNNING)
     {
-        ctx->holding_mutex = 1;
+        /* Set the holding flag AFTER acquiring the mutex. If a fatal signal
+         * lands between the flag set and the lock returning, the crash
+         * handler's cleanup would call pthread_mutex_unlock on a mutex this
+         * thread never owned — UB on PI mutexes. */
         pthread_mutex_lock(image_tables_mutex());
+        ctx->holding_mutex = 1;
 
         /* Per-task scan timing. Every task thread tracks its own
          * scan/cycle/latency stats around its body; the IO housekeeping
@@ -274,14 +296,9 @@ void *plc_cycle_thread(void *arg)
     sigaction(SIGFPE,  &crash_sa, NULL);
     sigaction(SIGSEGV, &crash_sa, NULL);
 
-    /* SIGUSR1 is used by stop_plc_program() to wake task threads
-     * blocked in clock_nanosleep so they observe the STOPPED state. */
-    struct sigaction wake_sa;
-    std::memset(&wake_sa, 0, sizeof(wake_sa));
-    wake_sa.sa_handler = sigusr1_noop;
-    sigemptyset(&wake_sa.sa_mask);
-    wake_sa.sa_flags = 0;
-    sigaction(SIGUSR1, &wake_sa, NULL);
+    /* SIGUSR1 wake handler is installed once at process init (plc_main.c).
+     * No per-thread re-installation here — the bootstrap thread inherits
+     * the handler from the process. */
 
     log_info("Starting main loop");
 
@@ -363,10 +380,15 @@ void *plc_cycle_thread(void *arg)
     log_info("PLC base tick: %llu ns across %zu task(s)",
              (unsigned long long)base_ns, total_tasks);
 
-    /* Allocate per-task contexts and spawn one thread per IEC task. */
+    /* Allocate per-task contexts and spawn one thread per IEC task.
+     * Hold plc_tasks_lock across the alloc + count publish so a STATS
+     * reader doesn't observe a non-NULL pointer with the old (zero)
+     * count, or vice versa. */
+    pthread_mutex_lock(&plc_tasks_lock);
     plc_tasks = static_cast<PlcTaskCtx *>(std::calloc(total_tasks, sizeof(PlcTaskCtx)));
     if (!plc_tasks)
     {
+        pthread_mutex_unlock(&plc_tasks_lock);
         log_error("Failed to allocate plc_tasks array");
         pthread_mutex_lock(&state_mutex);
         plc_state = PLC_STATE_ERROR;
@@ -374,6 +396,7 @@ void *plc_cycle_thread(void *arg)
         return NULL;
     }
     plc_task_count = total_tasks;
+    pthread_mutex_unlock(&plc_tasks_lock);
 
     {
         size_t flat_idx = 0;
@@ -431,17 +454,58 @@ void *plc_cycle_thread(void *arg)
                  plc_tasks[fastest_idx].priority);
     }
 
-    /* Spawn task threads. */
-    for (size_t i = 0; i < plc_task_count; ++i)
+    /* Spawn task threads.
+     *
+     * Failure mode: if pthread_create succeeds for tasks 0..i-1 and then
+     * fails for task i, the previously-spawned threads are running at
+     * SCHED_FIFO 99 holding image_tables_mutex and reading from
+     * plc_tasks[].  Returning here without cleanup leaves them orphaned
+     * — the next load_plc_program reallocates plc_tasks and the old
+     * threads dereference freed memory. We must:
+     *
+     *   1) flip plc_state to ERROR so the surviving task threads exit
+     *      their `while (state == RUNNING)` loop on their next iteration;
+     *   2) SIGUSR1 each surviving thread to break it out of its
+     *      clock_nanosleep without waiting up to interval_ns;
+     *   3) join all spawned threads before freeing the array.
+     *
+     * After this rollback, plc_tasks is nullptr and plc_task_count is 0,
+     * so STATS / next-cycle teardown can run without UAF. */
+    size_t spawned = 0;
+    for (; spawned < plc_task_count; ++spawned)
     {
-        if (pthread_create(&plc_tasks[i].thread, NULL,
-                           plc_task_thread, &plc_tasks[i]) != 0)
+        if (pthread_create(&plc_tasks[spawned].thread, NULL,
+                           plc_task_thread, &plc_tasks[spawned]) != 0)
         {
             log_error("Failed to spawn task %zu thread: %s",
-                      i, strerror(errno));
+                      spawned, strerror(errno));
+
+            /* Flip to ERROR FIRST so the running tasks exit. */
             pthread_mutex_lock(&state_mutex);
             plc_state = PLC_STATE_ERROR;
             pthread_mutex_unlock(&state_mutex);
+
+            /* Wake any task currently blocked in clock_nanosleep so it
+             * notices the state change without waiting a full period. */
+            for (size_t k = 0; k < spawned; ++k)
+            {
+                pthread_kill(plc_tasks[k].thread, SIGUSR1);
+            }
+            for (size_t k = 0; k < spawned; ++k)
+            {
+                pthread_join(plc_tasks[k].thread, nullptr);
+            }
+            /* Take plc_tasks_lock around the destruction so any STATS
+             * reader currently iterating exits before we free. */
+            pthread_mutex_lock(&plc_tasks_lock);
+            for (size_t k = 0; k < plc_task_count; ++k)
+            {
+                scan_cycle_tracker_cleanup(&plc_tasks[k].tracker);
+            }
+            std::free(plc_tasks);
+            plc_tasks      = nullptr;
+            plc_task_count = 0;
+            pthread_mutex_unlock(&plc_tasks_lock);
             return NULL;
         }
     }
@@ -467,6 +531,14 @@ void *plc_cycle_thread(void *arg)
     {
         pthread_join(plc_tasks[i].thread, nullptr);
     }
+
+    /* Take plc_tasks_lock for the tracker-cleanup + free. A STATS reader
+     * that started iterating before STOP arrived will block briefly
+     * waiting for this critical section, then exit because plc_task_count
+     * is observed as 0. Without the lock, the reader could be midway
+     * through scan_cycle_tracker_snapshot when we pthread_mutex_destroy
+     * the tracker's own mutex below — undefined behaviour. */
+    pthread_mutex_lock(&plc_tasks_lock);
     for (size_t i = 0; i < plc_task_count; ++i)
     {
         scan_cycle_tracker_cleanup(&plc_tasks[i].tracker);
@@ -474,6 +546,7 @@ void *plc_cycle_thread(void *arg)
     std::free(plc_tasks);
     plc_tasks      = nullptr;
     plc_task_count = 0;
+    pthread_mutex_unlock(&plc_tasks_lock);
 
     signal(SIGFPE,  SIG_DFL);
     signal(SIGSEGV, SIG_DFL);
@@ -504,20 +577,45 @@ extern "C" int load_plc_program(PluginManager *pm)
 
         if (plugin_driver)
         {
-            if (plugin_driver_update_config(plugin_driver, "./plugins.conf") == 0)
-            {
-                plugin_driver_init(plugin_driver);
-                log_info("[PLUGIN]: Plugins re-initialized with updated config");
-            }
-            else
+            if (plugin_driver_update_config(plugin_driver, "./plugins.conf") != 0)
             {
                 log_error("[PLUGIN]: Failed to load plugin configuration");
+                pthread_mutex_lock(&state_mutex);
+                plc_state = PLC_STATE_ERROR;
+                pthread_mutex_unlock(&state_mutex);
+                log_info("PLC State: ERROR");
+                if (pm == plc_program) plc_program = NULL;
+                plugin_manager_destroy(pm);
+                return -1;
             }
+            if (plugin_driver_init(plugin_driver) != 0)
+            {
+                /* Roll back any plugins that did initialise before the
+                 * failure. Without this, the next INIT cycle's call to
+                 * plugin_driver_init would invoke init() on top of
+                 * half-allocated state and (e.g.) double-spawn EtherCAT
+                 * masters or OPC-UA sockets. */
+                log_error("[PLUGIN]: Plugin init failed — rolling back");
+                plugin_driver_cleanup_init(plugin_driver);
+                pthread_mutex_lock(&state_mutex);
+                plc_state = PLC_STATE_ERROR;
+                pthread_mutex_unlock(&state_mutex);
+                log_info("PLC State: ERROR");
+                if (pm == plc_program) plc_program = NULL;
+                plugin_manager_destroy(pm);
+                return -1;
+            }
+            log_info("[PLUGIN]: Plugins re-initialized with updated config");
         }
 
         if (pthread_create(&plc_thread, NULL, plc_cycle_thread, pm) != 0)
         {
             log_error("Failed to create PLC cycle thread");
+            /* plugin_driver_init succeeded above, so plugins hold init
+             * state (allocated buffers, opened devices). Roll those back
+             * before bailing — otherwise the next start retries init()
+             * on a half-initialised driver. */
+            if (plugin_driver) plugin_driver_cleanup_init(plugin_driver);
             pthread_mutex_lock(&state_mutex);
             plc_state = PLC_STATE_ERROR;
             pthread_mutex_unlock(&state_mutex);

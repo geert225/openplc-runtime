@@ -159,17 +159,19 @@ static uint8_t plugin_debug_write(uint8_t arr, uint16_t elem,
 // immediately, then continues running for the brief window until the
 // plugin's own stop_loop is invoked. Plugins that enter fault-stopped state
 // are expected to short-circuit their I/O during that window.
+//
+// No pre-check on plc_get_state() here: plc_begin_transition does the
+// check atomically (under the same gate that prevents concurrent
+// transitions), so doing it again outside would just re-introduce the
+// check-then-act race the gate is there to close.
 static void plugin_request_plc_stop(const char *reason)
 {
     log_error("[PLUGIN] stop requested: %s", reason ? reason : "(no reason given)");
-    if (plc_get_state() != PLC_STATE_RUNNING)
-    {
-        log_warn("[PLUGIN] stop request ignored — PLC is not running");
-        return;
-    }
     if (!plc_begin_transition(PLC_STATE_STOPPED))
     {
-        log_error("[PLUGIN] failed to start stop transition");
+        // Either the PLC is already stopping/stopped or another stop
+        // is already in flight — either way, nothing to do.
+        log_warn("[PLUGIN] stop request collapsed (already transitioning or not running)");
     }
 }
 
@@ -205,6 +207,57 @@ static PyObject *create_python_runtime_args_capsule(plugin_runtime_args_t *args)
     }
 
     return capsule;
+}
+
+/* Tear down a single plugin instance: cleanup hook (if init() ran),
+ * close native handles, release Python refs. Leaves the slot zeroed.
+ *
+ * IMPORTANT: dispatched on the slot's CURRENT stored type, not on the
+ * incoming config's type — that's the bug fix for the slot-positional
+ * reload issue. Closing by slot index assumed configs[w].type matched
+ * driver->plugins[w].config.type, which falls apart whenever the user
+ * reorders / replaces / changes the type of an entry in plugins.conf.
+ *
+ * Caller must ensure the plugin is not running (this function is called
+ * from update_config which only runs after STOP). The dlclose is unsafe
+ * on a live plugin — once the .so is unmapped, any in-flight call into
+ * its function pointers segfaults. */
+static void teardown_plugin_instance(plugin_instance_t *plugin)
+{
+    if (!plugin) return;
+
+    if (plugin->running)
+    {
+        log_error("[PLUGIN] internal error: tearing down running plugin '%s' — refusing",
+                  plugin->config.name);
+        return;
+    }
+
+    if (plugin->config.type == PLUGIN_TYPE_PYTHON && plugin->python_plugin)
+    {
+        // python_plugin_cleanup invokes the optional cleanup() if the
+        // plugin had been initialised, then DECREFs all module refs and
+        // frees the python_plugin bundle (sets the field to NULL).
+        // Calling it on an uninitialised plugin still releases module
+        // refs cleanly, so always call it as long as python_plugin is set.
+        python_plugin_cleanup(plugin);
+    }
+    else if (plugin->config.type == PLUGIN_TYPE_NATIVE && plugin->native_plugin)
+    {
+        if (plugin->initialized && plugin->native_plugin->cleanup)
+        {
+            plugin->native_plugin->cleanup();
+        }
+        if (plugin->native_plugin->handle)
+        {
+            dlclose(plugin->native_plugin->handle);
+        }
+        free(plugin->native_plugin);
+        plugin->native_plugin = NULL;
+    }
+
+    plugin->initialized = 0;
+    memset(&plugin->config, 0, sizeof(plugin->config));
 }
 
 int plugin_driver_update_config(plugin_driver_t *driver, const char *config_file)
@@ -259,40 +312,74 @@ int plugin_driver_update_config(plugin_driver_t *driver, const char *config_file
         return -1;
     }
 
+    /* Tear down ALL old plugins, dispatched by their CURRENT stored type
+     * (not the new config's type). This fixes the slot-positional reload
+     * bug: previously a slot whose type changed Native→Python would skip
+     * the dlclose (because the new type was Python) and leak the old .so
+     * handle; the converse direction would force-free a Python instance's
+     * native_plugin (which is NULL) but leave python_plugin orphaned.
+     *
+     * After this loop every slot 0..old plugin_count-1 is zeroed; we can
+     * safely rebuild from configs[] without worrying about stale state.
+     * This function is only called from load_plc_program (post-STOP) and
+     * plc_main.c boot, both of which guarantee no plugin is running, so
+     * dlclose is safe. */
+    int old_plugin_count = driver->plugin_count;
+    for (int w = 0; w < old_plugin_count; w++)
+    {
+        teardown_plugin_instance(&driver->plugins[w]);
+    }
+
+    /* Reset has_python_plugin before rebuilding — it'll be set again below
+     * for any Python entries in the new config. Without resetting, removing
+     * the last Python plugin from plugins.conf would leave the flag at 1
+     * and cause unnecessary GIL acquires throughout the driver. */
+    has_python_plugin = 0;
+
+    int load_failures = 0;
     driver->plugin_count = config_count;
-    has_python_plugin    = 0;
+
     for (int w = 0; w < config_count; w++)
     {
-        memcpy(&driver->plugins[w].config, &configs[w], sizeof(plugin_config_t));
+        plugin_instance_t *plugin = &driver->plugins[w];
+        // Slot already zeroed by the teardown loop (or never used).
+        memcpy(&plugin->config, &configs[w], sizeof(plugin_config_t));
+
         if (configs[w].type == PLUGIN_TYPE_PYTHON)
         {
             has_python_plugin = 1;
+            // Python symbol loading is deferred to plugin_driver_load_config;
+            // update_config is called at runtime after STOP and we want to
+            // mirror the behaviour of the original code, which only loaded
+            // native symbols here. Python re-import happens lazily.
         }
-
-        // Load or reload symbols for native plugins.
-        // New plugins (native_plugin == NULL) need initial symbol loading.
-        // Existing plugins need reloading if their .so was recompiled (VPP plugins
-        // are compiled from source on every upload and the .so changes on disk).
-        if (configs[w].type == PLUGIN_TYPE_NATIVE)
+        else if (configs[w].type == PLUGIN_TYPE_NATIVE)
         {
-            if (driver->plugins[w].native_plugin != NULL)
+            if (native_plugin_get_symbols(plugin) != 0)
             {
-                // Close old handle and reload — the .so may have been recompiled
-                if (driver->plugins[w].native_plugin->handle)
+                if (plugin->config.enabled)
                 {
-                    dlclose(driver->plugins[w].native_plugin->handle);
+                    /* An enabled native plugin failed to load its .so.
+                     * This is the fix for "update_config failure not
+                     * surfaced": previously this was a log_warn and the
+                     * caller proceeded into init/start with native_plugin
+                     * == NULL, silently dropping cycle hooks. Now we mark
+                     * the load as failed so load_plc_program can surface
+                     * it as an ERROR state instead of a silent no-op. */
+                    log_error("[PLUGIN] enabled native plugin '%s' failed to load symbols",
+                              configs[w].name);
+                    ++load_failures;
                 }
-                free(driver->plugins[w].native_plugin);
-                driver->plugins[w].native_plugin = NULL;
-            }
-            if (native_plugin_get_symbols(&driver->plugins[w]) != 0)
-            {
-                log_warn("Failed to load symbols for native plugin '%s' (may not be available yet)",
-                         configs[w].name);
+                else
+                {
+                    log_warn("[PLUGIN] disabled native plugin '%s' has no loadable .so",
+                             configs[w].name);
+                }
             }
         }
     }
-    return 0;
+
+    return (load_failures > 0) ? -1 : 0;
 }
 
 int plugin_driver_load_config(plugin_driver_t *driver, const char *config_file)
@@ -392,6 +479,7 @@ int plugin_driver_init(plugin_driver_t *driver)
                 return -1;
             }
             Py_DECREF(result);
+            plugin->initialized = 1;
         }
         else if (plugin->config.type == PLUGIN_TYPE_NATIVE && plugin->native_plugin &&
                  plugin->native_plugin->init)
@@ -427,6 +515,7 @@ int plugin_driver_init(plugin_driver_t *driver)
 
             // Free the args after successful initialization
             free_structured_args(args);
+            plugin->initialized = 1;
         }
     }
 
@@ -436,6 +525,39 @@ int plugin_driver_init(plugin_driver_t *driver)
     }
 
     return 0;
+}
+
+int plugin_driver_cleanup_init(plugin_driver_t *driver)
+{
+    if (!driver) return 0;
+
+    PyGILState_STATE local_gstate = PyGILState_LOCKED;
+    int have_gil = has_python_plugin && Py_IsInitialized();
+    if (have_gil) local_gstate = PyGILState_Ensure();
+
+    int cleaned = 0;
+    /* Reverse order so dependent plugins (declared later, depend on
+     * resources owned by earlier plugins) tear down first. */
+    for (int i = driver->plugin_count - 1; i >= 0; --i)
+    {
+        plugin_instance_t *plugin = &driver->plugins[i];
+        if (!plugin->initialized) continue;
+
+        if (plugin->config.type == PLUGIN_TYPE_PYTHON && plugin->python_plugin)
+        {
+            python_plugin_cleanup(plugin);
+        }
+        else if (plugin->config.type == PLUGIN_TYPE_NATIVE && plugin->native_plugin &&
+                 plugin->native_plugin->cleanup)
+        {
+            plugin->native_plugin->cleanup();
+        }
+        plugin->initialized = 0;
+        ++cleaned;
+    }
+
+    if (have_gil) PyGILState_Release(local_gstate);
+    return cleaned;
 }
 
 // Call the thread function for each plugin
@@ -644,18 +766,20 @@ void plugin_driver_destroy(plugin_driver_t *driver)
     for (int i = 0; i < driver->plugin_count; i++)
     {
         plugin_instance_t *plugin = &driver->plugins[i];
-        if (plugin->python_plugin && python_initialized)
+        if (plugin->python_plugin && python_initialized && plugin->initialized)
         {
             python_plugin_cleanup(plugin);
+            plugin->initialized = 0;
         }
         if (plugin->native_plugin)
         {
-            // Call cleanup function if available
-            if (plugin->native_plugin->cleanup)
+            // Call cleanup function if available, but only if init() ran.
+            if (plugin->initialized && plugin->native_plugin->cleanup)
             {
                 plugin->native_plugin->cleanup();
                 log_info("Native plugin %s cleaned up successfully", plugin->config.name);
             }
+            plugin->initialized = 0;
             // Close the shared library handle
             if (plugin->native_plugin->handle)
             {

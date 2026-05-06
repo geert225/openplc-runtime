@@ -1,7 +1,6 @@
 #include "plugin_config.h"
 #include "plugin_driver.h"
 #include "journal_buffer.h"
-#include "plugin_utils.h"
 
 #include <pthread.h>
 #include <stdarg.h>
@@ -90,24 +89,20 @@ int journal_write_lint(journal_buffer_type_t type, uint16_t index,
     return 0;
 }
 
-// Stub: get_var_* (plugin_utils.c)
-void get_var_list(size_t num_vars, size_t *indexes, void **result)
-{
-    (void)num_vars;
-    (void)indexes;
-    (void)result;
-}
+// The MatIEC-era flat-index API (get_var_list / get_var_size /
+// get_var_count from plugin_utils.c) was removed alongside the rest of
+// the MatIEC pipeline. Plugins now receive structured runtime args
+// (plugin_runtime_args_t) constructed from the STruC++ debug map; the
+// debugger ABI is exercised in test_debug_handler.c.
 
-size_t get_var_size(size_t idx)
-{
-    (void)idx;
-    return 0;
-}
-
-uint16_t get_var_count(void)
-{
-    return 0;
-}
+// Stubs: plc_tasks_reader_lock / plc_tasks_reader_unlock (plc_state_manager.cpp).
+// scan_cycle_manager.c calls these around format_timing_stats_response to
+// keep the reader from racing the bootstrap thread freeing plc_tasks. The
+// real lock lives in plc_state_manager.cpp; tests don't pull that .cpp in,
+// so we provide no-op stubs. Tests that exercise the lifecycle (rather
+// than just the per-tracker math) will need to link the real symbols.
+void plc_tasks_reader_lock(void)   {}
+void plc_tasks_reader_unlock(void) {}
 
 // Stub: log_* (log.c)
 void log_info(const char *fmt, ...)

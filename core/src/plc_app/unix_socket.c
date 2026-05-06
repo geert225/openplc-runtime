@@ -47,19 +47,50 @@ static void *transition_worker(void *arg)
     return NULL;
 }
 
-// Start a background thread that performs the (potentially slow) state transition.
-// Returns true if the thread was spawned, false on error.
+// Start a background thread that performs the (potentially slow) state
+// transition. Returns true if the thread was spawned, false otherwise.
+//
+// Two safety guards on the entry path, both targeting plugin-initiated
+// stops (which are unsynchronised relative to the unix-socket dispatcher):
+//
+//   1. CAS on `is_transitioning` 0→1: collapses concurrent calls. A
+//      misbehaving plugin spinning on plugin_request_plc_stop would
+//      otherwise pile up detached pthread workers — each one mallocing,
+//      cloning a thread, and racing for the state mutex. The CAS gate
+//      means only the first call fires the worker; everything else is a
+//      cheap return.
+//
+//   2. Re-check current state AFTER the CAS wins: closes the
+//      check-then-call race where the caller sees RUNNING, calls in,
+//      and the state flips to STOPPED before we spawn the worker. We'd
+//      otherwise dispatch a no-op transition, leaving STATUS reporting
+//      TRANSITIONING for the worker's lifetime for nothing.
 bool plc_begin_transition(PLCState target)
 {
+    int expected = 0;
+    if (!atomic_compare_exchange_strong(&is_transitioning, &expected, 1))
+    {
+        // Another transition is already in flight. Don't pile on.
+        return false;
+    }
+
+    if (plc_get_state() == target)
+    {
+        // State already at target — release the gate and bail. No
+        // worker needed; reporting STATUS:TRANSITIONING for a no-op
+        // would just confuse external pollers.
+        atomic_store(&is_transitioning, 0);
+        return false;
+    }
+
     PLCState *arg = malloc(sizeof(PLCState));
     if (!arg)
     {
         log_error("Failed to allocate transition argument");
+        atomic_store(&is_transitioning, 0);
         return false;
     }
     *arg = target;
-
-    atomic_store(&is_transitioning, 1);
 
     pthread_t tid;
     if (pthread_create(&tid, NULL, transition_worker, arg) != 0)

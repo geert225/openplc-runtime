@@ -1015,11 +1015,10 @@ static bool ecat_run_one_cycle(ecat_master_instance_t *inst)
 }
 
 /* SIGUSR1 wakes the bus thread out of clock_nanosleep so a stop request
- * lands within microseconds instead of after a full sleep period. */
-static void ecat_bus_sigusr1_noop(int sig)
-{
-    (void)sig;
-}
+ * lands within microseconds instead of after a full sleep period. The
+ * handler is installed once at process init (plc_main.c handle_sigusr1)
+ * — DON'T re-install here, sigaction is process-wide and last-writer-
+ * wins between bus threads / task threads / future signal users. */
 
 static inline uint64_t ts_to_ns(const struct timespec *ts)
 {
@@ -1073,10 +1072,10 @@ static void *ecat_bus_thread(void *arg)
             "Bus thread '%s': SCHED_FIFO priority %d", inst->name, prio);
     }
 
-    /* SIGUSR1 wake-up signal so stop_loop can break us out of nanosleep. */
-    struct sigaction sa = {0};
-    sa.sa_handler = ecat_bus_sigusr1_noop;
-    sigaction(SIGUSR1, &sa, NULL);
+    /* SIGUSR1 handler is process-wide; installed once at plc_main.c.
+     * No per-thread sigaction here. SIGUSR1 stays unblocked for this
+     * thread by default (pthread_create inherits the parent's mask, and
+     * the process-wide mask doesn't include SIGUSR1). */
 
     int64_t interval_ns =
         (int64_t)inst->config.master.cycle_time_us * 1000LL;
@@ -1102,8 +1101,10 @@ static void *ecat_bus_thread(void *arg)
 
         /* Latency = how much later than the deadline we woke up. Can
          * theoretically be slightly negative if clock skew or coarse
-         * timer granularity puts us a fraction ahead. */
-        int64_t latency_ns = (int64_t)(actual_wake_ns - expected_ns);
+         * timer granularity puts us a fraction ahead. Subtract in the
+         * signed domain so an early wake yields a small negative value
+         * rather than relying on impl-defined unsigned→signed conversion. */
+        int64_t latency_ns = (int64_t)actual_wake_ns - (int64_t)expected_ns;
         atomic_store_explicit(&inst->diag.latency_ns, latency_ns, memory_order_relaxed);
 
         int64_t cur_lat_min = atomic_load_explicit(&inst->diag.min_latency_ns,
