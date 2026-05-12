@@ -308,7 +308,23 @@ static void debugGetTraceList(uint8_t *frame, size_t *frame_len, size_t length)
     *frame_len = HDR + response_sz;
 }
 
-/* FC 0x45 — DEBUG_GET_MD5 (with endianness probe echo) */
+/* FC 0x45 — DEBUG_GET_MD5
+ *
+ * The trailer carries a runtime-driven endianness sentinel, not an echo of
+ * what the editor sent.  The variable-data path is pure memcpy on both
+ * sides (the strucpp dispatcher does no byte-order adaptation), so wire
+ * bytes for force / read are always in target-native order.  To let the
+ * editor know what "native" means here, this handler writes the literal
+ * value 0xDEAD via a native uint16_t store; the two bytes that land in the
+ * frame reflect the target's byte order:
+ *
+ *     LE target  →  trailer = [0xAD, 0xDE]
+ *     BE target  →  trailer = [0xDE, 0xAD]
+ *
+ * The editor uses that to decide whether to byte-swap variable data at its
+ * end.  The probe bytes in the request are ignored — the trailer is a
+ * sentinel, not an echo.
+ */
 static void debugGetMd5(uint8_t *frame, size_t *frame_len, size_t length)
 {
     if (length < 3 || ext_strucpp_program_md5 == NULL)
@@ -316,9 +332,6 @@ static void debugGetMd5(uint8_t *frame, size_t *frame_len, size_t length)
         respond_short(frame, frame_len, MB_FC_DEBUG_GET_MD5, MB_DEBUG_ERROR_NOT_LOADED);
         return;
     }
-
-    uint8_t echo_hi = frame[1];
-    uint8_t echo_lo = frame[2];
 
     frame[0] = MB_FC_DEBUG_GET_MD5;
     frame[1] = MB_DEBUG_SUCCESS;
@@ -332,8 +345,10 @@ static void debugGetMd5(uint8_t *frame, size_t *frame_len, size_t length)
     }
     if (pos + 2 <= MAX_DEBUG_FRAME)
     {
-        frame[pos++] = echo_hi;
-        frame[pos++] = echo_lo;
+        /* Native-order store of the endianness sentinel — the resulting
+         * bytes reveal the target's byte order to the editor. */
+        *(uint16_t *)&frame[pos] = 0xDEAD;
+        pos += 2;
     }
     *frame_len = pos;
 }
