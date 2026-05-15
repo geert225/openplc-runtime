@@ -293,18 +293,29 @@ def apply_vpp_plugin_conf(generated_dir: str = "core/generated") -> None:
         shutil.copy2(uploaded_conf, VPP_CONF_DEST)
         build_state.log(f"[INFO] VPP: installed vpp_plugins.conf from upload\n")
 
-        # Copy each VPP plugin's config file into build/vpp/ so the path
-        # referenced inside vpp_plugins.conf resolves correctly after compile.
+        # Copy each VPP plugin's config file to the path declared in
+        # vpp_plugins.conf (the config_path field). That field is the
+        # single source of truth for where the .so will look for its
+        # config at runtime — use it directly rather than constructing
+        # a separate destination.
         conf_dir = os.path.join(generated_dir, "conf")
         vpp_conf_plugins = PluginsConfiguration.from_file(VPP_CONF_DEST)
+        runtime_root = os.path.abspath(".")
         for p in vpp_conf_plugins.plugins:
-            # Config file is expected at conf/<name>.json in the upload
+            if not p.config_path:
+                continue
             src_config = os.path.join(conf_dir, f"{p.name}.json")
-            if os.path.exists(src_config):
-                os.makedirs(VPP_BUILD_DIR, exist_ok=True)
-                dest_config = os.path.join(VPP_BUILD_DIR, f"{p.name}.json")
-                shutil.copy2(src_config, dest_config)
-                build_state.log(f"[INFO] VPP: copied {p.name}.json to {dest_config}\n")
+            if not os.path.exists(src_config):
+                build_state.log(f"[WARNING] VPP: conf/{p.name}.json not found in upload, skipping\n")
+                continue
+            dest_config = os.path.normpath(p.config_path)
+            # Guard against path traversal in editor-generated vpp_plugins.conf
+            if not os.path.abspath(dest_config).startswith(runtime_root):
+                build_state.log(f"[WARNING] VPP: config_path '{p.config_path}' escapes runtime root, skipping\n")
+                continue
+            os.makedirs(os.path.dirname(dest_config), exist_ok=True)
+            shutil.copy2(src_config, dest_config)
+            build_state.log(f"[INFO] VPP: copied {p.name}.json to {dest_config}\n")
     else:
         # No VPP in this upload — remove any stale vpp_plugins.conf so
         # the plugin loader does not attempt to load old VPP drivers.
