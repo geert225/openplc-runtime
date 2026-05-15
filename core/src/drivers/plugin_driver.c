@@ -323,7 +323,31 @@ int plugin_driver_update_config(plugin_driver_t *driver, const char *config_file
      * safely rebuild from configs[] without worrying about stale state.
      * This function is only called from load_plc_program (post-STOP) and
      * plc_main.c boot, both of which guarantee no plugin is running, so
-     * dlclose is safe. */
+     * dlclose is safe.
+     *
+     * GIL: this function does Python work in two places —
+     *   1) teardown_plugin_instance → python_plugin_cleanup (Py_XDECREF,
+     *      PyObject_CallFunctionObjArgs) for any old Python slot;
+     *   2) python_plugin_get_symbols (PyImport_ImportModule, etc.) for
+     *      each new Python entry in the rebuild loop.
+     * Both require the GIL. plc_main releases the GIL after the initial
+     * plugin init, so the second update_config call (from
+     * load_plc_program) lands here without it.
+     *
+     * The teardown loop is the only stage that strictly needs an explicit
+     * ensure — if Python is initialized and we have Python plugins to
+     * tear down, we MUST hold the GIL or Py_XDECREF will SIGSEGV. The
+     * rebuild loop's python_plugin_get_symbols handles the cold-start
+     * case itself (it calls Py_Initialize if needed and is implicitly
+     * GIL-holding after that), so for that loop we just need to make
+     * sure we don't release the GIL we acquired here. */
+    PyGILState_STATE plugin_gstate = PyGILState_LOCKED;
+    int plugin_have_gil = Py_IsInitialized();
+    if (plugin_have_gil)
+    {
+        plugin_gstate = PyGILState_Ensure();
+    }
+
     int old_plugin_count = driver->plugin_count;
     for (int w = 0; w < old_plugin_count; w++)
     {
@@ -348,10 +372,36 @@ int plugin_driver_update_config(plugin_driver_t *driver, const char *config_file
         if (configs[w].type == PLUGIN_TYPE_PYTHON)
         {
             has_python_plugin = 1;
-            // Python symbol loading is deferred to plugin_driver_load_config;
-            // update_config is called at runtime after STOP and we want to
-            // mirror the behaviour of the original code, which only loaded
-            // native symbols here. Python re-import happens lazily.
+            /* Re-import Python module symbols here. The teardown loop
+             * above ran python_plugin_cleanup, which zeros python_plugin.
+             * Without re-importing, plugin_driver_init's Python branch
+             * (which requires plugin->python_plugin && pFuncInit) would
+             * silently skip every Python plugin on the second invocation
+             * of update_config — the modbus_slave / modbus_master / opcua
+             * plugins would never re-init after a PLC restart.
+             *
+             * python_plugin_get_symbols handles cold-start itself: if
+             * Python isn't initialized yet, it calls Py_Initialize which
+             * implicitly puts the current thread in possession of the GIL,
+             * so subsequent Python plugins in this loop also run safely
+             * without an explicit ensure. */
+            if (plugin->config.path[0] != '\0')
+            {
+                if (python_plugin_get_symbols(plugin) != 0)
+                {
+                    if (plugin->config.enabled)
+                    {
+                        log_error("[PLUGIN] enabled Python plugin '%s' failed to load symbols",
+                                  configs[w].name);
+                        ++load_failures;
+                    }
+                    else
+                    {
+                        log_warn("[PLUGIN] disabled Python plugin '%s' has no loadable module",
+                                 configs[w].name);
+                    }
+                }
+            }
         }
         else if (configs[w].type == PLUGIN_TYPE_NATIVE)
         {
@@ -377,6 +427,11 @@ int plugin_driver_update_config(plugin_driver_t *driver, const char *config_file
                 }
             }
         }
+    }
+
+    if (plugin_have_gil)
+    {
+        PyGILState_Release(plugin_gstate);
     }
 
     return (load_failures > 0) ? -1 : 0;
@@ -448,33 +503,13 @@ int plugin_driver_load_config(plugin_driver_t *driver, const char *config_file)
         return -1;
     }
 
-    plugin_driver_update_config(driver, config_file);
-
-    // Now retrieve the function symbols and initialize
-    // struct plugin_instance_t para cada plugin.
-    for (int i = 0; i < driver->plugin_count; i++)
-    {
-        plugin_instance_t *plugin = &driver->plugins[i];
-
-        if (plugin->config.type == PLUGIN_TYPE_PYTHON)
-        {
-            if (python_plugin_get_symbols(plugin) != 0)
-            {
-                log_error("Failed to get Python plugin symbols for: %s", plugin->config.path);
-                return -1;
-            }
-        }
-        else if (plugin->config.type == PLUGIN_TYPE_NATIVE)
-        {
-            if (native_plugin_get_symbols(plugin) != 0)
-            {
-                log_error("Failed to get native plugin symbols for: %s", plugin->config.path);
-                return -1;
-            }
-        }
-    }
-
-    return 0;
+    /* plugin_driver_update_config now performs the full teardown + rebuild,
+     * including symbol loading for both Python and native plugins. The
+     * previous post-update_config loop here would re-call the *get_symbols
+     * functions on already-loaded slots — those allocate fresh bundles and
+     * overwrite the pointer, leaking the bundle that update_config just
+     * created. Just forward the return code. */
+    return plugin_driver_update_config(driver, config_file);
 }
 
 // Send to plugin init function all args
