@@ -75,6 +75,11 @@ typedef struct
 plugin_driver_t *plugin_driver_create(void);
 int plugin_driver_load_config(plugin_driver_t *driver, const char *config_file);
 int plugin_driver_update_config(plugin_driver_t *driver, const char *config_file);
+/** Append plugins from a secondary config file without tearing down the
+ *  plugins already loaded by plugin_driver_update_config. Used to load
+ *  VPP plugins from vpp_plugins.conf after built-ins from plugins.conf.
+ *  Returns 0 on success, -1 if any enabled plugin fails to load its .so. */
+int plugin_driver_append_config(plugin_driver_t *driver, const char *config_file);
 int plugin_driver_init(plugin_driver_t *driver);
 /* Mirror of plugin_driver_init: walks plugins[] in reverse order and calls
  * the matching cleanup hook on every plugin whose `initialized` flag is

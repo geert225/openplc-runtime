@@ -214,56 +214,8 @@ def update_plugin_configurations(generated_dir: str = "core/generated"):
             else:
                 build_state.log(f"[WARNING] {message}\n")
 
-    # Handle VPP plugin registration
-    # VPP plugins are compiled from source on-target. If a compiled VPP plugin
-    # .so exists in the build directory, register it in plugins.conf.
-    # VPP outputs live under build/vpp/ (a dedicated subdir) so the lookup
-    # glob can't accidentally match a future built-in plugin .so dropped
-    # into build/ — see compile.sh for the matching layout.
-    build_dir = os.path.join(generated_dir, "build") if generated_dir != "core/generated" else "build"
-    vpp_plugin_dir = os.path.join(generated_dir, "vpp_plugin")
-    vpp_output_dir = os.path.join(build_dir, "vpp")
-    vpp_sos = glob.glob(os.path.join(vpp_output_dir, "lib*_plugin.so"))
-
-    if os.path.exists(vpp_plugin_dir) and vpp_sos:
-        for so_path in vpp_sos:
-            # Extract plugin name: "libsynergy_plugin.so" -> "synergy"
-            so_basename = os.path.basename(so_path)
-            plugin_name = so_basename.replace("lib", "").replace("_plugin.so", "")
-
-            # Find matching config file
-            config_path = os.path.join(conf_dir, f"{plugin_name}.json")
-            if not os.path.exists(config_path):
-                build_state.log(f"[WARNING] VPP plugin {plugin_name}: no config file found at {config_path}\n")
-                continue
-
-            if not plugins_config.has_plugin(plugin_name):
-                # First-time deployment: add new entry
-                plugins_config.add_plugin(
-                    name=plugin_name,
-                    path=so_path,
-                    enabled=True,
-                    plugin_type=PluginType.NATIVE,
-                    config_path=config_path,
-                )
-                plugins_updated += 1
-                build_state.log(f"[INFO] Registered new VPP plugin '{plugin_name}' from {so_path}\n")
-            else:
-                # Update existing entry with new paths and enable
-                plugins_config.update_plugin_path(plugin_name, so_path)
-                for p in plugins_config.plugins:
-                    if p.name == plugin_name:
-                        p.config_path = config_path
-                        if not p.enabled:
-                            p.enabled = True
-                            plugins_updated += 1
-                        break
-                build_state.log(f"[INFO] Updated VPP plugin '{plugin_name}' path to {so_path}\n")
-    elif not os.path.exists(vpp_plugin_dir):
-        # No VPP plugin in this upload — disable any previously registered VPP plugins
-        # that no longer have a matching config file (already handled by
-        # update_plugins_from_config_dir above, since their config won't be in conf/)
-        pass
+    # VPP plugins are handled separately via vpp_plugins.conf — see
+    # apply_vpp_plugin_conf(). Nothing to do here for VPP.
 
     # Save the updated configuration
     if plugins_config.to_file(plugins_conf_path):
@@ -310,6 +262,55 @@ def _wait_for_plc_idle(runtime_manager: RuntimeManager, timeout_s: float) -> boo
             return True
         time.sleep(0.1)
     return False
+
+
+def apply_vpp_plugin_conf(generated_dir: str = "core/generated") -> None:
+    """Apply or remove the VPP plugin configuration for this upload.
+
+    VPP plugins are fully owned by the editor: it sends a
+    ``vpp_plugins.conf`` alongside the program when the target is a VPP
+    board, and omits it for vanilla builds.  This function is the single
+    authoritative gate:
+
+    * **Upload includes vpp_plugins.conf** → copy it to the runtime root
+      so the C-side plugin loader picks it up at the next PLC start.
+      Also copy each plugin's JSON config from ``conf/`` into the VPP
+      build output directory (``build/vpp/``) so the .so can read it
+      from the stable location listed in vpp_plugins.conf.
+
+    * **Upload does not include vpp_plugins.conf** → delete any existing
+      ``vpp_plugins.conf`` from the runtime root.  This ensures a
+      vanilla upload never inadvertently loads a VPP driver left over
+      from a previous project, regardless of what .so files exist in
+      ``build/vpp/``.
+    """
+    VPP_CONF_DEST = "vpp_plugins.conf"
+    VPP_BUILD_DIR = "build/vpp"
+    uploaded_conf = os.path.join(generated_dir, "vpp_plugins.conf")
+
+    if os.path.exists(uploaded_conf):
+        # Copy vpp_plugins.conf to runtime root
+        shutil.copy2(uploaded_conf, VPP_CONF_DEST)
+        build_state.log(f"[INFO] VPP: installed vpp_plugins.conf from upload\n")
+
+        # Copy each VPP plugin's config file into build/vpp/ so the path
+        # referenced inside vpp_plugins.conf resolves correctly after compile.
+        conf_dir = os.path.join(generated_dir, "conf")
+        vpp_conf_plugins = PluginsConfiguration.from_file(VPP_CONF_DEST)
+        for p in vpp_conf_plugins.plugins:
+            # Config file is expected at conf/<name>.json in the upload
+            src_config = os.path.join(conf_dir, f"{p.name}.json")
+            if os.path.exists(src_config):
+                os.makedirs(VPP_BUILD_DIR, exist_ok=True)
+                dest_config = os.path.join(VPP_BUILD_DIR, f"{p.name}.json")
+                shutil.copy2(src_config, dest_config)
+                build_state.log(f"[INFO] VPP: copied {p.name}.json to {dest_config}\n")
+    else:
+        # No VPP in this upload — remove any stale vpp_plugins.conf so
+        # the plugin loader does not attempt to load old VPP drivers.
+        if os.path.exists(VPP_CONF_DEST):
+            os.remove(VPP_CONF_DEST)
+            build_state.log("[INFO] VPP: removed stale vpp_plugins.conf (no VPP in upload)\n")
 
 
 def run_compile(runtime_manager: RuntimeManager, cwd: str = "core/generated", clean: bool = False):

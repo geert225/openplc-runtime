@@ -588,6 +588,20 @@ extern "C" int load_plc_program(PluginManager *pm)
                 plugin_manager_destroy(pm);
                 return -1;
             }
+            /* Load VPP plugins from the editor-generated vpp_plugins.conf.
+             * The file is absent when the upload had no VPP target, so an
+             * absent file is silently ignored (not an error). */
+            if (plugin_driver_append_config(plugin_driver, "./vpp_plugins.conf") != 0)
+            {
+                log_error("[PLUGIN]: VPP plugin failed to load — check vpp_plugins.conf and build/vpp/");
+                pthread_mutex_lock(&state_mutex);
+                plc_state = PLC_STATE_ERROR;
+                pthread_mutex_unlock(&state_mutex);
+                log_info("PLC State: ERROR");
+                if (pm == plc_program) plc_program = NULL;
+                plugin_manager_destroy(pm);
+                return -1;
+            }
             if (plugin_driver_init(plugin_driver) != 0)
             {
                 /* Roll back any plugins that did initialise before the

@@ -32,6 +32,7 @@ from webserver.plcapp_management import (
     build_state,
     run_compile,
     safe_extract,
+    apply_vpp_plugin_conf,
     update_plugin_configurations,
 )
 from webserver.restapi import (
@@ -241,7 +242,10 @@ def handle_upload_file(data: dict) -> dict:
 
         safe_extract(zip_file, extract_dir, valid_files)
 
-        # Update plugin configurations based on extracted config files
+        # Apply VPP plugin conf from upload (copy if present, delete if not)
+        apply_vpp_plugin_conf(extract_dir)
+
+        # Update built-in plugin configurations based on extracted config files
         update_plugin_configurations(extract_dir)
 
         # ?clean=1 — wired from the editor's "Clean build and upload" UI

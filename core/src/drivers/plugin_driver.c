@@ -382,6 +382,65 @@ int plugin_driver_update_config(plugin_driver_t *driver, const char *config_file
     return (load_failures > 0) ? -1 : 0;
 }
 
+int plugin_driver_append_config(plugin_driver_t *driver, const char *config_file)
+{
+    if (!driver || !config_file)
+    {
+        return -1;
+    }
+
+    if (access(config_file, F_OK) != 0)
+    {
+        /* File absent is not an error — VPP is optional. */
+        return 0;
+    }
+
+    plugin_config_t configs[MAX_PLUGINS];
+    int config_count = parse_plugin_config(config_file, configs, MAX_PLUGINS);
+    if (config_count < 0)
+    {
+        return -1;
+    }
+
+    int load_failures = 0;
+
+    for (int w = 0; w < config_count; w++)
+    {
+        /* Skip if we'd overflow the driver's plugin array. */
+        if (driver->plugin_count >= MAX_PLUGINS)
+        {
+            log_warn("[PLUGIN] plugin_driver_append_config: MAX_PLUGINS reached, skipping '%s'",
+                     configs[w].name);
+            break;
+        }
+
+        plugin_instance_t *plugin = &driver->plugins[driver->plugin_count];
+        memset(plugin, 0, sizeof(*plugin));
+        memcpy(&plugin->config, &configs[w], sizeof(plugin_config_t));
+        driver->plugin_count++;
+
+        if (configs[w].type == PLUGIN_TYPE_NATIVE)
+        {
+            if (native_plugin_get_symbols(plugin) != 0)
+            {
+                if (plugin->config.enabled)
+                {
+                    log_error("[PLUGIN] enabled VPP plugin '%s' failed to load symbols",
+                              configs[w].name);
+                    ++load_failures;
+                }
+                else
+                {
+                    log_warn("[PLUGIN] disabled VPP plugin '%s' has no loadable .so",
+                             configs[w].name);
+                }
+            }
+        }
+    }
+
+    return (load_failures > 0) ? -1 : 0;
+}
+
 int plugin_driver_load_config(plugin_driver_t *driver, const char *config_file)
 {
     if (!driver || !config_file)
