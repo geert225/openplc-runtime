@@ -2,6 +2,13 @@
 
 FROM debian:bookworm-slim
 
+# Runtime version baked in at build time (mirrors strucpp + editor —
+# the value is the GitHub release tag, passed by .github/workflows/
+# docker.yml).  Editors read this via /api/version to gate uploads
+# (the v4.1.x runtime ships STruC++; older runtimes ship MatIEC).
+ARG RUNTIME_VERSION=dev
+ENV RUNTIME_VERSION=${RUNTIME_VERSION}
+
 WORKDIR /workdir
 
 # Copy source code
