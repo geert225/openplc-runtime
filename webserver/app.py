@@ -24,6 +24,7 @@ import flask_login
 from webserver.credentials import CertGen
 from webserver.debug_websocket import init_debug_websocket
 from webserver.discovery.discovery_routes import discovery_bp
+from webserver.discovery.network_discovery import responder as network_discovery_responder
 from webserver.logger import get_logger
 from webserver.plcapp_management import (
     MAX_FILE_SIZE,
@@ -59,6 +60,11 @@ runtime_manager = RuntimeManager(
 )
 
 runtime_manager.start()
+
+# UDP discovery responder so the editor can find this runtime on the LAN.
+# Failure to bind is logged and ignored — discovery is a convenience, not a
+# hard dependency.
+network_discovery_responder.start()
 
 # Store in Flask app config so blueprints can access via current_app
 # without triggering a re-import of this module (which would create
@@ -386,6 +392,7 @@ def run_https():
     finally:
         logger.info("Runtime manager stopped")
         runtime_manager.stop()
+        network_discovery_responder.stop()
 
 
 if __name__ == "__main__":
