@@ -91,12 +91,7 @@ class NetworkDiscoveryResponder:
             target=self._run, name="network-discovery", daemon=True
         )
         self._thread.start()
-        # WARNING level so it surfaces with default log filtering.
-        logger.warning(
-            "[DISCOVERY] Responder listening on UDP %d (hostname=%s)",
-            self.port,
-            socket.gethostname(),
-        )
+        logger.info("Discovery responder listening on UDP %d", self.port)
         return True
 
     def stop(self) -> None:
@@ -122,45 +117,14 @@ class NetworkDiscoveryResponder:
             self._handle(data, addr)
 
     def _handle(self, data: bytes, addr: tuple[str, int]) -> None:
-        src_ip = addr[0]
-        src_port = addr[1]
-
         # Strict input filter: exact magic only, anything else dropped.
-        if len(data) > MAX_REQUEST_BYTES:
-            logger.warning(
-                "[DISCOVERY] Dropping oversized packet from %s:%d (%d bytes)",
-                src_ip,
-                src_port,
-                len(data),
-            )
-            return
-        if data.strip() != DISCOVERY_MAGIC:
-            # Log a short, safe preview — never echo raw bytes back out.
-            preview = data[:32].decode("utf-8", errors="replace")
-            logger.warning(
-                "[DISCOVERY] Dropping packet from %s:%d (%d bytes, not the magic). Preview: %r",
-                src_ip,
-                src_port,
-                len(data),
-                preview,
-            )
+        if len(data) > MAX_REQUEST_BYTES or data.strip() != DISCOVERY_MAGIC:
             return
 
-        logger.warning(
-            "[DISCOVERY] Received probe from %s:%d (%d bytes)",
-            src_ip,
-            src_port,
-            len(data),
-        )
-
+        src_ip = addr[0]
         now = time.monotonic()
         last = self._last_seen.get(src_ip, 0.0)
         if now - last < PER_IP_RATE_LIMIT_SECONDS:
-            logger.warning(
-                "[DISCOVERY] Rate-limit drop for %s (last reply %.3fs ago)",
-                src_ip,
-                now - last,
-            )
             return
         self._last_seen[src_ip] = now
 
@@ -185,18 +149,9 @@ class NetworkDiscoveryResponder:
 
         try:
             assert self._sock is not None
-            sent = self._sock.sendto(payload, addr)
-            logger.warning(
-                "[DISCOVERY] Sent reply to %s:%d (%d/%d bytes)",
-                src_ip,
-                src_port,
-                sent,
-                len(payload),
-            )
+            self._sock.sendto(payload, addr)
         except OSError as exc:
-            logger.warning(
-                "[DISCOVERY] Reply to %s:%d failed: %s", src_ip, src_port, exc
-            )
+            logger.debug("Discovery reply to %s failed: %s", src_ip, exc)
 
 
 # Module-level singleton used by webserver/app.py.
