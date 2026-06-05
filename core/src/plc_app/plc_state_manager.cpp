@@ -140,6 +140,13 @@ static void *plc_task_thread(void *arg)
 
     if (ctx->cpu_affinity_mask != 0)
     {
+        // CPU affinity uses `cpu_set_t` / `CPU_ZERO` / `CPU_SETSIZE` /
+        // `pthread_setaffinity_np` — all Linux extensions to `<sched.h>`,
+        // not present on MSYS2/Cygwin/Windows.  Skip silently when
+        // building for a non-Linux host: Windows doesn't expose
+        // SCHED_FIFO either, so any "pin to CPU" guarantee would already
+        // be unachievable there.
+#if !defined(__CYGWIN__) && !defined(__MSYS__) && defined(__linux__)
         cpu_set_t cs;
         CPU_ZERO(&cs);
         for (int cpu = 0; cpu < 64 && cpu < CPU_SETSIZE; ++cpu)
@@ -151,6 +158,10 @@ static void *plc_task_thread(void *arg)
             log_warn("[task %s] pthread_setaffinity_np failed: %s",
                      ctx->name, strerror(errno));
         }
+#else
+        log_info("[task %s] CPU affinity requested but unsupported on this platform",
+                 ctx->name);
+#endif
     }
 
     if (sigsetjmp(ctx->crash_jmp, 1) != 0)

@@ -60,8 +60,21 @@ target_compile_options(soem PUBLIC\n\
 # HAVE_U_INT*_T tells bundled bittypes.h to skip its typedefs --\n\
 # MSYS2 POSIX headers (sys/types.h) already provide these types and\n\
 # use different underlying types on LP64 (long vs long long for 64-bit).\n\
+#\n\
+# __USE_W32_SOCKETS tells MSYS2 / Cygwin's POSIX headers\n\
+# (\`sys/select.h\`, \`sys/unistd.h\`) NOT to declare their own \`select\`\n\
+# and \`gethostname\` — the Win32 \`winsock2.h\` declarations (which the\n\
+# bundled wpcap headers pull in transitively) are the ones we want\n\
+# to use.  Without this, any TU that includes both a POSIX header\n\
+# (e.g. \`<signal.h>\` in ethercat_plugin.c, which transitively pulls\n\
+# in sys/select.h) AND a SOEM/wpcap header (which pulls in\n\
+# winsock2.h) gets a redeclaration error because the two libcs\n\
+# disagree on the signature ( \`struct timeval *\` vs \`const TIMEVAL *\`,\n\
+# \`size_t\` vs \`int\`).  Marking the macro PUBLIC propagates it to\n\
+# every target linking against soem (notably ethercat_plugin).\n\
 target_compile_definitions(soem PUBLIC\n\
   WIN32\n\
+  __USE_W32_SOCKETS\n\
   HAVE_U_INT8_T\n\
   HAVE_U_INT16_T\n\
   HAVE_U_INT32_T\n\

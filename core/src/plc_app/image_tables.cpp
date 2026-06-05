@@ -93,7 +93,16 @@ namespace {
     {
         pthread_mutexattr_t attr;
         if (pthread_mutexattr_init(&attr) != 0) return -1;
+        // Priority inheritance is a POSIX optional feature.  MSYS2/Cygwin
+        // pthread on Windows doesn't ship it (PTHREAD_PRIO_INHERIT is
+        // undefined, pthread_mutexattr_setprotocol is unavailable).
+        // Windows has no real-time scheduling anyway, so the PI protocol
+        // would be a no-op even if it linked — fall back to a plain
+        // recursive mutex.
+#if !defined(__CYGWIN__) && !defined(__MSYS__) && \
+    defined(_POSIX_THREAD_PRIO_INHERIT) && _POSIX_THREAD_PRIO_INHERIT > 0
         pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_INHERIT);
+#endif
         pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
         int rc = pthread_mutex_init(m, &attr);
         pthread_mutexattr_destroy(&attr);
