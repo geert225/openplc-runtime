@@ -54,7 +54,20 @@ check_required_files() {
 check_required_files
 
 # Build the program — actual rules live in scripts/Makefile.strucpp.
-make -j"$(nproc)" -f scripts/Makefile.strucpp
+#
+# Leave one core free for the rest of the system. On a 4-core Pi 4
+# (the smallest target we ship to), `-j$(nproc)` saturates every core
+# with g++ and starves the webserver / runtime monitor of CPU during
+# the compile; combined with the Pi's slow SD-card swap, that's been
+# observed to make port-8443 RST new connections for 60+ seconds while
+# the compile thrashes. `nproc - 1` keeps one core reserved for the
+# Flask webserver, the runtime monitor thread, and any plugins still
+# running — only ~25 % slower per build on a Pi 4, but the device stays
+# responsive throughout. Floor at 1 so single-core targets don't end up
+# with `-j0` (which means "unlimited" in GNU make, i.e. fork-bomb).
+JOBS=$(nproc)
+[ "$JOBS" -gt 1 ] && JOBS=$((JOBS - 1))
+make -j"$JOBS" -f scripts/Makefile.strucpp
 
 # -----------------------------------------------------------------------
 # Compile VPP plugin if source is present in the uploaded project
