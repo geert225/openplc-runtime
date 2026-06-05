@@ -466,6 +466,17 @@ build_native_plugins() {
     local plugins_built=0
     local plugins_failed=0
 
+    # Plugins that require Linux-only kernel features (SCHED_FIFO,
+    # PREEMPT_RT, raw sockets via libpcap with kernel bypass) — skip
+    # them entirely on MSYS2/Windows.  The vendored SOEM EtherCAT
+    # master in particular ships its own Windows port (under
+    # `oshw/win32/wpcap/`) that conflicts with MSYS2's w32api
+    # `winsock2.h` (duplicate definitions of `select`, `gethostname`,
+    # etc.), and even if those headers compiled cleanly the runtime
+    # behaviour relies on PREEMPT_RT scheduling that Windows doesn't
+    # provide.  These plugins are Linux-only by design.
+    local linux_only_plugins=("ethercat")
+
     for plugin_dir in "$native_plugins_dir"/*/; do
         # Skip if not a directory
         [ -d "$plugin_dir" ] || continue
@@ -476,6 +487,21 @@ build_native_plugins() {
         # Skip if no CMakeLists.txt
         if [ ! -f "$cmake_file" ]; then
             continue
+        fi
+
+        # Skip Linux-only plugins on MSYS2/Windows
+        if is_msys2; then
+            local is_linux_only=0
+            for skip in "${linux_only_plugins[@]}"; do
+                if [ "$plugin_name" = "$skip" ]; then
+                    is_linux_only=1
+                    break
+                fi
+            done
+            if [ "$is_linux_only" = "1" ]; then
+                log_info "Skipping Linux-only plugin on MSYS2/Windows: $plugin_name"
+                continue
+            fi
         fi
 
         plugins_found=$((plugins_found + 1))
