@@ -1221,24 +1221,49 @@ def start_loop():
         return False
 
 
+def _cancel_all_tasks(loop):
+    """Cancel all running tasks on the event loop."""
+    for task in asyncio.all_tasks(loop):
+        task.cancel()
+
+
 def stop_loop():
-    """Stop the Modbus server gracefully."""
+    """Stop the Modbus server gracefully.
+
+    Uses a two-phase approach:
+    1. Graceful (10s): call ServerStop and wait for the thread to finish.
+    2. Forced (5s): cancel all asyncio tasks on the event loop and wait again.
+
+    Returns:
+        True if the server thread stopped, False if it survived both phases.
+    """
     global server_task, running
 
     running = False
 
     if server_task:
-        # Call ServerStop() directly - it's designed for cross-thread use
-        # (uses asyncio.run_coroutine_threadsafe internally)
+        # Phase 1: Graceful stop via pymodbus ServerStop
         try:
             ServerStop()
         except RuntimeError as e:
             # Server may not be running or already stopped
             logger.warn(f"ServerStop warning: {e}")
 
-        server_task.join(timeout=5.0)
+        server_task.join(timeout=10.0)
+
         if server_task.is_alive():
-            logger.warn("Server thread did not stop within timeout")
+            # Phase 2: Force-cancel the event loop
+            logger.warn("Graceful stop timed out, forcing event loop cancellation...")
+            loop = server_loop
+            if loop is not None and loop.is_running():
+                loop.call_soon_threadsafe(_cancel_all_tasks, loop)
+            server_task.join(timeout=5.0)
+
+        if server_task.is_alive():
+            logger.error("Server thread did not stop after forced cancellation")
+            server_task = None
+            return False
+
         server_task = None
 
     logger.info("Server stopped")

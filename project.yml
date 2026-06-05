@@ -3,7 +3,7 @@
   :use_exceptions: FALSE
   :use_mocks: TRUE
   :use_test_preprocessor: :none
-  :use_backtrace: :gdb
+  :use_backtrace: :none
   :build_root: build/test
   :test_file_prefix: test_
   :release_build: FALSE # We don't need release builds for testing
@@ -13,13 +13,24 @@
     - tests/**
   :source:
     - core/src/**
-    # Exclude files that are not part of the unit under test or have heavy external deps
-    # For now, we include everything and let Ceedling handle linking.
-    # If specific files cause issues, we can exclude them here.
+    - -:core/src/drivers/plugins/native/s7comm/** # Exclude s7comm to avoid duplicate cJSON.c
+    # SOEM ships per-OS osal/oshw variants; only the Linux ones are valid for tests.
+    # Excluding the others keeps compilation and the include resolution unambiguous.
+    - -:core/src/drivers/plugins/native/ethercat/libs/soem/contrib/**
+    - -:core/src/drivers/plugins/native/ethercat/libs/soem/osal/win32/**
+    - -:core/src/drivers/plugins/native/ethercat/libs/soem/osal/rtk/**
+    - -:core/src/drivers/plugins/native/ethercat/libs/soem/oshw/win32/**
+    - -:core/src/drivers/plugins/native/ethercat/libs/soem/oshw/rtk/**
   :support:
     - tests/support/**  # Include support files (stubs, mocks, helpers)
   :include:
     - core/src/**
+    - -:core/src/drivers/plugins/native/s7comm/**
+    - -:core/src/drivers/plugins/native/ethercat/libs/soem/contrib/**
+    - -:core/src/drivers/plugins/native/ethercat/libs/soem/osal/win32/**
+    - -:core/src/drivers/plugins/native/ethercat/libs/soem/osal/rtk/**
+    - -:core/src/drivers/plugins/native/ethercat/libs/soem/oshw/win32/**
+    - -:core/src/drivers/plugins/native/ethercat/libs/soem/oshw/rtk/**
     - tests/support # For custom helpers or mocks if needed
 
 :defines:
@@ -30,7 +41,26 @@
     - UNITY_INCLUDE_DOUBLE # Enable double support in Unity
 
 :plugins:
-  :enabled: []
+  :enabled:
+    - gcov
+
+# ----------------------------------------------------------------------------
+# Coverage report config (used by `ceedling gcov:all`).
+# Generates a text summary on stdout and a navigable HTML report under
+# build/gcov/. Excludes vendored code (SOEM, cJSON) and the test tree itself
+# so the numbers reflect cobertura do código de produção.
+# ----------------------------------------------------------------------------
+:gcov:
+  :utilities:
+    - gcovr
+  :summaries: FALSE          # suppress per-test stdout summaries; the
+                             # aggregated report below is what matters.
+  :reports:
+    - HtmlDetailed
+    - Text
+  :gcovr:
+    :report_include: 'core/src/.*'
+    :report_exclude: '(.*\/libs\/.*|.*\/cjson\/.*|.*\/tests\/.*|.*\/s7comm\/.*)'
 
 :cmock:
   :mock_prefix: mock_
@@ -48,11 +78,11 @@
 :flags:
   :test:
     :compile:
-      - -I/usr/include/python3.10 # From pkg-config --cflags-only-I python3-embed
+      - -I/usr/include/python3.12 # From pkg-config --cflags-only-I python3-embed
 
 :libraries:
   :test:
-    - python3.10               # From pkg-config --libs python3-embed (Ceedling adds -l)
+    - python3.12               # From pkg-config --libs python3-embed (Ceedling adds -l)
     - dl                       # Required by plugin_driver.c (Ceedling adds -l)
     - pthread                  # Required by plugin_driver.c (Ceedling adds -l)
 

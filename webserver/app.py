@@ -23,6 +23,8 @@ import flask_login
 
 from webserver.credentials import CertGen
 from webserver.debug_websocket import init_debug_websocket
+from webserver.discovery.discovery_routes import discovery_bp
+from webserver.discovery.network_discovery import responder as network_discovery_responder
 from webserver.logger import get_logger
 from webserver.plcapp_management import (
     MAX_FILE_SIZE,
@@ -31,6 +33,7 @@ from webserver.plcapp_management import (
     build_state,
     run_compile,
     safe_extract,
+    apply_vpp_plugin_conf,
     update_plugin_configurations,
 )
 from webserver.restapi import (
@@ -57,6 +60,16 @@ runtime_manager = RuntimeManager(
 )
 
 runtime_manager.start()
+
+# UDP discovery responder so the editor can find this runtime on the LAN.
+# Failure to bind is logged and ignored — discovery is a convenience, not a
+# hard dependency.
+network_discovery_responder.start()
+
+# Store in Flask app config so blueprints can access via current_app
+# without triggering a re-import of this module (which would create
+# a duplicate RuntimeManager when run with python -m webserver.app).
+app_restapi.config["RUNTIME_MANAGER"] = runtime_manager
 
 BASE_DIR: Final[Path] = Path(__file__).parent
 CERT_FILE: Final[Path] = (BASE_DIR / "certOPENPLC.pem").resolve()
@@ -235,8 +248,17 @@ def handle_upload_file(data: dict) -> dict:
 
         safe_extract(zip_file, extract_dir, valid_files)
 
-        # Update plugin configurations based on extracted config files
+        # Apply VPP plugin conf from upload (copy if present, delete if not)
+        apply_vpp_plugin_conf(extract_dir)
+
+        # Update built-in plugin configurations based on extracted config files
         update_plugin_configurations(extract_dir)
+
+        # ?clean=1 — wired from the editor's "Clean build and upload" UI
+        # option. Forces a full recompile by wiping core/build/ and the
+        # ccache contents before invoking compile.sh. Older editors
+        # don't pass this flag, so behaviour for them is unchanged.
+        clean_build = flask.request.args.get("clean") == "1"
 
         # Start compilation in a separate thread
         build_state.status = BuildStatus.COMPILING
@@ -244,7 +266,7 @@ def handle_upload_file(data: dict) -> dict:
         task_compile = threading.Thread(
             target=run_compile,
             args=(runtime_manager,),
-            kwargs={"cwd": extract_dir},
+            kwargs={"cwd": extract_dir, "clean": clean_build},
             daemon=True,
         )
 
@@ -268,8 +290,21 @@ def handle_upload_file(data: dict) -> dict:
         }
 
 
+def handle_plugin_command(data: dict) -> dict:
+    plugin_name = data.get("plugin")
+    command = data.get("command")
+    params = data.get("params", {})
+
+    if not plugin_name or not command:
+        return {"error": "Missing 'plugin' or 'command'"}
+
+    command_json = json.dumps({"command": command, "params": params})
+    return runtime_manager.send_plugin_command(plugin_name, command_json)
+
+
 POST_HANDLERS: dict[str, Callable[[dict], dict]] = {
     "upload-file": handle_upload_file,
+    "plugin-command": handle_plugin_command,
 }
 
 
@@ -289,6 +324,7 @@ def restapi_callback_post(argument: str, data: dict) -> dict:
 def run_https():
     # rest api register
     app_restapi.register_blueprint(restapi_bp, url_prefix="/api")
+    app_restapi.register_blueprint(discovery_bp)
     register_callback_get(restapi_callback_get)
     register_callback_post(restapi_callback_post)
 
@@ -356,6 +392,7 @@ def run_https():
     finally:
         logger.info("Runtime manager stopped")
         runtime_manager.stop()
+        network_discovery_responder.stop()
 
 
 if __name__ == "__main__":

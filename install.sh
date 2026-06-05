@@ -177,6 +177,49 @@ install_dependencies()
     fi
 }
 
+CMAKE_MIN_VERSION="3.28"
+
+install_cmake() {
+    # Check if system cmake already meets the minimum version
+    if command -v cmake >/dev/null 2>&1; then
+        local current_version
+        current_version=$(cmake --version | head -1 | grep -oP '[0-9]+\.[0-9]+(\.[0-9]+)?')
+        if printf '%s\n%s\n' "$CMAKE_MIN_VERSION" "$current_version" | sort -V | head -1 | grep -qx "$CMAKE_MIN_VERSION"; then
+            echo "CMake $current_version already meets minimum requirement ($CMAKE_MIN_VERSION)"
+            return 0
+        fi
+        echo "CMake $current_version is too old (need $CMAKE_MIN_VERSION+), installing newer version..."
+    fi
+
+    local arch
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64)  arch="x86_64" ;;
+        aarch64) arch="aarch64" ;;
+        *)
+            echo "WARNING: No prebuilt CMake binary for $arch, falling back to pip"
+            pip3 install --break-system-packages cmake
+            return $?
+            ;;
+    esac
+
+    local cmake_version="3.31.6"
+    local cmake_url="https://github.com/Kitware/CMake/releases/download/v${cmake_version}/cmake-${cmake_version}-linux-${arch}.tar.gz"
+    echo "Installing CMake ${cmake_version} from official release..."
+    curl -fsSL "$cmake_url" | tar xz -C /usr/local --strip-components=1
+    echo "CMake $(cmake --version | head -1) installed"
+}
+
+# `ccache` is added to every package set below. The runtime's
+# scripts/Makefile.strucpp picks it up automatically when present and
+# uses it to cache compiled .o files keyed by a hash of the
+# preprocessed source + compile flags. The editor uploads the full
+# project on every build, but ccache compares CONTENT (not file
+# mtime), so unchanged TUs hit the cache and skip recompilation
+# entirely. Single-POU edits drop incremental rebuilds from minutes
+# to a few seconds. Without ccache the runtime still builds — just
+# without the per-file reuse.
+
 # For apt-based distros (Debian, Ubuntu, Linux Mint, Pop!_OS, elementary OS, Zorin, MX Linux, etc.)
 install_deps_apt() {
     apt-get update && \
@@ -185,15 +228,22 @@ install_deps_apt() {
         python3-dev python3-pip python3-venv \
         gcc \
         make \
-        cmake \
+        ccache \
         pkg-config \
-        libffi-dev
+        libffi-dev \
+        ethtool \
+        git \
+        ca-certificates \
+        curl
+    # Install CMake 3.28+ (required by SOEM/EtherCAT plugin)
+    # Debian Bookworm only ships 3.25 which is too old
+    install_cmake
 }
 
 # For yum-based distros (RHEL 7, CentOS 7, Amazon Linux)
 install_deps_yum() {
     yum install -y \
-        gcc gcc-c++ make cmake \
+        gcc gcc-c++ make cmake ccache \
         python3 python3-devel python3-pip python3-venv \
     && yum clean all
 }
@@ -201,7 +251,7 @@ install_deps_yum() {
 # For dnf-based distros (Fedora, RHEL 8+, CentOS Stream, Rocky Linux, AlmaLinux, Oracle Linux 8+)
 install_deps_dnf() {
     dnf install -y \
-        gcc gcc-c++ make cmake \
+        gcc gcc-c++ make cmake ccache \
         python3 python3-devel python3-pip python3-venv \
     && dnf clean all
 }
@@ -214,6 +264,7 @@ install_deps_pacman() {
         gcc \
         make \
         cmake \
+        ccache \
         pkgconf \
         python \
         python-pip \
@@ -224,7 +275,7 @@ install_deps_pacman() {
 install_deps_zypper() {
     zypper refresh && \
     zypper install -y \
-        gcc gcc-c++ make cmake \
+        gcc gcc-c++ make cmake ccache \
         python3 python3-devel python3-pip \
         pkg-config
 }
@@ -237,6 +288,7 @@ install_deps_apk() {
         gcc \
         make \
         cmake \
+        ccache \
         pkgconf \
         python3 python3-dev py3-pip
 }
@@ -262,7 +314,9 @@ install_deps_msys2() {
         python-setuptools \
         python-cryptography \
         git \
-        sqlite3
+        sqlite3 \
+        msys2-w32api-headers \
+        msys2-w32api-runtime
 }
 
 compile_plc() {
@@ -401,6 +455,12 @@ build_native_plugins() {
     # Create plugins output directory
     mkdir -p "$plugins_output_dir"
 
+    # Initialize git submodules (needed by plugins that vendor libraries like SOEM)
+    if [ -f "$OPENPLC_DIR/.gitmodules" ]; then
+        log_info "Initializing git submodules for native plugins..."
+        git -C "$OPENPLC_DIR" submodule update --init --recursive
+    fi
+
     # Find directories with CMakeLists.txt (indicates buildable plugin)
     local plugins_found=0
     local plugins_built=0
@@ -485,6 +545,7 @@ build_native_plugins() {
 
     return 0
 }
+
 
 # Setup runtime directory (needed for both Linux and Docker)
 # On MSYS2, use /run/runtime which maps to the MSYS2 installation directory

@@ -1,5 +1,7 @@
 # Ignore all files in the build output directory
 /build*/
+# Per-plugin standalone CMake build dirs (e.g. ethercat, s7comm)
+core/src/drivers/plugins/native/*/build/
 /core/generated/
 /memory-bank
 
@@ -29,6 +31,10 @@ __pycache__/
 *.installed
 *.egg-info
 *.pytest_cache/
+
+# Auto-generated SOEM platform cmake files for MSYS2/Cygwin builds
+core/src/drivers/plugins/native/ethercat/libs/soem/cmake/MSYS.cmake
+core/src/drivers/plugins/native/ethercat/libs/soem/cmake/CYGWIN.cmake
 
 # Ignore all object files and shared libraries
 *.o

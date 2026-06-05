@@ -27,7 +27,7 @@ from .plugin_config_decode.modbus_master_config_model import ModbusIoPointConfig
 # Component interfaces (for advanced users who want to extend the system)
 from .component_interfaces import (
     IBufferType, IMutexManager, IBufferValidator, IBufferAccessor,
-    IBatchProcessor, IDebugUtils, IConfigHandler, ISafeBufferAccess
+    IBatchProcessor, IConfigHandler, ISafeBufferAccess
 )
 
 __all__ = [
@@ -56,7 +56,7 @@ __all__ = [
 
     # Component interfaces (for extension)
     'IBufferType', 'IMutexManager', 'IBufferValidator', 'IBufferAccessor',
-    'IBatchProcessor', 'IDebugUtils', 'IConfigHandler', 'ISafeBufferAccess',
+    'IBatchProcessor', 'IConfigHandler', 'ISafeBufferAccess',
 
     # Future extensions
     # 'EthercatConfig',

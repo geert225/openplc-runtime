@@ -12,6 +12,7 @@
 
 #include "journal_buffer.h"
 #include "utils/log.h"
+#include "utils/utils.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -31,7 +32,7 @@ static size_t g_count = 0;
 static uint32_t g_next_sequence = 0;
 
 /* Journal mutex - protects g_entries, g_count, g_next_sequence */
-static pthread_mutex_t g_journal_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_journal_mutex;
 
 /* Buffer pointers for applying entries */
 static journal_buffer_ptrs_t g_buffer_ptrs;
@@ -65,6 +66,11 @@ int journal_init(const journal_buffer_ptrs_t *buffer_ptrs)
         return -1;
     }
 
+    if (init_rt_mutex(&g_journal_mutex) != 0) {
+        fprintf(stderr, "[JOURNAL] Error: failed to initialize mutex\n");
+        return -1;
+    }
+
     pthread_mutex_lock(&g_journal_mutex);
 
     /* Copy buffer pointers */
@@ -92,6 +98,7 @@ void journal_cleanup(void)
     memset(&g_buffer_ptrs, 0, sizeof(g_buffer_ptrs));
 
     pthread_mutex_unlock(&g_journal_mutex);
+    pthread_mutex_destroy(&g_journal_mutex);
 }
 
 bool journal_is_initialized(void)

@@ -1,3 +1,4 @@
+import json
 import os
 import socket
 import subprocess
@@ -340,3 +341,29 @@ class RuntimeManager:
         except Exception as e:
             logger.error("Failed to get PLC stats (unexpected): %s", e)
             return None
+
+    def send_plugin_command(self, plugin_name: str, command_json: str, timeout: float = 10.0):
+        """Send a command to a plugin via the C runtime unix socket."""
+        try:
+            msg = f"PLUGIN_CMD:{plugin_name}:{command_json}\n"
+            response = self.runtime_socket.send_and_receive(msg, timeout=timeout)
+            if response is None:
+                return {"error": "No response from runtime (timeout)"}
+
+            # Parse: "PLUGIN_CMD:OK:{json}" or "PLUGIN_CMD:ERROR:{json}"
+            if response.startswith("PLUGIN_CMD:OK:"):
+                json_str = response[len("PLUGIN_CMD:OK:"):]
+                return json.loads(json_str)
+            elif response.startswith("PLUGIN_CMD:ERROR:"):
+                json_str = response[len("PLUGIN_CMD:ERROR:"):]
+                return json.loads(json_str)
+            else:
+                return {"error": f"Unexpected response: {response[:200]}"}
+        except json.JSONDecodeError:
+            return {"error": f"Invalid JSON in response: {response[:200]}"}
+        except (OSError, socket.error) as e:
+            logger.error("Failed to send plugin command: %s", e)
+            return {"error": str(e)}
+        except Exception as e:
+            logger.error("Failed to send plugin command (unexpected): %s", e)
+            return {"error": str(e)}

@@ -6,6 +6,10 @@
 #include "plugin_types.h"
 #include "python_plugin_bridge.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // Maximum number of plugins
 #define MAX_PLUGINS 16
 
@@ -21,6 +25,13 @@ typedef void (*plugin_stop_loop_func_t)(void);
 typedef void (*plugin_cycle_start_func_t)(void);
 typedef void (*plugin_cycle_end_func_t)(void);
 typedef void (*plugin_cleanup_func_t)(void);
+typedef int (*plugin_execute_command_func_t)(const char *command_json, char *response,
+                                             size_t response_size);
+// Optional: fills `out` with a JSON object describing plugin-specific
+// statistics. Called from the STATS response path so it MUST be
+// non-blocking (atomic reads or trivial copies only).
+// Return 0 on success; any other value means "skip me this cycle."
+typedef int (*plugin_get_stats_func_t)(char *out, size_t out_size);
 
 typedef struct
 {
@@ -31,6 +42,8 @@ typedef struct
     plugin_cycle_start_func_t cycle_start;
     plugin_cycle_end_func_t cycle_end;
     plugin_cleanup_func_t cleanup;
+    plugin_execute_command_func_t execute_command;
+    plugin_get_stats_func_t get_stats;
 } plugin_funct_bundle_t;
 
 // Plugin instance structure
@@ -41,6 +54,12 @@ typedef struct plugin_instance_s
     plugin_funct_bundle_t *native_plugin;
     // pthread_t thread;
     int running;
+    /* Set after a successful init() call; cleared by cleanup. Tracked
+     * separately from `running` so a partial init failure (e.g.,
+     * pthread_create on the cycle thread fails AFTER plugin_driver_init
+     * succeeded) can roll back only the plugins that actually got
+     * initialised, not those still untouched. */
+    int initialized;
     plugin_config_t config;
 } plugin_instance_t;
 
@@ -56,7 +75,20 @@ typedef struct
 plugin_driver_t *plugin_driver_create(void);
 int plugin_driver_load_config(plugin_driver_t *driver, const char *config_file);
 int plugin_driver_update_config(plugin_driver_t *driver, const char *config_file);
+/** Append plugins from a secondary config file without tearing down the
+ *  plugins already loaded by plugin_driver_update_config. Used to load
+ *  VPP plugins from vpp_plugins.conf after built-ins from plugins.conf.
+ *  Returns 0 on success, -1 if any enabled plugin fails to load its .so. */
+int plugin_driver_append_config(plugin_driver_t *driver, const char *config_file);
 int plugin_driver_init(plugin_driver_t *driver);
+/* Mirror of plugin_driver_init: walks plugins[] in reverse order and calls
+ * the matching cleanup hook on every plugin whose `initialized` flag is
+ * set, then clears the flag. Used to roll back a partial init when a
+ * later step (e.g., spawning the cycle thread) fails — without this, a
+ * subsequent INIT cycle re-runs plugin init() on top of half-allocated
+ * state and duplicates threads/sockets. Safe to call when no plugins are
+ * initialised. Returns the count of plugins it cleaned up. */
+int plugin_driver_cleanup_init(plugin_driver_t *driver);
 int plugin_driver_start(plugin_driver_t *driver);
 int plugin_driver_stop(plugin_driver_t *driver);
 void plugin_driver_destroy(plugin_driver_t *driver);
@@ -69,6 +101,18 @@ int plugin_mutex_give(pthread_mutex_t *mutex);
 void plugin_driver_cycle_start(plugin_driver_t *driver);
 void plugin_driver_cycle_end(plugin_driver_t *driver);
 
+// Route a command to a specific plugin by name (for async commands like scan)
+int plugin_driver_execute_command(plugin_driver_t *driver, const char *plugin_name,
+                                  const char *command_json, char *response, size_t response_size);
+
+// Splice plugin-contributed statistics into an already-formatted STATS
+// response. Walks loaded native plugins, calls each get_stats, and
+// inserts a "plugin_stats":{...} member before the closing `}` of the
+// existing STATS JSON. A trailing newline in `buffer` is preserved.
+// No-op if no plugin provides stats. Returns the new string length.
+size_t plugin_driver_append_stats_json(plugin_driver_t *driver, char *buffer,
+                                       size_t buffer_size);
+
 // Python plugin functions
 int python_plugin_get_symbols(plugin_instance_t *plugin);
 
@@ -79,5 +123,9 @@ int native_plugin_get_symbols(plugin_instance_t *plugin);
 void *generate_structured_args_with_driver(plugin_type_t type, plugin_driver_t *driver,
                                            int plugin_index);
 void free_structured_args(plugin_runtime_args_t *args);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // PLUGIN_DRIVER_H

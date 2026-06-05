@@ -1,5 +1,11 @@
+// _GNU_SOURCE is required for pthread_setaffinity_np and CPU_SET macros
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "utils.h"
 #include <errno.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -7,15 +13,19 @@
 // MSYS2/Cygwin does not support mlockall or real-time scheduling
 // These features are only available on Linux
 #if !defined(__CYGWIN__) && !defined(__MSYS__)
+#include <sched.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #define HAS_REALTIME_FEATURES 1
 #else
 #define HAS_REALTIME_FEATURES 0
 #endif
 
-unsigned long long *ext_common_ticktime__ = NULL;
-unsigned long tick__                      = 0;
-char *ext_plc_program_md5                 = NULL;
+/* Default 20 ms; overridden by compute_base_tick_from_config() once the
+ * .so is loaded and g_config is reachable. */
+uint64_t base_tick_ns         = 20000000ULL;
+unsigned long scan_counter    = 0;
+char *ext_strucpp_program_md5 = NULL;
 
 void normalize_timespec(struct timespec *ts)
 {
@@ -65,12 +75,13 @@ void timespec_diff(struct timespec *a, struct timespec *b, struct timespec *resu
     }
 }
 
-// configure SCHED_FIFO priority
+// CPU affinity is left to deployment (taskset, cgroup cpuset, systemd
+// CPUAffinity=) so the runtime stays hardware-agnostic.
 void set_realtime_priority(void)
 {
 #if HAS_REALTIME_FEATURES
     struct sched_param param;
-    param.sched_priority = 20; // Priority between 1 and 99
+    param.sched_priority = 20;
 
     if (sched_setscheduler(0, SCHED_FIFO, &param) != 0)
     {
@@ -79,6 +90,17 @@ void set_realtime_priority(void)
     else
     {
         log_info("Scheduler set to SCHED_FIFO, priority %d", param.sched_priority);
+    }
+
+    // Default timer slack (50us) directly becomes wake-up jitter on
+    // clock_nanosleep(TIMER_ABSTIME). PR_SET_TIMERSLACK is per-thread.
+    if (prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0) != 0)
+    {
+        log_warn("PR_SET_TIMERSLACK failed: %s", strerror(errno));
+    }
+    else
+    {
+        log_info("Timer slack reduced to 1ns for PLC thread");
     }
 #else
     // Real-time scheduling not available on MSYS2/Cygwin
@@ -101,6 +123,29 @@ void lock_memory(void)
 #else
     // Memory locking not available on MSYS2/Cygwin
     log_info("Memory locking not available on this platform");
+#endif
+}
+
+int init_rt_mutex(pthread_mutex_t *mutex)
+{
+#if HAS_REALTIME_FEATURES
+    pthread_mutexattr_t attr;
+    if (pthread_mutexattr_init(&attr) != 0)
+        return -1;
+    if (pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_INHERIT) != 0)
+    {
+        pthread_mutexattr_destroy(&attr);
+        return -1;
+    }
+    if (pthread_mutex_init(mutex, &attr) != 0)
+    {
+        pthread_mutexattr_destroy(&attr);
+        return -1;
+    }
+    pthread_mutexattr_destroy(&attr);
+    return 0;
+#else
+    return pthread_mutex_init(mutex, NULL);
 #endif
 }
 

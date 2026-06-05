@@ -6,12 +6,12 @@
 #include <string.h>
 
 // Simple mock control variables
-static int mock_calloc_should_fail             = 0;
-static int mock_pthread_mutex_init_should_fail = 0;
-static void *mock_calloc_return_value          = NULL;
-static int mock_calloc_call_count              = 0;
-static int mock_pthread_mutex_init_call_count  = 0;
-static int mock_free_call_count                = 0;
+static int mock_calloc_should_fail          = 0;
+static int mock_init_rt_mutex_should_fail   = 0;
+static void *mock_calloc_return_value       = NULL;
+static int mock_calloc_call_count           = 0;
+static int mock_init_rt_mutex_call_count    = 0;
+static int mock_free_call_count             = 0;
 
 // Mock implementations - override the real functions
 void *calloc(size_t num, size_t size)
@@ -34,12 +34,11 @@ void *calloc(size_t num, size_t size)
     return ptr;
 }
 
-int pthread_mutex_init(pthread_mutex_t *mutex, const pthread_mutexattr_t *attr)
+int init_rt_mutex(pthread_mutex_t *mutex)
 {
     (void)mutex;
-    (void)attr; // Suppress unused warnings
-    mock_pthread_mutex_init_call_count++;
-    return mock_pthread_mutex_init_should_fail ? -1 : 0;
+    mock_init_rt_mutex_call_count++;
+    return mock_init_rt_mutex_should_fail ? -1 : 0;
 }
 
 void free(void *ptr)
@@ -54,12 +53,12 @@ void free(void *ptr)
 // Mock reset function
 void reset_mocks(void)
 {
-    mock_calloc_should_fail             = 0;
-    mock_pthread_mutex_init_should_fail = 0;
-    mock_calloc_return_value            = NULL;
-    mock_calloc_call_count              = 0;
-    mock_pthread_mutex_init_call_count  = 0;
-    mock_free_call_count                = 0;
+    mock_calloc_should_fail          = 0;
+    mock_init_rt_mutex_should_fail   = 0;
+    mock_calloc_return_value         = NULL;
+    mock_calloc_call_count           = 0;
+    mock_init_rt_mutex_call_count    = 0;
+    mock_free_call_count             = 0;
 }
 
 // Note: External buffer variables and plugin_manager_destroy are now defined in
@@ -93,8 +92,8 @@ void test_plugin_driver_create_ShouldAllocateAndInitializeDriver(void)
     TEST_ASSERT_EQUAL_INT_MESSAGE(1, mock_calloc_call_count, "calloc should be called once");
 
     // Verify that pthread_mutex_init was called
-    TEST_ASSERT_EQUAL_INT_MESSAGE(1, mock_pthread_mutex_init_call_count,
-                                  "pthread_mutex_init should be called once");
+    TEST_ASSERT_EQUAL_INT_MESSAGE(1, mock_init_rt_mutex_call_count,
+                                  "init_rt_mutex should be called once");
 
     // Verify internal state - all fields should be zero-initialized by calloc
     TEST_ASSERT_EQUAL_INT(0, driver->plugin_count);
@@ -119,29 +118,29 @@ void test_plugin_driver_create_CallocFails_ShouldReturnNULL(void)
     TEST_ASSERT_EQUAL_INT_MESSAGE(1, mock_calloc_call_count, "calloc should be called once");
 
     // Verify that pthread_mutex_init was NOT called (since calloc failed)
-    TEST_ASSERT_EQUAL_INT_MESSAGE(0, mock_pthread_mutex_init_call_count,
-                                  "pthread_mutex_init should not be called if calloc fails");
+    TEST_ASSERT_EQUAL_INT_MESSAGE(0, mock_init_rt_mutex_call_count,
+                                  "init_rt_mutex should not be called if calloc fails");
 }
 
 // Test Case 3: Test driver creation - mutex init failure
 void test_plugin_driver_create_MutexInitFails_ShouldFreeAndReturnNULL(void)
 {
     // Setup: Configure pthread_mutex_init to fail
-    mock_pthread_mutex_init_should_fail = 1;
+    mock_init_rt_mutex_should_fail = 1;
 
     // Call the function under test
     plugin_driver_t *driver = plugin_driver_create();
 
     // Assertions
     TEST_ASSERT_NULL_MESSAGE(driver,
-                             "Driver creation should return NULL if pthread_mutex_init fails");
+                             "Driver creation should return NULL if init_rt_mutex fails");
 
     // Verify that all expected functions were called
     TEST_ASSERT_EQUAL_INT_MESSAGE(1, mock_calloc_call_count, "calloc should be called once");
-    TEST_ASSERT_EQUAL_INT_MESSAGE(1, mock_pthread_mutex_init_call_count,
-                                  "pthread_mutex_init should be called once");
+    TEST_ASSERT_EQUAL_INT_MESSAGE(1, mock_init_rt_mutex_call_count,
+                                  "init_rt_mutex should be called once");
     TEST_ASSERT_EQUAL_INT_MESSAGE(
-        1, mock_free_call_count, "free should be called once to clean up after mutex init failure");
+        1, mock_free_call_count, "free should be called once to clean up after init_rt_mutex failure");
 }
 
 // Test Case 4: Test data structure manipulation (simplified)

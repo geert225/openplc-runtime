@@ -993,6 +993,9 @@ def stop_loop():
     """
     Stop the main loop and all running device threads.
     This function is called when the plugin needs to be stopped.
+
+    Returns:
+        True if all threads stopped, False if any thread survived the timeout.
     """
     global slave_threads, logger  # pylint: disable=global-variable-not-assigned
 
@@ -1013,20 +1016,24 @@ def stop_loop():
             except Exception as e:
                 logger.error(f"Error stopping thread {thread.name}: {e}")
 
-        # Wait for all threads to finish (with timeout)
-        timeout_per_thread = 5.0  # seconds
+        # Wait for all threads to finish under a shared deadline so total
+        # wall-clock time is bounded regardless of how many threads exist.
+        deadline = time.time() + 10.0
+        any_alive = False
         for thread in slave_threads:
+            remaining = max(0, deadline - time.time())
             try:
-                thread.join(timeout=timeout_per_thread)
+                thread.join(timeout=remaining)
                 if thread.is_alive():
-                    logger.warn(f"Thread {thread.name} did not stop within timeout")
+                    logger.error(f"Thread {thread.name} did not stop within timeout")
+                    any_alive = True
                 else:
                     logger.info(f"Thread {thread.name} stopped successfully")
             except Exception as e:
                 logger.error(f"Error joining thread {thread.name}: {e}")
 
         logger.info("Main loop stopped")
-        return True
+        return not any_alive
 
     except Exception as e:
         logger.error(f"Error stopping main loop: {e}")

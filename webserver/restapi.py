@@ -14,6 +14,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 import webserver.config
 from webserver.logger import get_logger
+from webserver.version import RUNTIME_VERSION
 
 logger, buffer = get_logger("logger", use_buffer=True)
 
@@ -33,9 +34,39 @@ _handler_callback_post: Optional[Callable[[str, dict], dict]] = None
 
 @restapi_bp.after_request
 def add_runtime_version_header(response):
-    """Add runtime version header to all API responses for version detection."""
-    response.headers["X-OpenPLC-Runtime-Version"] = "v4"
+    """Add runtime version header to all API responses for version detection.
+
+    Editors gate firmware uploads on this value — the v4.1.x runtime
+    ships the STruC++ compile pipeline, which is not wire-compatible
+    with the MatIEC pipeline 4.0.x runtimes shipped.
+    """
+    response.headers["X-OpenPLC-Runtime-Version"] = RUNTIME_VERSION
     return response
+
+
+@restapi_bp.route("/version", methods=["GET"])
+def restapi_version():
+    """Return the runtime version.
+
+    Unauthenticated on purpose — editors call this before login to
+    decide whether their compile pipeline is compatible.  The string
+    is the GitHub release tag baked in at build time (e.g.
+    ``v4.1.0-rc.3``); ``dev`` means the image was built from source
+    without a CI tag.
+    ---
+    tags:
+      - Runtime
+    responses:
+      200:
+        description: Runtime version retrieved
+        schema:
+          type: object
+          properties:
+            version:
+              type: string
+              description: Runtime version string (GitHub release tag)
+    """
+    return jsonify({"version": RUNTIME_VERSION}), 200
 
 
 jwt = JWTManager(app_restapi)
@@ -62,7 +93,6 @@ class User(db.Model):  # type: ignore[name-defined]
     id: int = db.Column(db.Integer, primary_key=True)
     username: str = db.Column(db.Text, nullable=False, unique=True)
     password_hash: str = db.Column(db.Text, nullable=False)
-    role: str = db.Column(db.String(20), default="user")
 
     # Use PBKDF2 with SHA256 and 600,000 iterations for password hashing
     derivation_method: str = "pbkdf2:sha256:600000"
@@ -77,7 +107,7 @@ class User(db.Model):  # type: ignore[name-defined]
         return check_password_hash(self.password_hash, password)
 
     def to_dict(self):
-        return {"id": self.id, "username": self.username, "role": self.role}
+        return {"id": self.id, "username": self.username}
 
 
 @jwt.user_identity_loader
@@ -105,6 +135,46 @@ def register_callback_post(callback: Callable[[str, dict], dict]):
 
 @restapi_bp.route("/create-user", methods=["POST"])
 def create_user():
+    """
+    Create a new user account.
+    ---
+    tags:
+      - Authentication
+    parameters:
+      - name: body
+        in: body
+        required: true
+        schema:
+          type: object
+          required:
+            - username
+            - password
+          properties:
+            username:
+              type: string
+              example: admin
+            password:
+              type: string
+              example: openplc
+    responses:
+      201:
+        description: User created successfully
+        schema:
+          type: object
+          properties:
+            msg:
+              type: string
+              example: User created
+            id:
+              type: integer
+              example: 1
+      400:
+        description: Missing username or password
+      401:
+        description: User already created or authentication required
+      409:
+        description: Username already exists
+    """
     # check if there are any users in the database
     try:
         users_exist = User.query.first() is not None
@@ -119,7 +189,6 @@ def create_user():
     data = request.get_json()
     username = data.get("username")
     password = data.get("password")
-    role = data.get("role", "user")
 
     if not username or not password:
         return jsonify({"msg": "Missing username or password"}), 400
@@ -128,7 +197,7 @@ def create_user():
         return jsonify({"msg": "Username already exists"}), 409
 
     # Create a new user
-    user = User(username=username, role=role)
+    user = User(username=username)
     user.set_password(password)
     db.session.add(user)
     db.session.commit()
@@ -140,6 +209,36 @@ def create_user():
 @restapi_bp.route("/get-user-info/<int:user_id>", methods=["GET"])
 @jwt_required()
 def get_user_info(user_id):
+    """
+    Get information about a specific user.
+    ---
+    tags:
+      - Users
+    security:
+      - BearerAuth: []
+    parameters:
+      - name: user_id
+        in: path
+        required: true
+        type: integer
+        description: The user ID
+    responses:
+      200:
+        description: User information retrieved successfully
+        schema:
+          type: object
+          properties:
+            id:
+              type: integer
+              example: 1
+            username:
+              type: string
+              example: admin
+      404:
+        description: User not found
+      500:
+        description: User retrieval error
+    """
     try:
         user = User.query.get(user_id)
     except Exception as e:
@@ -154,6 +253,30 @@ def get_user_info(user_id):
 
 @restapi_bp.route("/get-users-info", methods=["GET"])
 def get_users_info():
+    """
+    Get information about all users or check if users exist.
+    ---
+    tags:
+      - Users
+    security:
+      - BearerAuth: []
+    responses:
+      200:
+        description: Users information retrieved successfully
+        schema:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: integer
+              username:
+                type: string
+      404:
+        description: No users found
+      500:
+        description: User retrieval error
+    """
     # If there are no users, we don't need to verify JWT
     try:
         verify_jwt_in_request()
@@ -184,6 +307,50 @@ def get_users_info():
 @restapi_bp.route("/password-change/<int:user_id>", methods=["PUT"])
 @jwt_required()
 def change_password(user_id):
+    """
+    Change password for a specific user.
+    ---
+    tags:
+      - Users
+    security:
+      - BearerAuth: []
+    parameters:
+      - name: user_id
+        in: path
+        required: true
+        type: integer
+        description: The user ID
+      - name: body
+        in: body
+        required: true
+        schema:
+          type: object
+          required:
+            - old_password
+            - new_password
+          properties:
+            old_password:
+              type: string
+            new_password:
+              type: string
+    responses:
+      200:
+        description: Password updated successfully
+        schema:
+          type: object
+          properties:
+            msg:
+              type: string
+              example: Password for user admin updated successfully
+      400:
+        description: Missing old or new password
+      403:
+        description: Old password is incorrect
+      404:
+        description: User not found
+      500:
+        description: User retrieval error
+    """
     data = request.get_json()
     old_password = data.get("old_password")
     new_password = data.get("new_password")
@@ -216,6 +383,33 @@ def change_password(user_id):
 @restapi_bp.route("/delete-user/<int:user_id>", methods=["DELETE"])
 @jwt_required()
 def delete_user(user_id):
+    """
+    Delete a user by ID.
+    ---
+    tags:
+      - Users
+    security:
+      - BearerAuth: []
+    parameters:
+      - name: user_id
+        in: path
+        required: true
+        type: integer
+        description: The user ID to delete
+    responses:
+      200:
+        description: User deleted successfully
+        schema:
+          type: object
+          properties:
+            msg:
+              type: string
+              example: User admin deleted successfully
+      404:
+        description: User not found
+      500:
+        description: User retrieval error
+    """
     try:
         user = User.query.get(user_id)
     except Exception as e:
@@ -234,6 +428,41 @@ def delete_user(user_id):
 # login endpoint
 @restapi_bp.route("/login", methods=["POST"])
 def login():
+    """
+    Authenticate user and get JWT token.
+    ---
+    tags:
+      - Authentication
+    parameters:
+      - name: body
+        in: body
+        required: true
+        schema:
+          type: object
+          required:
+            - username
+            - password
+          properties:
+            username:
+              type: string
+              example: admin
+            password:
+              type: string
+              example: openplc
+    responses:
+      200:
+        description: Login successful
+        schema:
+          type: object
+          properties:
+            access_token:
+              type: string
+              description: JWT access token
+      401:
+        description: Invalid credentials
+      500:
+        description: User retrieval error
+    """
     username = request.json.get("username", None)
     password = request.json.get("password", None)
 
@@ -255,6 +484,23 @@ def login():
 @restapi_bp.route("/logout", methods=["POST"])
 @jwt_required()
 def logout():
+    """
+    Logout user and revoke JWT token.
+    ---
+    tags:
+      - Authentication
+    security:
+      - BearerAuth: []
+    responses:
+      200:
+        description: Logout successful
+        schema:
+          type: object
+          properties:
+            msg:
+              type: string
+              example: User logged out successfully
+    """
     revoke_jwt()
     return jsonify({"msg": "User logged out successfully"}), 200
 
@@ -275,6 +521,65 @@ def revoke_jwt():
 @restapi_bp.route("/<command>", methods=["GET"])
 @jwt_required()
 def restapi_plc_get(command):
+    """
+    Execute PLC control commands (GET).
+    ---
+    tags:
+      - PLC Control
+    security:
+      - BearerAuth: []
+    parameters:
+      - name: command
+        in: path
+        required: true
+        type: string
+        enum:
+          - start-plc
+          - stop-plc
+          - status
+          - ping
+          - runtime-logs
+          - compilation-status
+          - serial-ports
+        description: |
+          Command to execute:
+          - start-plc: Start the PLC runtime
+          - stop-plc: Stop the PLC runtime
+          - status: Get PLC status (optional query param include_stats=true)
+          - ping: Check if runtime is responsive
+          - runtime-logs: Get runtime logs (optional query params: id, level)
+          - compilation-status: Get current compilation status
+          - serial-ports: List available serial ports
+      - name: id
+        in: query
+        required: false
+        type: integer
+        description: Minimum log ID (for runtime-logs)
+      - name: level
+        in: query
+        required: false
+        type: string
+        description: Log level filter (for runtime-logs)
+      - name: include_stats
+        in: query
+        required: false
+        type: string
+        enum:
+          - "true"
+          - "false"
+        description: Include timing stats (for status)
+    responses:
+      200:
+        description: Command executed successfully
+        schema:
+          type: object
+          properties:
+            status:
+              type: string
+              description: Response status or PLC state
+      500:
+        description: No handler registered or execution error
+    """
     if _handler_callback_get is None:
         return jsonify({"error": "No handler registered"}), 500
 
@@ -290,6 +595,51 @@ def restapi_plc_get(command):
 @restapi_bp.route("/<command>", methods=["POST"])
 @jwt_required()
 def restapi_plc_post(command):
+    """
+    Execute PLC control commands (POST).
+    ---
+    tags:
+      - Programs
+    security:
+      - BearerAuth: []
+    consumes:
+      - multipart/form-data
+    parameters:
+      - name: command
+        in: path
+        required: true
+        type: string
+        enum:
+          - upload-file
+        description: |
+          Command to execute:
+          - upload-file: Upload a PLC program ZIP file for compilation
+      - name: file
+        in: formData
+        required: true
+        type: file
+        description: ZIP file containing PLC program
+    responses:
+      200:
+        description: Command executed successfully
+        schema:
+          type: object
+          properties:
+            UploadFileFail:
+              type: string
+              description: Error message (empty on success)
+            CompilationStatus:
+              type: string
+              enum:
+                - IDLE
+                - UNZIPPING
+                - COMPILING
+                - SUCCESS
+                - FAILED
+              description: Current compilation status
+      500:
+        description: No handler registered or execution error
+    """
     if _handler_callback_post is None:
         return jsonify({"error": "No handler registered"}), 500
 

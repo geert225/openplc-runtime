@@ -1,13 +1,21 @@
 cmake_minimum_required(VERSION 3.10)
-project(plc_application C)
+project(plc_application CXX C)
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Find Python development libraries
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PYTHON REQUIRED python3-embed)
 
-# Include directories
+# Include directories.
+#
+# Runtime-side strucpp assets live in:
+#   core/src/lib/strucpp_abi.hpp     — ABI mirror used to walk the .so
+# We do NOT vendor strucpp's full runtime headers into the runtime —
+# those ship with each user-program upload and are only consumed by
+# scripts/compile.sh when building the .so.
 include_directories(${CMAKE_SOURCE_DIR}/core/src/plc_app
                     ${CMAKE_SOURCE_DIR}/core/src/plc_app/utils
                     ${CMAKE_SOURCE_DIR}/core/generated/plc_lib
@@ -15,15 +23,13 @@ include_directories(${CMAKE_SOURCE_DIR}/core/src/plc_app
                     ${PYTHON_INCLUDE_DIRS})
 
 # Compiler options
-add_compile_options(-Wall -Werror  -Wextra -fstack-protector-strong
+add_compile_options(-Wall -Werror -Wextra -fstack-protector-strong
     -D_FORTIFY_SOURCE=2 -O2 -Wformat
     -Werror=format-security -fPIC -fPIE)
 
 # On Cygwin/MSYS2, disable treating warnings as errors due to header conflicts
 # The _POSIX_C_SOURCE redefinition warning is caused by Python headers vs system headers
-# Detection: CMAKE_SYSTEM_NAME is "CYGWIN" or "MSYS" on these platforms
 if(CMAKE_SYSTEM_NAME MATCHES "CYGWIN|MSYS")
-    # Remove -Werror but keep all other warnings and specific -Werror=format-security
     add_compile_options(-Wno-error)
 endif()
 
@@ -33,14 +39,14 @@ add_executable(plc_main
     ${CMAKE_SOURCE_DIR}/core/src/plc_app/utils/log.c
     ${CMAKE_SOURCE_DIR}/core/src/plc_app/utils/utils.c
     ${CMAKE_SOURCE_DIR}/core/src/plc_app/utils/watchdog.c
-    ${CMAKE_SOURCE_DIR}/core/src/plc_app/image_tables.c
+    ${CMAKE_SOURCE_DIR}/core/src/plc_app/image_tables.cpp
     ${CMAKE_SOURCE_DIR}/core/src/plc_app/journal_buffer.c
-    ${CMAKE_SOURCE_DIR}/core/src/plc_app/plc_state_manager.c
+    ${CMAKE_SOURCE_DIR}/core/src/plc_app/plc_io_cycle.cpp
+    ${CMAKE_SOURCE_DIR}/core/src/plc_app/plc_state_manager.cpp
     ${CMAKE_SOURCE_DIR}/core/src/plc_app/plcapp_manager.c
     ${CMAKE_SOURCE_DIR}/core/src/plc_app/scan_cycle_manager.c
     ${CMAKE_SOURCE_DIR}/core/src/drivers/plugin_driver.c
     ${CMAKE_SOURCE_DIR}/core/src/drivers/plugin_config.c
-    ${CMAKE_SOURCE_DIR}/core/src/drivers/plugin_utils.c
     ${CMAKE_SOURCE_DIR}/core/src/plc_app/unix_socket.c
     ${CMAKE_SOURCE_DIR}/core/src/plc_app/debug_handler.c
     ${CMAKE_SOURCE_DIR}/core/src/plc_app/client_tcp_udp.c

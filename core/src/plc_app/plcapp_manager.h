@@ -3,6 +3,10 @@
 
 #include <stdbool.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct PluginManager PluginManager;
 
 /**
@@ -54,5 +58,9 @@ void *plugin_manager_get_symbol(PluginManager *pm, const char *symbol_name);
  * @return A pointer to the function, or NULL on failure
  */
 #define plugin_manager_get_func(pm, type, name) ((type)plugin_manager_get_symbol((pm), (name)))
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // PLUGIN_MANAGER_H

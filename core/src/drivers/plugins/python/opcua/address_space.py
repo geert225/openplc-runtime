@@ -8,7 +8,7 @@ from configuration. It handles simple variables, structures, and arrays.
 import os
 import sys
 import traceback
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 
 from asyncua import Server, ua
 from asyncua.common.node import Node
@@ -41,6 +41,21 @@ from shared.plugin_config_decode.opcua_config_model import (
 )
 
 
+def _type_default(datatype: str) -> Any:
+    """Per-type seed value for newly-created OPC-UA nodes. Replaces
+    the removed `initial_value` config field — the first sync cycle
+    overwrites this with the program's actual current value via
+    debug_read, so the seed only shows for one polling tick."""
+    t = (datatype or "").upper()
+    if t == "BOOL":
+        return False
+    if t in ("REAL", "LREAL"):
+        return 0.0
+    if t in ("STRING", "WSTRING"):
+        return ""
+    return 0
+
+
 class AddressSpaceBuilder:
     """
     Builds OPC-UA address space from configuration.
@@ -51,7 +66,7 @@ class AddressSpaceBuilder:
     - Array variable nodes
 
     After building, provides mappings for:
-    - variable_nodes: Dict[int, VariableNode] - index to node mapping
+    - variable_nodes: Dict[(arr, elem), VariableNode] - address → node mapping
     - node_permissions: Dict[str, VariablePermissions] - node_id to permissions
     - nodeid_to_variable: Dict[Any, str] - NodeId to variable name mapping
     """
@@ -74,8 +89,10 @@ class AddressSpaceBuilder:
         self.namespace_idx = namespace_idx
         self.config = config
 
-        # Output mappings (populated during build)
-        self.variable_nodes: Dict[int, VariableNode] = {}
+        # Output mappings (populated during build). Keyed by
+        # (arr, elem) tuple — the same address space the runtime's
+        # debug_read / debug_write / debug_set thunks consume.
+        self.variable_nodes: Dict[Tuple[int, int], VariableNode] = {}
         self.node_permissions: Dict[str, VariablePermissions] = {}
         self.nodeid_to_variable: Dict[Any, str] = {}
 
@@ -135,7 +152,10 @@ class AddressSpaceBuilder:
             var: SimpleVariable configuration
         """
         opcua_type = map_plc_to_opcua_type(var.datatype)
-        initial_value = convert_value_for_opcua(var.datatype, var.initial_value)
+        # Type-defaulted seed value. The first sync cycle reads the
+        # program's actual current value via debug_read and updates
+        # the node — no `initial_value` config field anymore.
+        initial_value = convert_value_for_opcua(var.datatype, _type_default(var.datatype))
 
         # Create the variable node
         node = await parent_node.add_variable(
@@ -173,17 +193,18 @@ class AddressSpaceBuilder:
         access_mode = "readwrite" if has_write_permission else "readonly"
         var_node = VariableNode(
             node=node,
-            debug_var_index=var.index,
+            arr=var.arr,
+            elem=var.elem,
             datatype=var.datatype,
             access_mode=access_mode,
             is_array_element=False
         )
 
-        self.variable_nodes[var.index] = var_node
+        self.variable_nodes[(var.arr, var.elem)] = var_node
         self.node_permissions[var.node_id] = var.permissions
         self.nodeid_to_variable[node.nodeid] = var.node_id
 
-        log_debug(f"Created variable {var.node_id} (index: {var.index})")
+        log_debug(f"Created variable {var.node_id} (arr={var.arr}, elem={var.elem})")
 
     async def _create_struct(
         self,
@@ -271,7 +292,7 @@ class AddressSpaceBuilder:
 
         # This is a leaf field - create a Variable node
         opcua_type = map_plc_to_opcua_type(field.datatype)
-        initial_value = convert_value_for_opcua(field.datatype, field.initial_value)
+        initial_value = convert_value_for_opcua(field.datatype, _type_default(field.datatype))
 
         # Create the variable node
         node = await parent_node.add_variable(
@@ -295,25 +316,27 @@ class AddressSpaceBuilder:
         if has_write_permission:
             await node.set_writable()
 
-        # Store node mapping (only for leaf fields with valid indices)
-        if field.index is not None:
+        # Store node mapping (only for leaf fields with valid addresses).
+        if field.arr is not None and field.elem is not None:
             access_mode = "readwrite" if has_write_permission else "readonly"
             var_node = VariableNode(
                 node=node,
-                debug_var_index=field.index,
+                arr=field.arr,
+                elem=field.elem,
                 datatype=field.datatype,
                 access_mode=access_mode,
                 is_array_element=False
             )
 
-            self.variable_nodes[field.index] = var_node
+            self.variable_nodes[(field.arr, field.elem)] = var_node
             self.node_permissions[field_node_id] = field.permissions
             self.nodeid_to_variable[node.nodeid] = field_node_id
 
-            log_debug(f"Created field {field_node_id} (index: {field.index})")
+            log_debug(f"Created field {field_node_id} (arr={field.arr}, elem={field.elem})")
         else:
-            # Complex types (FBs, nested structs) have null indices - only leaf fields have indices
-            log_debug(f"Field {field_node_id} is a complex type (no index) - skipping node mapping")
+            # Complex types (FBs, nested structs) have null addresses;
+            # only their leaf children carry (arr, elem).
+            log_debug(f"Field {field_node_id} is a complex type (no address) - skipping node mapping")
 
     async def _create_array(
         self,
@@ -328,7 +351,7 @@ class AddressSpaceBuilder:
             arr: ArrayVariable configuration
         """
         opcua_type = map_plc_to_opcua_type(arr.datatype)
-        initial_value = convert_value_for_opcua(arr.datatype, arr.initial_value)
+        initial_value = convert_value_for_opcua(arr.datatype, _type_default(arr.datatype))
 
         # Create array with initial values
         array_values = [initial_value] * arr.length
@@ -372,18 +395,24 @@ class AddressSpaceBuilder:
         access_mode = "readwrite" if has_write_permission else "readonly"
         var_node = VariableNode(
             node=node,
-            debug_var_index=arr.index,
+            arr=arr.arr,
+            elem=arr.elem,
             datatype=arr.datatype,
             access_mode=access_mode,
             is_array_element=False,
             array_length=arr.length
         )
 
-        self.variable_nodes[arr.index] = var_node
+        # Key the array by its base (arr, elem) — sync loops iterate
+        # length consecutive (arr, elem+i) addresses.
+        self.variable_nodes[(arr.arr, arr.elem)] = var_node
         self.node_permissions[arr.node_id] = arr.permissions
         self.nodeid_to_variable[node.nodeid] = arr.node_id
 
-        log_debug(f"Created array {arr.node_id}[{arr.length}] (index: {arr.index})")
+        log_debug(
+            f"Created array {arr.node_id}[{arr.length}] "
+            f"(arr={arr.arr}, elem={arr.elem})"
+        )
 
     def _check_write_permission(self, permissions: VariablePermissions) -> bool:
         """

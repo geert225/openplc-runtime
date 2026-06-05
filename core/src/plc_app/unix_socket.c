@@ -9,6 +9,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include "../drivers/plugin_driver.h"
 #include "debug_handler.h"
 #include "plc_state_manager.h"
 #include "scan_cycle_manager.h"
@@ -18,6 +19,90 @@
 
 extern volatile sig_atomic_t keep_running;
 extern PLCState plc_state;
+
+static plugin_driver_t *g_plugin_driver = NULL;
+
+void unix_socket_set_plugin_driver(void *driver)
+{
+    g_plugin_driver = (plugin_driver_t *)driver;
+}
+
+// Flag to prevent overlapping state transitions (e.g. START while STOP is in progress).
+// Set before spawning the transition thread, cleared when the transition completes.
+static atomic_int is_transitioning = 0;
+
+static void *transition_worker(void *arg)
+{
+    PLCState target = *(PLCState *)arg;
+    free(arg);
+
+    bool result = plc_set_state(target);
+    if (!result)
+    {
+        log_error("State transition to %s failed",
+                  target == PLC_STATE_RUNNING ? "RUNNING" : "STOPPED");
+    }
+
+    atomic_store(&is_transitioning, 0);
+    return NULL;
+}
+
+// Start a background thread that performs the (potentially slow) state
+// transition. Returns true if the thread was spawned, false otherwise.
+//
+// Two safety guards on the entry path, both targeting plugin-initiated
+// stops (which are unsynchronised relative to the unix-socket dispatcher):
+//
+//   1. CAS on `is_transitioning` 0→1: collapses concurrent calls. A
+//      misbehaving plugin spinning on plugin_request_plc_stop would
+//      otherwise pile up detached pthread workers — each one mallocing,
+//      cloning a thread, and racing for the state mutex. The CAS gate
+//      means only the first call fires the worker; everything else is a
+//      cheap return.
+//
+//   2. Re-check current state AFTER the CAS wins: closes the
+//      check-then-call race where the caller sees RUNNING, calls in,
+//      and the state flips to STOPPED before we spawn the worker. We'd
+//      otherwise dispatch a no-op transition, leaving STATUS reporting
+//      TRANSITIONING for the worker's lifetime for nothing.
+bool plc_begin_transition(PLCState target)
+{
+    int expected = 0;
+    if (!atomic_compare_exchange_strong(&is_transitioning, &expected, 1))
+    {
+        // Another transition is already in flight. Don't pile on.
+        return false;
+    }
+
+    if (plc_get_state() == target)
+    {
+        // State already at target — release the gate and bail. No
+        // worker needed; reporting STATUS:TRANSITIONING for a no-op
+        // would just confuse external pollers.
+        atomic_store(&is_transitioning, 0);
+        return false;
+    }
+
+    PLCState *arg = malloc(sizeof(PLCState));
+    if (!arg)
+    {
+        log_error("Failed to allocate transition argument");
+        atomic_store(&is_transitioning, 0);
+        return false;
+    }
+    *arg = target;
+
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, transition_worker, arg) != 0)
+    {
+        log_error("Failed to create transition thread: %s", strerror(errno));
+        free(arg);
+        atomic_store(&is_transitioning, 0);
+        return false;
+    }
+    pthread_detach(tid);
+    return true;
+}
 
 // helper: read one line terminated by '\n' from a socket
 static ssize_t read_line(int fd, char *buffer, size_t max_length)
@@ -41,49 +126,96 @@ static ssize_t read_line(int fd, char *buffer, size_t max_length)
     return total_read;
 }
 
+static void format_status_response(char *response, size_t response_size)
+{
+    // While a transition is in progress, plc_state has already flipped
+    // to the target value (so the running task threads can exit their
+    // `while (plc_get_state() == RUNNING)` loops) but the actual
+    // load/unload work is still happening on the transition worker
+    // thread. Reporting the bare state here would tell external
+    // pollers STATUS:STOPPED while the runtime can't yet accept a
+    // START — they'd race ahead and get COMMAND:BUSY.
+    //
+    // Surfacing TRANSITIONING for the duration of the worker keeps
+    // _wait_for_plc_state(STOPPED) on the webserver side honest:
+    // STATUS:STOPPED is reported only after the worker has completed
+    // and is_transitioning has cleared.
+    if (atomic_load(&is_transitioning))
+    {
+        strncpy(response, "STATUS:TRANSITIONING\n", response_size);
+        return;
+    }
+
+    PLCState current_state = plc_get_state();
+
+    if (current_state == PLC_STATE_INIT)
+        strncpy(response, "STATUS:INIT\n", response_size);
+    else if (current_state == PLC_STATE_RUNNING)
+        strncpy(response, "STATUS:RUNNING\n", response_size);
+    else if (current_state == PLC_STATE_STOPPED)
+        strncpy(response, "STATUS:STOPPED\n", response_size);
+    else if (current_state == PLC_STATE_ERROR)
+        strncpy(response, "STATUS:ERROR\n", response_size);
+    else if (current_state == PLC_STATE_EMPTY)
+        strncpy(response, "STATUS:EMPTY\n", response_size);
+    else
+        strncpy(response, "STATUS:UNKNOWN\n", response_size);
+}
+
 void handle_unix_socket_commands(const char *command, char *response, size_t response_size)
 {
+    // While a state transition is in progress, only allow PING and STATUS.
+    // Everything else gets COMMAND:BUSY so commands cannot overlap.
+    if (atomic_load(&is_transitioning))
+    {
+        if (strcmp(command, "PING") == 0)
+        {
+            strncpy(response, "PING:OK\n", response_size);
+        }
+        else if (strcmp(command, "STATUS") == 0)
+        {
+            format_status_response(response, response_size);
+        }
+        else
+        {
+            strncpy(response, "COMMAND:BUSY\n", response_size);
+        }
+        response[response_size - 1] = '\0';
+        return;
+    }
+
     if (strcmp(command, "PING") == 0)
     {
         strncpy(response, "PING:OK\n", response_size);
     }
     else if (strcmp(command, "STATUS") == 0)
     {
-        PLCState current_state = plc_get_state();
-
-        if (current_state == PLC_STATE_INIT)
-            strncpy(response, "STATUS:INIT\n", response_size);
-        else if (current_state == PLC_STATE_RUNNING)
-            strncpy(response, "STATUS:RUNNING\n", response_size);
-        else if (current_state == PLC_STATE_STOPPED)
-            strncpy(response, "STATUS:STOPPED\n", response_size);
-        else if (current_state == PLC_STATE_ERROR)
-            strncpy(response, "STATUS:ERROR\n", response_size);
-        else if (current_state == PLC_STATE_EMPTY)
-            strncpy(response, "STATUS:EMPTY\n", response_size);
-        else
-            strncpy(response, "STATUS:UNKNOWN\n", response_size);
+        format_status_response(response, response_size);
     }
     else if (strcmp(command, "STOP") == 0)
     {
-        if (plc_set_state(PLC_STATE_STOPPED))
-            strncpy(response, "STOP:OK\n", response_size);
+        PLCState current_state = plc_get_state();
+        if (current_state == PLC_STATE_RUNNING)
+        {
+            if (plc_begin_transition(PLC_STATE_STOPPED))
+                strncpy(response, "STOP:OK\n", response_size);
+            else
+                strncpy(response, "STOP:ERROR\n", response_size);
+        }
         else
+        {
             strncpy(response, "STOP:ERROR\n", response_size);
+        }
     }
     else if (strcmp(command, "START") == 0)
     {
         PLCState current_state = plc_get_state();
         if (current_state != PLC_STATE_RUNNING)
         {
-            if (plc_set_state(PLC_STATE_RUNNING))
-            {
+            if (plc_begin_transition(PLC_STATE_RUNNING))
                 strncpy(response, "START:OK\n", response_size);
-            }
             else
-            {
                 strncpy(response, "START:ERROR\n", response_size);
-            }
         }
         else
         {
@@ -94,6 +226,10 @@ void handle_unix_socket_commands(const char *command, char *response, size_t res
     else if (strcmp(command, "STATS") == 0)
     {
         format_timing_stats_response(response, response_size);
+        // Splice in any plugin-contributed statistics. Safe no-op when no
+        // plugin exports get_stats.
+        if (g_plugin_driver)
+            plugin_driver_append_stats_json(g_plugin_driver, response, response_size);
     }
     else if (strncmp(command, "DEBUG:", 6) == 0)
     {
@@ -120,6 +256,50 @@ void handle_unix_socket_commands(const char *command, char *response, size_t res
         else
         {
             strncpy(response, "DEBUG:ERROR_PARSING\n", response_size);
+        }
+    }
+    else if (strncmp(command, "PLUGIN_CMD:", 11) == 0)
+    {
+        // Format: PLUGIN_CMD:<plugin_name>:<json_payload>
+        // NOTE: This handler is BLOCKING -- plugin commands like EtherCAT scan
+        // may take several seconds. The unix socket thread is single-client,
+        // so the caller must wait for the response.
+        const char *rest = &command[11];
+        const char *colon = strchr(rest, ':');
+        if (!colon || !g_plugin_driver)
+        {
+            snprintf(response, response_size,
+                     "PLUGIN_CMD:ERROR:{\"error\":\"invalid format or driver not set\"}\n");
+        }
+        else
+        {
+            // Extract plugin name
+            size_t name_len = colon - rest;
+            char plugin_name[64] = {0};
+            if (name_len >= sizeof(plugin_name))
+                name_len = sizeof(plugin_name) - 1;
+            strncpy(plugin_name, rest, name_len);
+
+            const char *json_payload = colon + 1;
+
+            // Stack-allocated buffer for plugin output.
+            // MAX_RESPONSE_SIZE is 64KB; this leaves 256 bytes for the
+            // "PLUGIN_CMD:OK:" prefix. Fits comfortably in the default
+            // 8MB thread stack.
+            char plugin_response[MAX_RESPONSE_SIZE - 256];
+            memset(plugin_response, 0, sizeof(plugin_response));
+
+            int result = plugin_driver_execute_command(g_plugin_driver, plugin_name, json_payload,
+                                                       plugin_response, sizeof(plugin_response));
+
+            if (result == 0)
+            {
+                snprintf(response, response_size, "PLUGIN_CMD:OK:%s\n", plugin_response);
+            }
+            else
+            {
+                snprintf(response, response_size, "PLUGIN_CMD:ERROR:%s\n", plugin_response);
+            }
         }
     }
     else

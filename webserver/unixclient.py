@@ -21,17 +21,31 @@ class SyncUnixClient:
 
     def connect(self):
         """Connect to the Unix socket server"""
+        # Release any prior socket before claiming a new fd. Without this,
+        # repeated reconnect attempts (e.g. while the runtime is down)
+        # leak a socket fd per call and eventually hit EMFILE.
+        self.close()
+
         if not os.path.exists(self.socket_path):
             raise FileNotFoundError(f"Socket not found: {self.socket_path}")
 
+        sock = None
         try:
             logger.debug("Connecting to socket %s", self.socket_path)
-            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            self.sock.settimeout(1.0)  # 1s timeout on blocking calls
-            self.sock.connect(self.socket_path)
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(1.0)  # 1s timeout on blocking calls
+            sock.connect(self.socket_path)
+            # Only publish the socket after a successful connect, so
+            # is_connected() never returns True for an unconnected fd.
+            self.sock = sock
             logger.debug("Connected to server socket %s", self.socket_path)
         except Exception as e:
             logger.error("Failed to connect: %s", e)
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
 
     def send_message(self, msg: str):
         if not self.sock:
@@ -54,7 +68,7 @@ class SyncUnixClient:
             self.sock.settimeout(timeout)
             try:
                 buffer = bytearray()
-                max_size = 8192 * 2 + 256
+                max_size = 65536 + 256
 
                 while len(buffer) < max_size:
                     chunk = self.sock.recv(4096)
@@ -102,7 +116,7 @@ class SyncUnixClient:
             self.sock.settimeout(timeout)
             try:
                 buffer = bytearray()
-                max_size = 8192 * 2 + 256
+                max_size = 65536 + 256
 
                 while len(buffer) < max_size:
                     chunk = self.sock.recv(4096)
