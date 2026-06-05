@@ -16,7 +16,6 @@
 #include "image_tables.h"
 #include "plc_state_manager.h"
 #include "plcapp_manager.h"
-#include "scan_cycle_manager.h"
 #include "unix_socket.h"
 #include "utils/log.h"
 #include "utils/utils.h"
@@ -31,6 +30,16 @@ void handle_sigint(int sig)
 {
     (void)sig;
     keep_running = 0;
+}
+
+/* Process-wide no-op SIGUSR1 handler. The wake mechanism is EINTR
+ * delivery to a specific thread via pthread_kill(target, SIGUSR1) — the
+ * handler body itself does nothing. Installed exactly once at startup
+ * (instead of being re-installed by every thread that wants to be
+ * woken) so that handlers can never clobber each other. */
+static void handle_sigusr1(int sig)
+{
+    (void)sig;
 }
 
 int main(int argc, char *argv[])
@@ -79,6 +88,20 @@ int main(int argc, char *argv[])
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
     sigaction(SIGINT, &sa, NULL);
+
+    // Install the process-wide SIGUSR1 wake handler exactly once. Task
+    // threads (plc_state_manager.cpp) and EtherCAT bus threads
+    // (ethercat_plugin.c) both rely on EINTR-from-pthread_kill to break
+    // out of clock_nanosleep on stop. Previously each of those callers
+    // re-installed sigaction(SIGUSR1, …) on its own — last writer wins,
+    // and any future divergence between handlers (e.g. one logs, the
+    // other resets state) would silently lose half the time depending
+    // on thread spawn order. One install, here, eliminates the race.
+    struct sigaction wake_sa;
+    wake_sa.sa_handler = handle_sigusr1;
+    sigemptyset(&wake_sa.sa_mask);
+    wake_sa.sa_flags = 0;
+    sigaction(SIGUSR1, &wake_sa, NULL);
 
     // Make sure PLC starts in STOP state
     plc_set_state(PLC_STATE_STOPPED);

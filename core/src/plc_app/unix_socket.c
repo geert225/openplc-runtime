@@ -47,19 +47,50 @@ static void *transition_worker(void *arg)
     return NULL;
 }
 
-// Start a background thread that performs the (potentially slow) state transition.
-// Returns true if the thread was spawned, false on error.
-static bool begin_transition(PLCState target)
+// Start a background thread that performs the (potentially slow) state
+// transition. Returns true if the thread was spawned, false otherwise.
+//
+// Two safety guards on the entry path, both targeting plugin-initiated
+// stops (which are unsynchronised relative to the unix-socket dispatcher):
+//
+//   1. CAS on `is_transitioning` 0→1: collapses concurrent calls. A
+//      misbehaving plugin spinning on plugin_request_plc_stop would
+//      otherwise pile up detached pthread workers — each one mallocing,
+//      cloning a thread, and racing for the state mutex. The CAS gate
+//      means only the first call fires the worker; everything else is a
+//      cheap return.
+//
+//   2. Re-check current state AFTER the CAS wins: closes the
+//      check-then-call race where the caller sees RUNNING, calls in,
+//      and the state flips to STOPPED before we spawn the worker. We'd
+//      otherwise dispatch a no-op transition, leaving STATUS reporting
+//      TRANSITIONING for the worker's lifetime for nothing.
+bool plc_begin_transition(PLCState target)
 {
+    int expected = 0;
+    if (!atomic_compare_exchange_strong(&is_transitioning, &expected, 1))
+    {
+        // Another transition is already in flight. Don't pile on.
+        return false;
+    }
+
+    if (plc_get_state() == target)
+    {
+        // State already at target — release the gate and bail. No
+        // worker needed; reporting STATUS:TRANSITIONING for a no-op
+        // would just confuse external pollers.
+        atomic_store(&is_transitioning, 0);
+        return false;
+    }
+
     PLCState *arg = malloc(sizeof(PLCState));
     if (!arg)
     {
         log_error("Failed to allocate transition argument");
+        atomic_store(&is_transitioning, 0);
         return false;
     }
     *arg = target;
-
-    atomic_store(&is_transitioning, 1);
 
     pthread_t tid;
     if (pthread_create(&tid, NULL, transition_worker, arg) != 0)
@@ -97,6 +128,24 @@ static ssize_t read_line(int fd, char *buffer, size_t max_length)
 
 static void format_status_response(char *response, size_t response_size)
 {
+    // While a transition is in progress, plc_state has already flipped
+    // to the target value (so the running task threads can exit their
+    // `while (plc_get_state() == RUNNING)` loops) but the actual
+    // load/unload work is still happening on the transition worker
+    // thread. Reporting the bare state here would tell external
+    // pollers STATUS:STOPPED while the runtime can't yet accept a
+    // START — they'd race ahead and get COMMAND:BUSY.
+    //
+    // Surfacing TRANSITIONING for the duration of the worker keeps
+    // _wait_for_plc_state(STOPPED) on the webserver side honest:
+    // STATUS:STOPPED is reported only after the worker has completed
+    // and is_transitioning has cleared.
+    if (atomic_load(&is_transitioning))
+    {
+        strncpy(response, "STATUS:TRANSITIONING\n", response_size);
+        return;
+    }
+
     PLCState current_state = plc_get_state();
 
     if (current_state == PLC_STATE_INIT)
@@ -148,7 +197,7 @@ void handle_unix_socket_commands(const char *command, char *response, size_t res
         PLCState current_state = plc_get_state();
         if (current_state == PLC_STATE_RUNNING)
         {
-            if (begin_transition(PLC_STATE_STOPPED))
+            if (plc_begin_transition(PLC_STATE_STOPPED))
                 strncpy(response, "STOP:OK\n", response_size);
             else
                 strncpy(response, "STOP:ERROR\n", response_size);
@@ -163,7 +212,7 @@ void handle_unix_socket_commands(const char *command, char *response, size_t res
         PLCState current_state = plc_get_state();
         if (current_state != PLC_STATE_RUNNING)
         {
-            if (begin_transition(PLC_STATE_RUNNING))
+            if (plc_begin_transition(PLC_STATE_RUNNING))
                 strncpy(response, "START:OK\n", response_size);
             else
                 strncpy(response, "START:ERROR\n", response_size);
@@ -177,6 +226,10 @@ void handle_unix_socket_commands(const char *command, char *response, size_t res
     else if (strcmp(command, "STATS") == 0)
     {
         format_timing_stats_response(response, response_size);
+        // Splice in any plugin-contributed statistics. Safe no-op when no
+        // plugin exports get_stats.
+        if (g_plugin_driver)
+            plugin_driver_append_stats_json(g_plugin_driver, response, response_size);
     }
     else if (strncmp(command, "DEBUG:", 6) == 0)
     {

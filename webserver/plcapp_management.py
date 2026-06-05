@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
 from enum import Enum, auto
 import os
+import shutil
+import time
 import zipfile
 import subprocess
 import threading
@@ -9,7 +11,7 @@ from typing import Final
 
 from webserver.runtimemanager import RuntimeManager
 from webserver.logger import get_logger, LogParser
-from webserver.plugin_config_model import PluginsConfiguration, PluginConfig
+from webserver.plugin_config_model import PluginsConfiguration, PluginConfig, PluginType
 
 logger, _ = get_logger("runtime", use_buffer=True)
 
@@ -212,6 +214,9 @@ def update_plugin_configurations(generated_dir: str = "core/generated"):
             else:
                 build_state.log(f"[WARNING] {message}\n")
 
+    # VPP plugins are handled separately via vpp_plugins.conf — see
+    # apply_vpp_plugin_conf(). Nothing to do here for VPP.
+
     # Save the updated configuration
     if plugins_config.to_file(plugins_conf_path):
         build_state.log(f"[INFO] Plugin configuration update complete. {plugins_updated} plugins updated.\n")
@@ -235,8 +240,99 @@ def update_plugin_configurations(generated_dir: str = "core/generated"):
         build_state.log("[ERROR] Failed to save updated plugin configuration\n")
 
 
-def run_compile(runtime_manager: RuntimeManager, cwd: str = "core/generated"):
-    """Run compile script synchronously (wait for completion) and update status/logs."""
+def _wait_for_plc_idle(runtime_manager: RuntimeManager, timeout_s: float) -> bool:
+    """Poll status_plc() until the runtime is NOT in a transition.
+
+    The runtime reports STATUS:TRANSITIONING while a stop/start worker
+    is in flight (plc_state has flipped but the unload/load work hasn't
+    completed). Any other STATUS (STOPPED, EMPTY, INIT, RUNNING) means
+    the runtime is settled and ready to accept the next command.
+
+    Used before the cleanup script runs, so the .so move doesn't race
+    against an in-flight unload, and before sending START, so the
+    runtime can actually process the command instead of returning
+    COMMAND:BUSY. Tolerates the case where the PLC was never started
+    (state == INIT or EMPTY) — those return immediately since there's
+    no transition to wait for.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        resp = runtime_manager.status_plc()
+        if resp and "TRANSITIONING" not in resp.upper():
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def apply_vpp_plugin_conf(generated_dir: str = "core/generated") -> None:
+    """Apply or remove the VPP plugin configuration for this upload.
+
+    VPP plugins are fully owned by the editor: it sends a
+    ``vpp_plugins.conf`` alongside the program when the target is a VPP
+    board, and omits it for vanilla builds.  This function is the single
+    authoritative gate:
+
+    * **Upload includes vpp_plugins.conf** → copy it to the runtime root
+      so the C-side plugin loader picks it up at the next PLC start.
+      Also copy each plugin's JSON config from ``conf/`` into the VPP
+      build output directory (``build/vpp/``) so the .so can read it
+      from the stable location listed in vpp_plugins.conf.
+
+    * **Upload does not include vpp_plugins.conf** → delete any existing
+      ``vpp_plugins.conf`` from the runtime root.  This ensures a
+      vanilla upload never inadvertently loads a VPP driver left over
+      from a previous project, regardless of what .so files exist in
+      ``build/vpp/``.
+    """
+    VPP_CONF_DEST = "vpp_plugins.conf"
+    VPP_BUILD_DIR = "build/vpp"
+    uploaded_conf = os.path.join(generated_dir, "vpp_plugins.conf")
+
+    if os.path.exists(uploaded_conf):
+        # Copy vpp_plugins.conf to runtime root
+        shutil.copy2(uploaded_conf, VPP_CONF_DEST)
+        build_state.log(f"[INFO] VPP: installed vpp_plugins.conf from upload\n")
+
+        # Copy each VPP plugin's config file to the path declared in
+        # vpp_plugins.conf (the config_path field). That field is the
+        # single source of truth for where the .so will look for its
+        # config at runtime — use it directly rather than constructing
+        # a separate destination.
+        conf_dir = os.path.join(generated_dir, "conf")
+        vpp_conf_plugins = PluginsConfiguration.from_file(VPP_CONF_DEST)
+        runtime_root = os.path.abspath(".")
+        for p in vpp_conf_plugins.plugins:
+            if not p.config_path:
+                continue
+            src_config = os.path.join(conf_dir, f"{p.name}.json")
+            if not os.path.exists(src_config):
+                build_state.log(f"[WARNING] VPP: conf/{p.name}.json not found in upload, skipping\n")
+                continue
+            dest_config = os.path.normpath(p.config_path)
+            # Guard against path traversal in editor-generated vpp_plugins.conf
+            if not os.path.abspath(dest_config).startswith(runtime_root):
+                build_state.log(f"[WARNING] VPP: config_path '{p.config_path}' escapes runtime root, skipping\n")
+                continue
+            os.makedirs(os.path.dirname(dest_config), exist_ok=True)
+            shutil.copy2(src_config, dest_config)
+            build_state.log(f"[INFO] VPP: copied {p.name}.json to {dest_config}\n")
+    else:
+        # No VPP in this upload — remove any stale vpp_plugins.conf so
+        # the plugin loader does not attempt to load old VPP drivers.
+        if os.path.exists(VPP_CONF_DEST):
+            os.remove(VPP_CONF_DEST)
+            build_state.log("[INFO] VPP: removed stale vpp_plugins.conf (no VPP in upload)\n")
+
+
+def run_compile(runtime_manager: RuntimeManager, cwd: str = "core/generated", clean: bool = False):
+    """Run compile script synchronously (wait for completion) and update status/logs.
+
+    When ``clean=True`` (editor's "Clean build and upload" option), wipe the
+    Make-managed ``core/build/`` directory and clear the ccache contents
+    before invoking compile.sh. This forces a full recompile from scratch
+    even when source content hashes match the cached objects — useful when
+    the user suspects a stale or corrupted cache.
+    """
     script_path: str = "./scripts/compile.sh"
 
     build_state.status = BuildStatus.COMPILING
@@ -248,15 +344,51 @@ def run_compile(runtime_manager: RuntimeManager, cwd: str = "core/generated"):
             build_state.log(msg)
         pipe.close()
 
-    def wait_and_finish(proc: subprocess.Popen, step_name: str):
+    def wait_step(proc: subprocess.Popen, step_name: str) -> bool:
+        """Wait for a subprocess and log the result. Returns True on
+        zero-exit. Caller is responsible for combining results — does
+        NOT mutate build_state.status, since that's only updated once
+        after every step (compile + cleanup) completes, so a successful
+        compile isn't masked by a failed cleanup or vice-versa."""
         exit_code = proc.wait()
-        build_state.exit_code = exit_code
         if exit_code == 0:
-            build_state.status = BuildStatus.SUCCESS
             build_state.log(f"[INFO] {step_name} finished successfully\n")
-        else:
-            build_state.status = BuildStatus.FAILED
-            build_state.log(f"[ERROR] {step_name} failed (exit={exit_code})\n")
+            return True
+        build_state.log(f"[ERROR] {step_name} failed (exit={exit_code})\n")
+        return False
+
+    # --- Optional clean step ---
+    if clean:
+        build_state.log("[INFO] Clean build requested — wiping core/build/ and ccache\n")
+        # Wipe the per-project object cache. shutil.rmtree avoids needing
+        # `make clean` (which would require the Makefile to be in cwd).
+        build_dir = "core/build"
+        if os.path.exists(build_dir):
+            try:
+                shutil.rmtree(build_dir)
+            except OSError as e:
+                build_state.log(f"[WARNING] Failed to remove {build_dir}: {e}\n")
+        # Wipe ccache. Failures here are non-fatal — `ccache -C` returning
+        # non-zero (e.g. ccache not installed) shouldn't abort the build,
+        # since the build folder wipe alone already invalidates per-file
+        # caches that live in build/.
+        try:
+            ccache_proc = subprocess.run(
+                ["ccache", "-C"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            if ccache_proc.returncode == 0:
+                build_state.log("[INFO] ccache cleared\n")
+            else:
+                build_state.log(
+                    f"[WARNING] ccache -C exited {ccache_proc.returncode}: "
+                    f"{ccache_proc.stderr.strip() or 'no error output'}\n"
+                )
+        except FileNotFoundError:
+            build_state.log("[INFO] ccache not installed — skipping cache wipe\n")
 
     # --- Compile step ---
     compile_proc = subprocess.Popen(
@@ -270,11 +402,24 @@ def run_compile(runtime_manager: RuntimeManager, cwd: str = "core/generated"):
     threading.Thread(target=stream_output, args=(compile_proc.stdout, ""), daemon=True).start()
     threading.Thread(target=stream_output, args=(compile_proc.stderr, "[ERROR] "), daemon=True).start()
 
-    # Block until compile finishes
-    wait_and_finish(compile_proc, "Build")
+    # Block until compile finishes.
+    compile_ok = wait_step(compile_proc, "Build")
 
-    # Stop PLC before cleanup
+    # Stop the running PLC before swapping the .so. stop_plc() returns
+    # as soon as the runtime ACKs over the socket, but the actual task
+    # / plugin / .so teardown continues asynchronously — wait for the
+    # runtime to settle (not in a transition) before letting the
+    # cleanup script touch build/new_libplc.so. Otherwise the new .so
+    # could be moved into place (or the old one held open) while
+    # teardown is still in progress. _wait_for_plc_idle returns
+    # immediately for the "PLC was never started" case (state == INIT
+    # / EMPTY) — there's no transition to wait for.
     runtime_manager.stop_plc()
+    if not _wait_for_plc_idle(runtime_manager, timeout_s=30.0):
+        build_state.log(
+            "[WARNING] Runtime stayed in TRANSITIONING for 30s; "
+            "proceeding with cleanup anyway\n"
+        )
 
     # --- Cleanup step ---
     cleanup_proc = subprocess.Popen(
@@ -288,12 +433,52 @@ def run_compile(runtime_manager: RuntimeManager, cwd: str = "core/generated"):
     threading.Thread(target=stream_output, args=(cleanup_proc.stdout, ""), daemon=True).start()
     threading.Thread(target=stream_output, args=(cleanup_proc.stderr, "[ERROR] "), daemon=True).start()
 
-    # Block until cleanup finishes
-    wait_and_finish(cleanup_proc, "Cleanup")
+    cleanup_ok = wait_step(cleanup_proc, "Cleanup")
 
-    # Restart PLC only if everything succeeded
+    # Update build_state.status from the COMBINED result. Previously,
+    # only the cleanup result mattered (the second wait_and_finish
+    # overwrote whatever the compile set), so a failed compile + a
+    # successful cleanup would have been reported as SUCCESS, and a
+    # successful compile + a failed cleanup as FAILED — neither
+    # matches what actually happened.
+    if compile_ok and cleanup_ok:
+        build_state.status = BuildStatus.SUCCESS
+        build_state.exit_code = 0
+    else:
+        build_state.status = BuildStatus.FAILED
+        build_state.exit_code = 1
+
     if build_state.status == BuildStatus.SUCCESS:
-        runtime_manager.reset_crash_tracking()
-        runtime_manager.start_plc()
+        # Re-run plugin configuration now that compile.sh has produced any
+        # VPP plugin .so files. The pre-compile call at upload time can only
+        # register pre-built plugins; VPP plugins are compiled on-target
+        # during run_compile, so their entries in plugins.conf have to be
+        # written after the compile step succeeds.
+        #
+        # Hold status back in COMPILING while we finalize plugins.conf so
+        # the editor doesn't poll SUCCESS and send START before the VPP
+        # plugin entry is written.
+        #
+        # Wrap in try/except: if update_plugin_configurations raises (e.g.,
+        # malformed plugins.conf, OS error rewriting it), we MUST flip
+        # status to FAILED. Without this, a raised exception bubbles out
+        # of run_compile leaving build_state.status pinned at COMPILING,
+        # and the editor's polling loop hangs forever waiting for a
+        # terminal status.
+        build_state.status = BuildStatus.COMPILING
+        try:
+            update_plugin_configurations(cwd)
+            build_state.status = BuildStatus.SUCCESS
+            # Reset crash tracking after a successful build — the program
+            # changed, so any previous crash pattern no longer applies. Do
+            # NOT auto-start the PLC here: the editor is responsible for
+            # sending START once it has confirmed a clean build, which
+            # gives it control over retries when the previous STOP
+            # transition is still finishing (COMMAND:BUSY window).
+            runtime_manager.reset_crash_tracking()
+        except Exception as e:
+            build_state.log(f"[ERROR] Failed to update plugin configurations: {e}\n")
+            build_state.status = BuildStatus.FAILED
+            build_state.exit_code = 1
     else:
         build_state.log("[WARNING] PLC program has not been updated because the build failed\n")

@@ -129,55 +129,6 @@ class IBatchProcessor:
         pass
 
 
-class IDebugUtils:
-    """Interface for debug and variable operations"""
-
-    @abstractmethod
-    def get_var_list(self, indexes: List[int]) -> Tuple[List[int], str]:
-        """Get addresses for variable indexes. Returns (addresses, error_message)"""
-        pass
-
-    @abstractmethod
-    def get_var_size(self, index: int) -> Tuple[int, str]:
-        """Get size of variable at index. Returns (size, error_message)"""
-        pass
-
-    @abstractmethod
-    def get_var_value(self, index: int) -> Tuple[Any, str]:
-        """Read variable value by index. Returns (value, error_message)"""
-        pass
-
-    @abstractmethod
-    def set_var_value(self, index: int, value: Any) -> Tuple[bool, str]:
-        """Write variable value by index. Returns (success, error_message)"""
-        pass
-
-    @abstractmethod
-    def get_var_count(self) -> Tuple[int, str]:
-        """Get total variable count. Returns (count, error_message)"""
-        pass
-
-    @abstractmethod
-    def get_var_info(self, index: int) -> Tuple[Dict, str]:
-        """Get comprehensive variable info. Returns (info_dict, error_message)"""
-        pass
-
-    @abstractmethod
-    def get_var_sizes_batch(self, indexes: List[int]) -> Tuple[List[int], str]:
-        """Get sizes for multiple variables in batch. Returns (sizes, error_message)"""
-        pass
-
-    @abstractmethod
-    def get_var_values_batch(self, indexes: List[int]) -> Tuple[List[Tuple[Any, str]], str]:
-        """Read multiple variable values in batch. Returns (results, error_message)"""
-        pass
-
-    @abstractmethod
-    def set_var_values_batch(self, index_value_pairs: List[Tuple[int, Any]]) -> Tuple[List[Tuple[bool, str]], str]:
-        """Write multiple variable values in batch. Returns (results, error_message)"""
-        pass
-
-
 class IConfigHandler:
     """Interface for configuration file operations"""
 

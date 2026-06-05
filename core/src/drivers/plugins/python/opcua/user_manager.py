@@ -515,6 +515,23 @@ class OpenPLCUserManager(UserManager):
         """
         Authenticate as anonymous user.
 
+        Anonymous role assignment is policy-driven by the user list:
+
+          - When no users are configured (config.users is empty), the
+            server is effectively single-tenant — there's no privilege
+            model to enforce, so anonymous gets the highest role
+            (engineer / Admin). This makes "drop in OPC-UA, set
+            insecure profile, click connect" work end-to-end without
+            needing to set up users just to get write access.
+          - When at least one user is configured, anonymous keeps the
+            read-only viewer role. The administrator opted into a
+            user model, so anonymous shouldn't bypass it.
+
+        Either way, per-variable permissions still apply. A variable
+        whose viewer permission is "rw" is writable by anyone; one
+        whose engineer permission is "r" is read-only even for the
+        engineer role.
+
         Args:
             profile: The security profile
 
@@ -525,11 +542,17 @@ class OpenPLCUserManager(UserManager):
             log_warn("Anonymous authentication not allowed for this profile")
             return None, None
 
-        # Anonymous users get viewer role (read-only)
-        openplc_role = "viewer"
+        if len(self.config.users) == 0:
+            # No user model configured — give anonymous full role so
+            # writes work without having to set up users.
+            openplc_role = "engineer"
+            asyncua_role = UserRole.Admin
+        else:
+            # Users configured — anonymous is read-only viewer.
+            openplc_role = "viewer"
+            asyncua_role = UserRole.User
 
-        # Return asyncua User object
-        return User(role=UserRole.User, name="anonymous"), openplc_role
+        return User(role=asyncua_role, name="anonymous"), openplc_role
 
     def _extract_cert_id(self, certificate: Any) -> Optional[str]:
         """

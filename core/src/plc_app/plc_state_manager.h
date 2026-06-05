@@ -2,7 +2,27 @@
 #define PLC_STATE_MANAGER_H
 
 #include "plcapp_manager.h"
+#include "scan_cycle_manager.h"
+#include <pthread.h>
+#include <setjmp.h>
+#include <signal.h>
 #include <stdbool.h>
+#include <stdint.h>
+
+/* Dual-language atomic types: C uses <stdatomic.h>'s _Atomic-typedef
+ * forms; C++ uses std::atomic<T>. Both have the same memory layout, so
+ * a struct that contains plc_atomic_long_t compiles in both languages
+ * and the linker treats it as the same storage. */
+#ifdef __cplusplus
+#include <atomic>
+typedef std::atomic<long>               plc_atomic_long_t;
+typedef std::atomic<uint_least64_t>     plc_atomic_u64_t;
+extern "C" {
+#else
+#include <stdatomic.h>
+typedef atomic_long                     plc_atomic_long_t;
+typedef atomic_uint_least64_t           plc_atomic_u64_t;
+#endif
 
 typedef enum
 {
@@ -12,6 +32,66 @@ typedef enum
     PLC_STATE_ERROR,
     PLC_STATE_EMPTY
 } PLCState;
+
+/* -----------------------------------------------------------------------
+ * Per-IEC-task execution context.
+ *
+ * One PlcTaskCtx per task declared in the user's CONFIGURATION. Lives
+ * for the duration of a loaded program; freed on stop.
+ *
+ * Per-thread state — crash_jmp, crash_sig, holding_mutex — must NOT be
+ * shared across threads. Each task thread owns its own context
+ * exclusively once spawned; the runtime stashes a __thread pointer to
+ * the active ctx so the signal handler can siglongjmp to the right
+ * recovery point.
+ * --------------------------------------------------------------------- */
+typedef struct PlcTaskCtx
+{
+    size_t                idx;                /* index into plc_tasks[] */
+    int64_t               interval_ns;
+    int                   priority;           /* IEC TASK priority, mapped to SCHED_FIFO */
+    uint64_t              cpu_affinity_mask;  /* 0 = no pinning, kernel decides */
+    bool                  is_fastest_task;    /* anchor for housekeeping (Phase 7) */
+    void                 *task_handle;        /* opaque strucpp::TaskInstance* */
+    pthread_t             thread;
+    char                  name[32];
+
+    sigjmp_buf            crash_jmp;
+    volatile sig_atomic_t crash_sig;
+    volatile sig_atomic_t holding_mutex;
+
+    plc_atomic_long_t     heartbeat;
+    plc_atomic_u64_t      local_tick;
+
+    /* Per-task scan/cycle/latency tracker. Each task thread updates its
+     * own tracker around its scan body; the STATS handler walks all
+     * trackers to emit per-task entries. Replaces the old single global
+     * plc_timing_stats from scan_cycle_manager.c which only tracked the
+     * fastest task. */
+    scan_cycle_tracker_t  tracker;
+} PlcTaskCtx;
+
+extern PlcTaskCtx *plc_tasks;
+extern size_t      plc_task_count;
+
+/* Lifecycle lock for plc_tasks / plc_task_count.
+ *
+ * The plc_cycle_thread owns the array — it allocates after walking the
+ * configuration (load) and frees after joining task threads (stop).
+ * Concurrently, the unix-socket thread services STATS by iterating the
+ * array under format_timing_stats_response. is_transitioning gates new
+ * commands but doesn't bracket an in-flight STATS call: a plugin-initiated
+ * stop can fire mid-iteration, free plc_tasks, and the STATS reader
+ * dereferences freed memory.
+ *
+ * Readers (STATS) hold this lock for the duration of the iteration.
+ * The writer (plc_cycle_thread) holds it while allocating, while
+ * publishing the count, and while freeing. STOP itself doesn't need the
+ * lock: task threads exit via plc_state observation; the lock only
+ * brackets the array swap. Held briefly enough that adding latency to
+ * STATS during a STOP transition is acceptable. */
+void plc_tasks_reader_lock(void);
+void plc_tasks_reader_unlock(void);
 
 /**
  * @brief Get the current PLC state.
@@ -45,5 +125,9 @@ void plc_force_error_state(void);
  * @return The signal number (e.g. SIGFPE, SIGSEGV), or 0 if no crash occurred
  */
 int plc_get_crash_signal(void);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // PLC_STATE_MANAGER_H

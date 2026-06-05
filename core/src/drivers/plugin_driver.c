@@ -15,11 +15,12 @@
 
 #include "../plc_app/image_tables.h"
 #include "../plc_app/journal_buffer.h"
+#include "../plc_app/plc_state_manager.h"
+#include "../plc_app/unix_socket.h"
 #include "../plc_app/utils/log.h"
 #include "../plc_app/utils/utils.h"
 #include "plugin_config.h"
 #include "plugin_driver.h"
-#include "plugin_utils.h"
 #include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -108,6 +109,73 @@ static int plugin_journal_write_lint(int type, int index, unsigned long long val
     return journal_write_lint((journal_buffer_type_t)type, (uint16_t)index, (uint64_t)value);
 }
 
+// STruC++ debugger thunks. Forward to ext_strucpp_debug_* function
+// pointers resolved from the program .so by image_tables symbols_init.
+// All five tolerate ext_*==NULL (program not yet loaded) and return a
+// safe sentinel: counts → 0, debug_set/debug_write → STATUS_OUT_OF_BOUNDS
+// (0x81), debug_read → 0 bytes written.
+
+static uint8_t plugin_debug_array_count(void)
+{
+    return ext_strucpp_debug_array_count ? ext_strucpp_debug_array_count() : 0;
+}
+
+static uint16_t plugin_debug_elem_count(uint8_t arr)
+{
+    return ext_strucpp_debug_elem_count ? ext_strucpp_debug_elem_count(arr) : 0;
+}
+
+static uint16_t plugin_debug_size(uint8_t arr, uint16_t elem)
+{
+    return ext_strucpp_debug_size ? ext_strucpp_debug_size(arr, elem) : 0;
+}
+
+static uint16_t plugin_debug_read(uint8_t arr, uint16_t elem, uint8_t *dest)
+{
+    return ext_strucpp_debug_read ? ext_strucpp_debug_read(arr, elem, dest) : 0;
+}
+
+static uint8_t plugin_debug_set(uint8_t arr, uint16_t elem, bool forcing,
+                                const uint8_t *bytes, uint16_t len)
+{
+    return ext_strucpp_debug_set
+               ? ext_strucpp_debug_set(arr, elem, forcing, bytes, len)
+               : 0x81; // STATUS_OUT_OF_BOUNDS
+}
+
+static uint8_t plugin_debug_write(uint8_t arr, uint16_t elem,
+                                  const uint8_t *bytes, uint16_t len)
+{
+    return ext_strucpp_debug_write
+               ? ext_strucpp_debug_write(arr, elem, bytes, len)
+               : 0x81; // STATUS_OUT_OF_BOUNDS
+}
+
+// Plugin-invoked async PLC stop. Logs the reason at error level and kicks
+// off a detached state-transition worker via the same path the unix-socket
+// STOP command uses — the transition flag blocks overlapping commands, and
+// all plugins get their stop_loop / cleanup hooks called in the normal
+// order. Non-blocking by design: the caller's I/O thread returns
+// immediately, then continues running for the brief window until the
+// plugin's own stop_loop is invoked. Plugins that enter fault-stopped state
+// are expected to short-circuit their I/O during that window.
+//
+// No pre-check on plc_get_state() here: plc_begin_transition does the
+// check atomically (under the same gate that prevents concurrent
+// transitions), so doing it again outside would just re-introduce the
+// check-then-act race the gate is there to close.
+static void plugin_request_plc_stop(const char *reason)
+{
+    log_error("[PLUGIN] stop requested: %s", reason ? reason : "(no reason given)");
+    if (!plc_begin_transition(PLC_STATE_STOPPED))
+    {
+        // Either the PLC is already stopping/stopped or another stop
+        // is already in flight — either way, nothing to do.
+        log_warn("[PLUGIN] stop request collapsed (already transitioning or not running)");
+    }
+}
+
+
 // Python capsule destructor for runtime args
 // Breakpoint here to debug capsule issues
 static void plugin_runtime_args_capsule_destructor(PyObject *capsule)
@@ -139,6 +207,57 @@ static PyObject *create_python_runtime_args_capsule(plugin_runtime_args_t *args)
     }
 
     return capsule;
+}
+
+/* Tear down a single plugin instance: cleanup hook (if init() ran),
+ * close native handles, release Python refs. Leaves the slot zeroed.
+ *
+ * IMPORTANT: dispatched on the slot's CURRENT stored type, not on the
+ * incoming config's type — that's the bug fix for the slot-positional
+ * reload issue. Closing by slot index assumed configs[w].type matched
+ * driver->plugins[w].config.type, which falls apart whenever the user
+ * reorders / replaces / changes the type of an entry in plugins.conf.
+ *
+ * Caller must ensure the plugin is not running (this function is called
+ * from update_config which only runs after STOP). The dlclose is unsafe
+ * on a live plugin — once the .so is unmapped, any in-flight call into
+ * its function pointers segfaults. */
+static void teardown_plugin_instance(plugin_instance_t *plugin)
+{
+    if (!plugin) return;
+
+    if (plugin->running)
+    {
+        log_error("[PLUGIN] internal error: tearing down running plugin '%s' — refusing",
+                  plugin->config.name);
+        return;
+    }
+
+    if (plugin->config.type == PLUGIN_TYPE_PYTHON && plugin->python_plugin)
+    {
+        // python_plugin_cleanup invokes the optional cleanup() if the
+        // plugin had been initialised, then DECREFs all module refs and
+        // frees the python_plugin bundle (sets the field to NULL).
+        // Calling it on an uninitialised plugin still releases module
+        // refs cleanly, so always call it as long as python_plugin is set.
+        python_plugin_cleanup(plugin);
+    }
+    else if (plugin->config.type == PLUGIN_TYPE_NATIVE && plugin->native_plugin)
+    {
+        if (plugin->initialized && plugin->native_plugin->cleanup)
+        {
+            plugin->native_plugin->cleanup();
+        }
+        if (plugin->native_plugin->handle)
+        {
+            dlclose(plugin->native_plugin->handle);
+        }
+        free(plugin->native_plugin);
+        plugin->native_plugin = NULL;
+    }
+
+    plugin->initialized = 0;
+    memset(&plugin->config, 0, sizeof(plugin->config));
 }
 
 int plugin_driver_update_config(plugin_driver_t *driver, const char *config_file)
@@ -193,17 +312,188 @@ int plugin_driver_update_config(plugin_driver_t *driver, const char *config_file
         return -1;
     }
 
+    /* Tear down ALL old plugins, dispatched by their CURRENT stored type
+     * (not the new config's type). This fixes the slot-positional reload
+     * bug: previously a slot whose type changed Native→Python would skip
+     * the dlclose (because the new type was Python) and leak the old .so
+     * handle; the converse direction would force-free a Python instance's
+     * native_plugin (which is NULL) but leave python_plugin orphaned.
+     *
+     * After this loop every slot 0..old plugin_count-1 is zeroed; we can
+     * safely rebuild from configs[] without worrying about stale state.
+     * This function is only called from load_plc_program (post-STOP) and
+     * plc_main.c boot, both of which guarantee no plugin is running, so
+     * dlclose is safe.
+     *
+     * GIL: this function does Python work in two places —
+     *   1) teardown_plugin_instance → python_plugin_cleanup (Py_XDECREF,
+     *      PyObject_CallFunctionObjArgs) for any old Python slot;
+     *   2) python_plugin_get_symbols (PyImport_ImportModule, etc.) for
+     *      each new Python entry in the rebuild loop.
+     * Both require the GIL. plc_main releases the GIL after the initial
+     * plugin init, so the second update_config call (from
+     * load_plc_program) lands here without it.
+     *
+     * The teardown loop is the only stage that strictly needs an explicit
+     * ensure — if Python is initialized and we have Python plugins to
+     * tear down, we MUST hold the GIL or Py_XDECREF will SIGSEGV. The
+     * rebuild loop's python_plugin_get_symbols handles the cold-start
+     * case itself (it calls Py_Initialize if needed and is implicitly
+     * GIL-holding after that), so for that loop we just need to make
+     * sure we don't release the GIL we acquired here. */
+    PyGILState_STATE plugin_gstate = PyGILState_LOCKED;
+    int plugin_have_gil = Py_IsInitialized();
+    if (plugin_have_gil)
+    {
+        plugin_gstate = PyGILState_Ensure();
+    }
+
+    int old_plugin_count = driver->plugin_count;
+    for (int w = 0; w < old_plugin_count; w++)
+    {
+        teardown_plugin_instance(&driver->plugins[w]);
+    }
+
+    /* Reset has_python_plugin before rebuilding — it'll be set again below
+     * for any Python entries in the new config. Without resetting, removing
+     * the last Python plugin from plugins.conf would leave the flag at 1
+     * and cause unnecessary GIL acquires throughout the driver. */
+    has_python_plugin = 0;
+
+    int load_failures = 0;
     driver->plugin_count = config_count;
-    has_python_plugin    = 0;
+
     for (int w = 0; w < config_count; w++)
     {
-        memcpy(&driver->plugins[w].config, &configs[w], sizeof(plugin_config_t));
+        plugin_instance_t *plugin = &driver->plugins[w];
+        // Slot already zeroed by the teardown loop (or never used).
+        memcpy(&plugin->config, &configs[w], sizeof(plugin_config_t));
+
         if (configs[w].type == PLUGIN_TYPE_PYTHON)
         {
             has_python_plugin = 1;
+            /* Re-import Python module symbols here. The teardown loop
+             * above ran python_plugin_cleanup, which zeros python_plugin.
+             * Without re-importing, plugin_driver_init's Python branch
+             * (which requires plugin->python_plugin && pFuncInit) would
+             * silently skip every Python plugin on the second invocation
+             * of update_config — the modbus_slave / modbus_master / opcua
+             * plugins would never re-init after a PLC restart.
+             *
+             * python_plugin_get_symbols handles cold-start itself: if
+             * Python isn't initialized yet, it calls Py_Initialize which
+             * implicitly puts the current thread in possession of the GIL,
+             * so subsequent Python plugins in this loop also run safely
+             * without an explicit ensure. */
+            if (plugin->config.path[0] != '\0')
+            {
+                if (python_plugin_get_symbols(plugin) != 0)
+                {
+                    if (plugin->config.enabled)
+                    {
+                        log_error("[PLUGIN] enabled Python plugin '%s' failed to load symbols",
+                                  configs[w].name);
+                        ++load_failures;
+                    }
+                    else
+                    {
+                        log_warn("[PLUGIN] disabled Python plugin '%s' has no loadable module",
+                                 configs[w].name);
+                    }
+                }
+            }
+        }
+        else if (configs[w].type == PLUGIN_TYPE_NATIVE)
+        {
+            if (native_plugin_get_symbols(plugin) != 0)
+            {
+                if (plugin->config.enabled)
+                {
+                    /* An enabled native plugin failed to load its .so.
+                     * This is the fix for "update_config failure not
+                     * surfaced": previously this was a log_warn and the
+                     * caller proceeded into init/start with native_plugin
+                     * == NULL, silently dropping cycle hooks. Now we mark
+                     * the load as failed so load_plc_program can surface
+                     * it as an ERROR state instead of a silent no-op. */
+                    log_error("[PLUGIN] enabled native plugin '%s' failed to load symbols",
+                              configs[w].name);
+                    ++load_failures;
+                }
+                else
+                {
+                    log_warn("[PLUGIN] disabled native plugin '%s' has no loadable .so",
+                             configs[w].name);
+                }
+            }
         }
     }
-    return 0;
+
+    if (plugin_have_gil)
+    {
+        PyGILState_Release(plugin_gstate);
+    }
+
+    return (load_failures > 0) ? -1 : 0;
+}
+
+int plugin_driver_append_config(plugin_driver_t *driver, const char *config_file)
+{
+    if (!driver || !config_file)
+    {
+        return -1;
+    }
+
+    if (access(config_file, F_OK) != 0)
+    {
+        /* File absent is not an error — VPP is optional. */
+        return 0;
+    }
+
+    plugin_config_t configs[MAX_PLUGINS];
+    int config_count = parse_plugin_config(config_file, configs, MAX_PLUGINS);
+    if (config_count < 0)
+    {
+        return -1;
+    }
+
+    int load_failures = 0;
+
+    for (int w = 0; w < config_count; w++)
+    {
+        /* Skip if we'd overflow the driver's plugin array. */
+        if (driver->plugin_count >= MAX_PLUGINS)
+        {
+            log_warn("[PLUGIN] plugin_driver_append_config: MAX_PLUGINS reached, skipping '%s'",
+                     configs[w].name);
+            break;
+        }
+
+        plugin_instance_t *plugin = &driver->plugins[driver->plugin_count];
+        memset(plugin, 0, sizeof(*plugin));
+        memcpy(&plugin->config, &configs[w], sizeof(plugin_config_t));
+        driver->plugin_count++;
+
+        if (configs[w].type == PLUGIN_TYPE_NATIVE)
+        {
+            if (native_plugin_get_symbols(plugin) != 0)
+            {
+                if (plugin->config.enabled)
+                {
+                    log_error("[PLUGIN] enabled VPP plugin '%s' failed to load symbols",
+                              configs[w].name);
+                    ++load_failures;
+                }
+                else
+                {
+                    log_warn("[PLUGIN] disabled VPP plugin '%s' has no loadable .so",
+                             configs[w].name);
+                }
+            }
+        }
+    }
+
+    return (load_failures > 0) ? -1 : 0;
 }
 
 int plugin_driver_load_config(plugin_driver_t *driver, const char *config_file)
@@ -213,33 +503,13 @@ int plugin_driver_load_config(plugin_driver_t *driver, const char *config_file)
         return -1;
     }
 
-    plugin_driver_update_config(driver, config_file);
-
-    // Now retrieve the function symbols and initialize
-    // struct plugin_instance_t para cada plugin.
-    for (int i = 0; i < driver->plugin_count; i++)
-    {
-        plugin_instance_t *plugin = &driver->plugins[i];
-
-        if (plugin->config.type == PLUGIN_TYPE_PYTHON)
-        {
-            if (python_plugin_get_symbols(plugin) != 0)
-            {
-                log_error("Failed to get Python plugin symbols for: %s", plugin->config.path);
-                return -1;
-            }
-        }
-        else if (plugin->config.type == PLUGIN_TYPE_NATIVE)
-        {
-            if (native_plugin_get_symbols(plugin) != 0)
-            {
-                log_error("Failed to get native plugin symbols for: %s", plugin->config.path);
-                return -1;
-            }
-        }
-    }
-
-    return 0;
+    /* plugin_driver_update_config now performs the full teardown + rebuild,
+     * including symbol loading for both Python and native plugins. The
+     * previous post-update_config loop here would re-call the *get_symbols
+     * functions on already-loaded slots — those allocate fresh bundles and
+     * overwrite the pointer, leaking the bundle that update_config just
+     * created. Just forward the return code. */
+    return plugin_driver_update_config(driver, config_file);
 }
 
 // Send to plugin init function all args
@@ -303,6 +573,7 @@ int plugin_driver_init(plugin_driver_t *driver)
                 return -1;
             }
             Py_DECREF(result);
+            plugin->initialized = 1;
         }
         else if (plugin->config.type == PLUGIN_TYPE_NATIVE && plugin->native_plugin &&
                  plugin->native_plugin->init)
@@ -338,6 +609,7 @@ int plugin_driver_init(plugin_driver_t *driver)
 
             // Free the args after successful initialization
             free_structured_args(args);
+            plugin->initialized = 1;
         }
     }
 
@@ -347,6 +619,39 @@ int plugin_driver_init(plugin_driver_t *driver)
     }
 
     return 0;
+}
+
+int plugin_driver_cleanup_init(plugin_driver_t *driver)
+{
+    if (!driver) return 0;
+
+    PyGILState_STATE local_gstate = PyGILState_LOCKED;
+    int have_gil = has_python_plugin && Py_IsInitialized();
+    if (have_gil) local_gstate = PyGILState_Ensure();
+
+    int cleaned = 0;
+    /* Reverse order so dependent plugins (declared later, depend on
+     * resources owned by earlier plugins) tear down first. */
+    for (int i = driver->plugin_count - 1; i >= 0; --i)
+    {
+        plugin_instance_t *plugin = &driver->plugins[i];
+        if (!plugin->initialized) continue;
+
+        if (plugin->config.type == PLUGIN_TYPE_PYTHON && plugin->python_plugin)
+        {
+            python_plugin_cleanup(plugin);
+        }
+        else if (plugin->config.type == PLUGIN_TYPE_NATIVE && plugin->native_plugin &&
+                 plugin->native_plugin->cleanup)
+        {
+            plugin->native_plugin->cleanup();
+        }
+        plugin->initialized = 0;
+        ++cleaned;
+    }
+
+    if (have_gil) PyGILState_Release(local_gstate);
+    return cleaned;
 }
 
 // Call the thread function for each plugin
@@ -555,18 +860,20 @@ void plugin_driver_destroy(plugin_driver_t *driver)
     for (int i = 0; i < driver->plugin_count; i++)
     {
         plugin_instance_t *plugin = &driver->plugins[i];
-        if (plugin->python_plugin && python_initialized)
+        if (plugin->python_plugin && python_initialized && plugin->initialized)
         {
             python_plugin_cleanup(plugin);
+            plugin->initialized = 0;
         }
         if (plugin->native_plugin)
         {
-            // Call cleanup function if available
-            if (plugin->native_plugin->cleanup)
+            // Call cleanup function if available, but only if init() ran.
+            if (plugin->initialized && plugin->native_plugin->cleanup)
             {
                 plugin->native_plugin->cleanup();
                 log_info("Native plugin %s cleaned up successfully", plugin->config.name);
             }
+            plugin->initialized = 0;
             // Close the shared library handle
             if (plugin->native_plugin->handle)
             {
@@ -646,11 +953,18 @@ void *generate_structured_args_with_driver(plugin_type_t type, plugin_driver_t *
     args->bool_memory = bool_memory;
 
     // Initialize mutex functions
-    args->mutex_take    = plugin_mutex_take;
-    args->mutex_give    = plugin_mutex_give;
-    args->get_var_list  = get_var_list;
-    args->get_var_size  = get_var_size;
-    args->get_var_count = get_var_count;
+    args->mutex_take = plugin_mutex_take;
+    args->mutex_give = plugin_mutex_give;
+    // STruC++ debugger surface — replaces the MatIEC-era
+    // get_var_list / get_var_size / get_var_count flat-index API.
+    // Each thunk forwards to the corresponding ext_strucpp_debug_*
+    // function pointer resolved from the program .so. NULL-safe.
+    args->debug_array_count = plugin_debug_array_count;
+    args->debug_elem_count  = plugin_debug_elem_count;
+    args->debug_size        = plugin_debug_size;
+    args->debug_read        = plugin_debug_read;
+    args->debug_set         = plugin_debug_set;
+    args->debug_write       = plugin_debug_write;
     // Set buffer mutex from driver
     args->buffer_mutex = &driver->buffer_mutex;
 
@@ -679,8 +993,13 @@ void *generate_structured_args_with_driver(plugin_type_t type, plugin_driver_t *
     args->journal_write_dint = plugin_journal_write_dint;
     args->journal_write_lint = plugin_journal_write_lint;
 
-    // PLC base tick time
-    args->common_ticktime_ns = ext_common_ticktime__ ? *ext_common_ticktime__ : 0;
+    // Plugin-initiated async PLC stop (for unrecoverable hardware faults).
+    args->request_plc_stop = plugin_request_plc_stop;
+
+    // PLC base tick time. Runtime owns base_tick_ns; on first plugin init
+    // (before symbols_init) it carries the 20 ms default, so plugins must
+    // guard against the value being smaller than their needed resolution.
+    args->base_tick_ns = base_tick_ns;
 
     // printf("[PLUGIN]: Runtime args initialized:\n");
     // printf("[PLUGIN]:   buffer_size = %d\n", args->buffer_size);
@@ -993,6 +1312,10 @@ int native_plugin_get_symbols(plugin_instance_t *plugin)
                  plugin->config.path);
     }
 
+    native_bundle->get_stats = (plugin_get_stats_func_t)dlsym(handle, "get_stats");
+    // get_stats is fully optional — plugins that don't publish statistics
+    // simply don't export it. No warning.
+
     // Store the native bundle and handle in the plugin instance
     plugin->native_plugin = native_bundle;
 
@@ -1004,6 +1327,7 @@ int native_plugin_get_symbols(plugin_instance_t *plugin)
     log_info("  - cycle_end: %s", native_bundle->cycle_end ? "(PASS)" : "(FAIL)");
     log_info("  - cleanup: %s", native_bundle->cleanup ? "(PASS)" : "(FAIL)");
     log_info("  - execute_command: %s", native_bundle->execute_command ? "(PASS)" : "(FAIL)");
+    log_info("  - get_stats: %s", native_bundle->get_stats ? "(PASS)" : "(FAIL)");
 
     return 0;
 }
@@ -1103,6 +1427,141 @@ int plugin_driver_execute_command(plugin_driver_t *driver, const char *plugin_na
 
     snprintf(response, response_size, "{\"error\":\"plugin '%s' not found\"}", plugin_name);
     return -1;
+}
+
+// ===================================================================
+// Plugin-contributed statistics aggregation
+// ===================================================================
+//
+// Called from the STATS response path. Takes an already-formatted JSON
+// response ending in "}\n" (or "}"), asks each native plugin that
+// exports get_stats to produce a JSON object snippet, and splices them
+// into a "plugin_stats" member before the closing brace.
+//
+// Per-plugin budget: PLUGIN_STATS_SLOT_BUDGET bytes.
+// Combined budget:  PLUGIN_STATS_TOTAL_BUDGET bytes.
+// Output is best-effort: malformed plugin output (doesn't start with
+// '{' and end with '}') is silently dropped, overflow truncates, and
+// the core STATS response is always preserved.
+#define PLUGIN_STATS_SLOT_BUDGET   1024
+#define PLUGIN_STATS_TOTAL_BUDGET  8192
+
+size_t plugin_driver_append_stats_json(plugin_driver_t *driver, char *buffer,
+                                       size_t buffer_size)
+{
+    if (!buffer || buffer_size == 0)
+        return 0;
+
+    size_t len = strlen(buffer);
+
+    // Detect and strip a trailing newline — we'll re-add it after splicing.
+    int had_newline = 0;
+    if (len > 0 && buffer[len - 1] == '\n')
+    {
+        had_newline = 1;
+        buffer[--len] = '\0';
+    }
+
+    // Expect the core STATS payload to end in '}'. If it doesn't, the
+    // response is malformed and we won't risk making it worse.
+    if (len == 0 || buffer[len - 1] != '}')
+    {
+        if (had_newline && len + 1 < buffer_size)
+        {
+            buffer[len] = '\n';
+            buffer[len + 1] = '\0';
+            len++;
+        }
+        return len;
+    }
+
+    if (!driver || driver->plugin_count == 0)
+    {
+        if (had_newline && len + 1 < buffer_size)
+        {
+            buffer[len] = '\n';
+            buffer[len + 1] = '\0';
+            len++;
+        }
+        return len;
+    }
+
+    // Build the ,"plugin_stats":{...} section in a scratch buffer so we
+    // can commit-or-rollback atomically if it would overflow the response.
+    char scratch[PLUGIN_STATS_TOTAL_BUDGET];
+    size_t spos = 0;
+    int emitted = 0;
+
+    for (int i = 0; i < driver->plugin_count; i++)
+    {
+        plugin_instance_t *p = &driver->plugins[i];
+        if (p->config.type != PLUGIN_TYPE_NATIVE)
+            continue;
+        if (!p->native_plugin || !p->native_plugin->get_stats)
+            continue;
+
+        char slot[PLUGIN_STATS_SLOT_BUDGET];
+        slot[0] = '\0';
+        if (p->native_plugin->get_stats(slot, sizeof(slot)) != 0)
+            continue;
+
+        size_t slen = strnlen(slot, sizeof(slot));
+        if (slen < 2 || slot[0] != '{' || slot[slen - 1] != '}')
+            continue; // malformed — drop silently
+
+        int n = snprintf(scratch + spos, sizeof(scratch) - spos, "%s\"%s\":%s",
+                         emitted ? "," : "", p->config.name, slot);
+        if (n < 0 || (size_t)n >= sizeof(scratch) - spos)
+            break; // scratch full; commit what we have
+
+        spos += (size_t)n;
+        emitted = 1;
+    }
+
+    if (!emitted)
+    {
+        if (had_newline && len + 1 < buffer_size)
+        {
+            buffer[len] = '\n';
+            buffer[len + 1] = '\0';
+            len++;
+        }
+        return len;
+    }
+
+    // Splice: overwrite the closing '}' with ,"plugin_stats":{...}} and
+    // re-append the newline if present.
+    size_t insert_pos = len - 1;
+    int n = snprintf(buffer + insert_pos, buffer_size - insert_pos,
+                     ",\"plugin_stats\":{%s}}%s", scratch, had_newline ? "\n" : "");
+    if (n < 0)
+    {
+        // snprintf failure — restore newline and bail.
+        if (had_newline && len + 1 < buffer_size)
+        {
+            buffer[len] = '\n';
+            buffer[len + 1] = '\0';
+            len++;
+        }
+        return len;
+    }
+    if ((size_t)n >= buffer_size - insert_pos)
+    {
+        // Would overflow the response buffer; roll back by restoring the '}'
+        // and the newline.
+        buffer[insert_pos] = '}';
+        buffer[insert_pos + 1] = '\0';
+        len = insert_pos + 1;
+        if (had_newline && len + 1 < buffer_size)
+        {
+            buffer[len] = '\n';
+            buffer[len + 1] = '\0';
+            len++;
+        }
+        return len;
+    }
+
+    return insert_pos + (size_t)n;
 }
 
 // Cleanup Python plugin

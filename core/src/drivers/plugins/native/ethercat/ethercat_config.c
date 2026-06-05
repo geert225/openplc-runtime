@@ -309,8 +309,7 @@ static void parse_master_section(const cJSON *master, ecat_master_config_t *conf
     config->receive_timeout_us = get_int(master, "receive_timeout_us", 2000);
     config->watchdog_timeout_cycles = get_int(master, "watchdog_timeout_cycles", 3);
     safe_strcpy(config->log_level, get_string(master, "log_level", "info"), sizeof(config->log_level));
-    safe_strcpy(config->task_name, get_string(master, "task_name", ""), sizeof(config->task_name));
-    config->task_cycle_time_us = get_int(master, "task_cycle_time_us", 0);
+    config->task_priority = get_int(master, "task_priority", 90);
     config->safe_close = get_bool(master, "safe_close", true);
 }
 
@@ -715,8 +714,7 @@ void ecat_config_init_defaults(ecat_config_t *config)
     config->master.receive_timeout_us = 2000;
     config->master.watchdog_timeout_cycles = 3;
     safe_strcpy(config->master.log_level, "info", sizeof(config->master.log_level));
-    config->master.task_name[0] = '\0';
-    config->master.task_cycle_time_us = 0;
+    config->master.task_priority = 90;
     config->master.safe_close = true;
 
     /* Diagnostics defaults */

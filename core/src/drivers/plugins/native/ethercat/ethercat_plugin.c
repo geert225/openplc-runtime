@@ -16,14 +16,30 @@
  * Phase 3: Synchronous process data exchange within PLC scan cycle
  *
  * Architecture:
- *   - Process data exchange runs synchronously inside the PLC scan cycle
- *     via cycle_start/cycle_end hooks, sharing the PLC thread's timing.
- *   - cycle_start: writes outputs, exchanges process data, reads inputs
- *   - cycle_end: (no-op, outputs are sent at the start of the next cycle)
- *   - No separate EtherCAT thread or shadow buffer is needed.
+ *   - Each master owns a dedicated `ecat_bus_thread` running at
+ *     SCHED_FIFO with the configured taskPriority. The thread sleeps
+ *     absolutely (CLOCK_MONOTONIC + TIMER_ABSTIME) to its next deadline
+ *     so jitter stays bounded.
+ *   - Per cycle: brief mutex window to copy outputs PLC→IOmap, release
+ *     mutex, run the SOEM exchange (no PLC mutex held), brief mutex
+ *     window again to copy inputs IOmap→PLC. Splits the I/O window so
+ *     IEC scan tasks aren't blocked across the network round-trip.
+ *   - Per-master scan_cycle_tracker registered with the runtime so
+ *     STATS reports bus cycle timing alongside the IEC tasks.
+ *   - The legacy cycle_start/cycle_end plugin hooks are gone.
  */
 
+/* _GNU_SOURCE pulls in glibc extensions used by the bus thread:
+ *   - pthread_setname_np()  for `top` / `htop` thread naming
+ *   - pthread_kill()        for SIGUSR1 wake-up on stop
+ * Must come before any system header. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <ctype.h>
+#include <errno.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -41,7 +57,12 @@
 #include "ethercat_master.h"
 #include "ethercat_io.h"
 #include "soem/soem.h"   /* osal_get_monotonic_time, ec_timet */
-#include "cjson/cJSON.h"  /* JSON parsing for execute_command */
+#include "cJSON.h"  /* JSON parsing for execute_command */
+
+/* Forward declaration: ecat_bus_thread is defined alongside the bus
+ * loop further down in the file but referenced first by
+ * start_single_master via pthread_create. */
+static void *ecat_bus_thread(void *arg);
 
 /*
  * =============================================================================
@@ -143,6 +164,8 @@ static void diag_reset(ecat_cycle_diag_t *d)
 {
     memset(d, 0, sizeof(*d));
     atomic_store_explicit(&d->min_bus_cycle_ns, UINT64_MAX, memory_order_relaxed);
+    atomic_store_explicit(&d->min_period_ns,    UINT64_MAX, memory_order_relaxed);
+    atomic_store_explicit(&d->min_latency_ns,   INT64_MAX,  memory_order_relaxed);
 }
 
 /*
@@ -681,6 +704,17 @@ static int start_single_master(ecat_master_instance_t *inst)
     inst->cycle_counter = 0;
     diag_reset(&inst->diag);
 
+    /* Time-based EWMA window in samples — chosen so the wall-clock
+     * smoothing window matches ECAT_AVG_TARGET_WINDOW_NS regardless of
+     * the configured cycle rate. Same scheme as scan_cycle_tracker. */
+    {
+        int64_t cycle_ns = (int64_t)inst->config.master.cycle_time_us * 1000LL;
+        inst->avg_window = (cycle_ns > 0)
+            ? (ECAT_AVG_TARGET_WINDOW_NS / cycle_ns)
+            : 1;
+        if (inst->avg_window < 1) inst->avg_window = 1;
+    }
+
     atomic_store(&inst->plugin_state, ECAT_STATE_OPERATIONAL);
 
     /* Send one initial exchange to populate the IOmap with slave data */
@@ -709,10 +743,23 @@ static int start_single_master(ecat_master_instance_t *inst)
      * inside ecat_master_open_and_scan() and reverted inside
      * ecat_master_close(). */
 
+    /* Spawn the dedicated bus thread. SCHED_FIFO + absolute clock_nanosleep
+     * driving the SOEM exchange at master.cycle_time_us. */
+    atomic_store(&inst->bus_running, true);
+    if (pthread_create(&inst->bus_thread, NULL, ecat_bus_thread, inst) != 0) {
+        plugin_logger_error(&g_logger,
+            "Master '%s': Failed to create bus thread: %s",
+            inst->name, strerror(errno));
+        atomic_store(&inst->bus_running, false);
+        atomic_store(&inst->plugin_state, ECAT_STATE_ERROR);
+        return -1;
+    }
+
     plugin_logger_info(&g_logger,
         "Master '%s': [state: OPERATIONAL] EtherCAT master started "
-        "(synchronous exchange, monitor=%s)",
-        inst->name, ECAT_ENABLE_MONITOR_THREAD ? "enabled" : "disabled");
+        "(dedicated bus thread, cycle=%d us, monitor=%s)",
+        inst->name, inst->config.master.cycle_time_us,
+        ECAT_ENABLE_MONITOR_THREAD ? "enabled" : "disabled");
 
     return 0;
 }
@@ -737,6 +784,17 @@ static void stop_single_master(ecat_master_instance_t *inst)
         "Master '%s': Stopping (current state: %s)...",
         inst->name, ecat_state_to_string(state));
 
+    /* Stop the bus thread first so no further SOEM exchange races with
+     * teardown. Signal via the running flag, then SIGUSR1 to wake any
+     * in-flight clock_nanosleep, then join. */
+    if (atomic_load(&inst->bus_running)) {
+        atomic_store(&inst->bus_running, false);
+        pthread_kill(inst->bus_thread, SIGUSR1);
+        pthread_join(inst->bus_thread, NULL);
+        plugin_logger_debug(&g_logger,
+            "Master '%s': Bus thread joined", inst->name);
+    }
+
 #if ECAT_ENABLE_MONITOR_THREAD
     /* Stop the monitor thread before closing the master */
     if (atomic_load(&inst->monitor_running)) {
@@ -754,8 +812,8 @@ static void stop_single_master(ecat_master_instance_t *inst)
         atomic_load_explicit(&inst->diag.cycle_count, memory_order_relaxed);
     uint64_t final_wkc_errors =
         atomic_load_explicit(&inst->diag.wkc_error_count, memory_order_relaxed);
-    int64_t  final_avg =
-        atomic_load_explicit(&inst->diag.avg_bus_cycle_ns, memory_order_relaxed);
+    int64_t  final_sum =
+        atomic_load_explicit(&inst->diag.avg_bus_cycle_ns_sum, memory_order_relaxed);
     uint64_t final_min =
         atomic_load_explicit(&inst->diag.min_bus_cycle_ns, memory_order_relaxed);
     uint64_t final_max =
@@ -763,6 +821,9 @@ static void stop_single_master(ecat_master_instance_t *inst)
 
     if (final_cycle_count > 0 || final_wkc_errors > 0) {
         uint64_t total_cycles = final_cycle_count + final_wkc_errors;
+        int64_t  final_avg_ns = (inst->avg_window > 0)
+            ? final_sum / inst->avg_window
+            : 0;
         /* min sentinel UINT64_MAX -> "n/a" */
         unsigned long long min_us = (final_min == UINT64_MAX) ? 0
                                   : (unsigned long long)(final_min / 1000);
@@ -773,7 +834,7 @@ static void stop_single_master(ecat_master_instance_t *inst)
             (unsigned long long)total_cycles,
             (unsigned long long)final_cycle_count,
             (unsigned long long)final_wkc_errors,
-            (long long)(final_avg / 1000),
+            (long long)(final_avg_ns / 1000),
             min_us,
             (unsigned long long)(final_max / 1000));
     }
@@ -802,59 +863,84 @@ static void stop_single_master(ecat_master_instance_t *inst)
 }
 
 /**
- * @brief Run one cycle for a single master instance
+ * @brief Perform one EtherCAT cycle for a single master instance
  *
- * Performs synchronous EtherCAT process data exchange:
- *   1. Writes PLC outputs (from previous cycle) into the real IOmap
- *   2. Exchanges process data with all slaves via SOEM
- *   3. Reads received inputs from the IOmap into PLC input buffers
- *   4. Tracks WKC errors (no blocking SOEM calls)
+ * Called by the dedicated bus thread on every cycle. Splits the I/O
+ * window into two short mutex windows separated by the actual SOEM
+ * exchange (which is the slow part — tens to hundreds of microseconds
+ * for typical networks):
  *
- * @param inst Per-master instance
+ *   1. lock buffer_mutex → copy PLC outputs into IOmap → unlock
+ *   2. SOEM exchange (no mutex held — IEC tasks can run during it)
+ *   3. lock buffer_mutex → copy IOmap inputs into PLC buffers → unlock
+ *   4. Update WKC + diagnostics
+ *
+ * Diag timing distinguishes two metrics:
+ *   - `exchange_ns`: just the SOEM round-trip (wire / NIC time)
+ *   - `total_ns`:    full work window — both mutex acquisitions, both
+ *                    memcpys, AND the exchange. The difference between
+ *                    the two surfaces buffer-mutex contention with the
+ *                    IEC tasks, which is the diagnostic users want.
+ *
+ * The IOmap is owned by the plugin (this thread + monitor thread via
+ * `request_soem_access`) so it never crosses the PLC mutex.
+ *
+ * Returns true on a successful exchange, false on a skip (e.g. the
+ * monitor thread holds exclusive SOEM access right now).
  */
-static void cycle_start_single(ecat_master_instance_t *inst)
+static bool ecat_run_one_cycle(ecat_master_instance_t *inst)
 {
     int state = atomic_load(&inst->plugin_state);
     /* RECOVERING is allowed: opportunistic exchange in the gaps between
      * monitor recovery attempts.  exchange_skips counts trylock misses. */
     if (state != ECAT_STATE_OPERATIONAL && state != ECAT_STATE_RECOVERING)
-        return;
-
-    /* Task-based scheduling: skip cycles that don't align with the task interval.
-     * tick_divisor is always >= 1; when 1 the modulo is always 0 (no skip). */
-    if ((inst->cycle_counter % inst->tick_divisor) != 0) {
-        inst->cycle_counter++;
-        return;
-    }
+        return false;
 
     uint8_t *iomap = ecat_master_get_iomap(inst);
     if (!iomap)
-        return;
+        return false;
 
 #if ECAT_ENABLE_MONITOR_THREAD
     /* If the monitor thread is holding soem_lock (state check or recovery),
-     * yield this cycle.  The PLC keeps running with stale I/O data for one
+     * yield this cycle.  The bus keeps running with stale I/O data for one
      * cycle.  Trylock is non-blocking; in contention it costs only a futex
      * read and returns immediately. */
     if (pthread_mutex_trylock(&inst->soem_lock) != 0) {
         atomic_fetch_add_explicit(&inst->exchange_skips, 1, memory_order_relaxed);
-        return;
+        return false;
     }
 #endif
 
-    /* 1. Write PLC outputs to IOmap (from previous cycle's computation) */
+    ec_timet t_exch_start, t_exch_end;
+
+    /* 1. Lock briefly, snapshot outputs from PLC buffers into the IOmap.
+     *    This is a pure memcpy — microseconds — so we don't hold the
+     *    image-tables mutex across the SOEM exchange. */
+    if (g_runtime_args.mutex_take && g_runtime_args.buffer_mutex) {
+        g_runtime_args.mutex_take(g_runtime_args.buffer_mutex);
+    }
     ecat_io_write_outputs_fast(&inst->transfer_list, iomap);
+    if (g_runtime_args.mutex_give && g_runtime_args.buffer_mutex) {
+        g_runtime_args.mutex_give(g_runtime_args.buffer_mutex);
+    }
 
-    /* 2. Exchange process data with slaves (synchronous) */
-    ec_timet t0, t1;
-    osal_get_monotonic_time(&t0);
+    /* 2. Exchange process data with slaves (synchronous, NO mutex held).
+     *    IEC scan tasks can read/write IO during this window. */
+    osal_get_monotonic_time(&t_exch_start);
     int wkc = ecat_master_exchange_processdata(inst, inst->receive_timeout_us);
-    osal_get_monotonic_time(&t1);
+    osal_get_monotonic_time(&t_exch_end);
 
-    uint64_t exchange_ns = elapsed_ns(&t0, &t1);
+    uint64_t exchange_ns = elapsed_ns(&t_exch_start, &t_exch_end);
 
-    /* 3. Read received inputs into PLC buffers */
+    /* 3. Lock again briefly, copy received inputs from IOmap into PLC
+     *    buffers. */
+    if (g_runtime_args.mutex_take && g_runtime_args.buffer_mutex) {
+        g_runtime_args.mutex_take(g_runtime_args.buffer_mutex);
+    }
     ecat_io_read_inputs_fast(&inst->transfer_list, iomap);
+    if (g_runtime_args.mutex_give && g_runtime_args.buffer_mutex) {
+        g_runtime_args.mutex_give(g_runtime_args.buffer_mutex);
+    }
 
 #if ECAT_ENABLE_MONITOR_THREAD
     pthread_mutex_unlock(&inst->soem_lock);
@@ -882,17 +968,16 @@ static void cycle_start_single(ecat_master_instance_t *inst)
 
     atomic_fetch_add_explicit(&inst->diag.cycle_count, 1, memory_order_relaxed);
 
-    /* EWMA: avg += (sample - avg) / 2^SHIFT.  Tracks recent-window jitter
-     * instead of a historical mean (which the previous integer-Welford
-     * loop stalled at once cycle_count grew large).  Division (not signed
-     * right shift) keeps the math portable -- the compiler emits the same
-     * sar sequence on supported targets without invoking the IDB on
-     * negative-operand right shift. */
-    int64_t cur_avg = atomic_load_explicit(&inst->diag.avg_bus_cycle_ns,
+    /* Time-based EWMA: store an approximate sum of the last N samples,
+     * update with `sum += sample - sum/N`, recover avg as `sum/N` on
+     * read.  N = inst->avg_window, fixed for the master's lifetime so
+     * the wall-clock smoothing window stays constant regardless of
+     * cycle rate.  Sum form avoids the integer-precision stall that
+     * `avg += (sample - avg)/N` hits when delta < N. */
+    int64_t cur_sum = atomic_load_explicit(&inst->diag.avg_bus_cycle_ns_sum,
                                            memory_order_relaxed);
-    int64_t delta = (int64_t)exchange_ns - cur_avg;
-    cur_avg += delta / (1 << ECAT_AVG_EWMA_SHIFT);
-    atomic_store_explicit(&inst->diag.avg_bus_cycle_ns, cur_avg,
+    cur_sum += (int64_t)exchange_ns - cur_sum / inst->avg_window;
+    atomic_store_explicit(&inst->diag.avg_bus_cycle_ns_sum, cur_sum,
                           memory_order_relaxed);
 
     /* Min/max: single-writer, no CAS needed. */
@@ -926,6 +1011,164 @@ static void cycle_start_single(ecat_master_instance_t *inst)
     } else {
         atomic_store(&inst->consecutive_wkc_errors, 0);
     }
+    return true;
+}
+
+/* SIGUSR1 wakes the bus thread out of clock_nanosleep so a stop request
+ * lands within microseconds instead of after a full sleep period. The
+ * handler is installed once at process init (plc_main.c handle_sigusr1)
+ * — DON'T re-install here, sigaction is process-wide and last-writer-
+ * wins between bus threads / task threads / future signal users. */
+
+static inline uint64_t ts_to_ns(const struct timespec *ts)
+{
+    return (uint64_t)ts->tv_sec * 1000000000ULL + (uint64_t)ts->tv_nsec;
+}
+
+/**
+ * @brief Bus thread body — periodic SOEM exchange driver
+ *
+ * Runs at SCHED_FIFO with the configured task_priority. Sleeps absolutely
+ * (CLOCK_MONOTONIC + TIMER_ABSTIME) to the next deadline so jitter stays
+ * bounded. Each tick:
+ *   - clock_nanosleep TIMER_ABSTIME → wake at the absolute deadline
+ *   - capture wake-up timing: latency vs deadline, period vs prev wake
+ *   - run the cycle (mutex+exchange+mutex)
+ *   - advance the deadline
+ *
+ * Two scheduling metrics surface the answers to "are we hitting our
+ * configured cycle time, and how late are we waking up?":
+ *   - period_ns: actual_wake[N] - actual_wake[N-1]; should equal
+ *     interval_ns on average on a healthy RT system.
+ *   - latency_ns: actual_wake[N] - expected_wake[N]; how much later
+ *     than its deadline the bus thread actually started running.
+ *
+ * Updates use the same lock-free atomic + time-based EWMA scheme as
+ * bus_cycle_ns (see ECAT_AVG_TARGET_WINDOW_NS).  Single-writer (this
+ * thread); JSON readers pull the values lock-free.
+ */
+static void *ecat_bus_thread(void *arg)
+{
+    ecat_master_instance_t *inst = (ecat_master_instance_t *)arg;
+
+    /* Set thread name for top/htop debugging. */
+    char tname[16];
+    snprintf(tname, sizeof tname, "ecat-%s", inst->name);
+    pthread_setname_np(pthread_self(), tname);
+
+    /* Apply SCHED_FIFO at the configured priority. Fall back to the
+     * default scheduler with a warning rather than refusing to run. */
+    int prio = inst->config.master.task_priority;
+    if (prio < 1)  prio = 1;
+    if (prio > 99) prio = 99;
+    struct sched_param sp = {0};
+    sp.sched_priority = prio;
+    if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0) {
+        plugin_logger_warn(&g_logger,
+            "Bus thread '%s': SCHED_FIFO(%d) failed: %s — running with default scheduling",
+            inst->name, prio, strerror(errno));
+    } else {
+        plugin_logger_info(&g_logger,
+            "Bus thread '%s': SCHED_FIFO priority %d", inst->name, prio);
+    }
+
+    /* SIGUSR1 handler is process-wide; installed once at plc_main.c.
+     * No per-thread sigaction here. SIGUSR1 stays unblocked for this
+     * thread by default (pthread_create inherits the parent's mask, and
+     * the process-wide mask doesn't include SIGUSR1). */
+
+    int64_t interval_ns =
+        (int64_t)inst->config.master.cycle_time_us * 1000LL;
+    if (interval_ns <= 0) interval_ns = 1000000LL; /* 1 ms safety floor */
+
+    /* Seed scheduling-stat min trackers. */
+    atomic_store_explicit(&inst->diag.min_period_ns,  UINT64_MAX, memory_order_relaxed);
+    atomic_store_explicit(&inst->diag.min_latency_ns, INT64_MAX,  memory_order_relaxed);
+
+    struct timespec next_wakeup;
+    clock_gettime(CLOCK_MONOTONIC, &next_wakeup);
+
+    bool     have_prev_wake = false;
+    uint64_t prev_wake_ns   = 0;
+
+    while (atomic_load(&inst->bus_running)) {
+        /* Capture actual wake-up time. The first iteration's deadline
+         * is "now" so latency should be ~0; meaningful from iteration 2. */
+        struct timespec actual_wake;
+        clock_gettime(CLOCK_MONOTONIC, &actual_wake);
+        uint64_t actual_wake_ns = ts_to_ns(&actual_wake);
+        uint64_t expected_ns    = ts_to_ns(&next_wakeup);
+
+        /* Latency = how much later than the deadline we woke up. Can
+         * theoretically be slightly negative if clock skew or coarse
+         * timer granularity puts us a fraction ahead. Subtract in the
+         * signed domain so an early wake yields a small negative value
+         * rather than relying on impl-defined unsigned→signed conversion. */
+        int64_t latency_ns = (int64_t)actual_wake_ns - (int64_t)expected_ns;
+        atomic_store_explicit(&inst->diag.latency_ns, latency_ns, memory_order_relaxed);
+
+        int64_t cur_lat_min = atomic_load_explicit(&inst->diag.min_latency_ns,
+                                                   memory_order_relaxed);
+        if (latency_ns < cur_lat_min)
+            atomic_store_explicit(&inst->diag.min_latency_ns, latency_ns,
+                                  memory_order_relaxed);
+        int64_t cur_lat_max = atomic_load_explicit(&inst->diag.max_latency_ns,
+                                                   memory_order_relaxed);
+        if (latency_ns > cur_lat_max)
+            atomic_store_explicit(&inst->diag.max_latency_ns, latency_ns,
+                                  memory_order_relaxed);
+
+        /* Time-based EWMA — same scheme as avg_bus_cycle_ns_sum. */
+        int64_t cur_lat_sum = atomic_load_explicit(&inst->diag.avg_latency_ns_sum,
+                                                   memory_order_relaxed);
+        cur_lat_sum += latency_ns - cur_lat_sum / inst->avg_window;
+        atomic_store_explicit(&inst->diag.avg_latency_ns_sum, cur_lat_sum,
+                              memory_order_relaxed);
+
+        if (have_prev_wake) {
+            uint64_t period_ns = actual_wake_ns - prev_wake_ns;
+            atomic_store_explicit(&inst->diag.period_ns, period_ns,
+                                  memory_order_relaxed);
+
+            uint64_t cur_per_min = atomic_load_explicit(&inst->diag.min_period_ns,
+                                                        memory_order_relaxed);
+            if (period_ns < cur_per_min)
+                atomic_store_explicit(&inst->diag.min_period_ns, period_ns,
+                                      memory_order_relaxed);
+            uint64_t cur_per_max = atomic_load_explicit(&inst->diag.max_period_ns,
+                                                        memory_order_relaxed);
+            if (period_ns > cur_per_max)
+                atomic_store_explicit(&inst->diag.max_period_ns, period_ns,
+                                      memory_order_relaxed);
+
+            int64_t cur_per_sum = atomic_load_explicit(&inst->diag.avg_period_ns_sum,
+                                                       memory_order_relaxed);
+            cur_per_sum += (int64_t)period_ns - cur_per_sum / inst->avg_window;
+            atomic_store_explicit(&inst->diag.avg_period_ns_sum, cur_per_sum,
+                                  memory_order_relaxed);
+        }
+        prev_wake_ns   = actual_wake_ns;
+        have_prev_wake = true;
+
+        /* Bus exchange + diag updates happen inside ecat_run_one_cycle. */
+        ecat_run_one_cycle(inst);
+
+        next_wakeup.tv_nsec += (long)(interval_ns % 1000000000LL);
+        next_wakeup.tv_sec  += (time_t)(interval_ns / 1000000000LL);
+        if (next_wakeup.tv_nsec >= 1000000000L) {
+            next_wakeup.tv_nsec -= 1000000000L;
+            next_wakeup.tv_sec  += 1;
+        }
+        int rc = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_wakeup, NULL);
+        if (rc == EINTR) continue; /* SIGUSR1 wake — loop will re-check bus_running */
+    }
+
+    plugin_logger_info(&g_logger,
+        "Bus thread '%s': stopped after %llu cycles",
+        inst->name,
+        (unsigned long long)atomic_load_explicit(&inst->diag.cycle_count,
+                                                 memory_order_relaxed));
+    return NULL;
 }
 
 /*
@@ -1034,23 +1277,10 @@ int init(void *args)
         }
 #endif
 
-        /* Calculate tick divisor for task-based scheduling.
-         * A divisor of 1 means "execute every cycle" (the default). */
-        inst->tick_divisor = 1;
-        if (inst->config.master.task_cycle_time_us > 0 &&
-            g_runtime_args.common_ticktime_ns > 0) {
-            unsigned long long task_ns =
-                (unsigned long long)inst->config.master.task_cycle_time_us * 1000ULL;
-            unsigned int divisor = (unsigned int)(task_ns / g_runtime_args.common_ticktime_ns);
-            if (divisor > 1)
-                inst->tick_divisor = divisor;
-            plugin_logger_info(&g_logger,
-                "Master[%d] '%s': task=%s, task_cycle=%d us, base_tick=%llu ns, divisor=%u",
-                i, inst->name, inst->config.master.task_name,
-                inst->config.master.task_cycle_time_us,
-                (unsigned long long)g_runtime_args.common_ticktime_ns,
-                inst->tick_divisor);
-        }
+        /* Bus timing is now driven by the dedicated bus thread spawned
+         * in start_single_master, ticking absolutely at
+         * master.cycle_time_us under SCHED_FIFO. The legacy
+         * tick_divisor / IEC-task-anchored model is gone. */
 
         atomic_store(&inst->plugin_state, ECAT_STATE_IDLE);
 
@@ -1251,30 +1481,12 @@ void cleanup(void)
     plugin_logger_info(&g_logger, "EtherCAT plugin cleanup complete");
 }
 
-/**
- * @brief Called at the start of each PLC scan cycle
- *
- * Iterates all master instances and performs synchronous process data
- * exchange for each one that is in OPERATIONAL or RECOVERING state.
- */
-void cycle_start(void)
-{
-    for (int i = 0; i < g_master_count; i++) {
-        cycle_start_single(&g_masters[i]);
-    }
-}
-
-/**
- * @brief Called at the end of each PLC scan cycle
- *
- * Output data is written to the IOmap at the beginning of cycle_start()
- * (before the exchange), so this hook is intentionally a no-op.
- */
-void cycle_end(void)
-{
-    /* Outputs are written at the start of the next cycle_start() so they
-     * are sent in the same SOEM exchange that receives fresh inputs. */
-}
+/* Note: the legacy `cycle_start` / `cycle_end` plugin entry points
+ * have been removed. Bus timing is now owned by the per-master
+ * `ecat_bus_thread`, ticking absolutely at master.cycle_time_us under
+ * SCHED_FIFO. The plugin driver loads the .so via dlsym and tolerates
+ * missing cycle hooks (logged as "(optional)" at startup), so dropping
+ * the symbols is a no-op for the loader. */
 
 /*
  * =============================================================================
@@ -1561,6 +1773,17 @@ typedef struct {
     uint64_t max_cycle_us;
     uint64_t min_exchange_us;
     uint64_t max_exchange_us;
+    /* Scheduling: how well the bus thread is being scheduled.
+     * period_us  — observed time between cycle starts (target =
+     *              configured cycle_us on a healthy RT system)
+     * latency_us — wake-up delay vs clock_nanosleep deadline; spikes
+     *              point at OS jitter, not bus or PLC issues. */
+    int64_t  avg_period_us;
+    int64_t  max_period_us;
+    int64_t  min_period_us;
+    int64_t  avg_latency_us;
+    int64_t  max_latency_us;
+    int64_t  min_latency_us;
 } ecat_diag_view_t;
 
 static void load_diag_view(const ecat_master_instance_t *inst,
@@ -1573,14 +1796,15 @@ static void load_diag_view(const ecat_master_instance_t *inst,
     out->noframe_count = atomic_load_explicit(&inst->diag.noframe_count,
                                               memory_order_relaxed);
 
-    /* Single bus_cycle_ns measurement is exposed under both legacy names
-     * (avg/min/max_cycle_us and min/max_exchange_us) for JSON compatibility
-     * with the Editor.  Both pairs reflect the same exchange (send+receive)
-     * timing — the duplicated naming is preserved to avoid breaking the
-     * existing JSON contract. */
-    int64_t avg = atomic_load_explicit(&inst->diag.avg_bus_cycle_ns,
-                                       memory_order_relaxed);
-    out->avg_cycle_us = (uint64_t)(avg / 1000);
+    /* Time-based EWMA: divide the stored sum by the master's avg_window
+     * to recover the moving average.  Single bus_cycle_ns measurement
+     * is exposed under both legacy names (avg/min/max_cycle_us and
+     * min/max_exchange_us) for JSON compatibility with the Editor. */
+    int64_t window = inst->avg_window > 0 ? inst->avg_window : 1;
+
+    int64_t bus_sum = atomic_load_explicit(&inst->diag.avg_bus_cycle_ns_sum,
+                                           memory_order_relaxed);
+    out->avg_cycle_us = (uint64_t)((bus_sum / window) / 1000);
 
     uint64_t min_bcn = atomic_load_explicit(&inst->diag.min_bus_cycle_ns,
                                             memory_order_relaxed);
@@ -1593,6 +1817,28 @@ static void load_diag_view(const ecat_master_instance_t *inst,
     out->max_cycle_us    = max_us;
     out->min_exchange_us = min_us;
     out->max_exchange_us = max_us;
+
+    /* Scheduling stats — captured by the bus thread itself. */
+    int64_t  per_sum    = atomic_load_explicit(&inst->diag.avg_period_ns_sum,
+                                               memory_order_relaxed);
+    uint64_t min_per_ns = atomic_load_explicit(&inst->diag.min_period_ns,
+                                               memory_order_relaxed);
+    uint64_t max_per_ns = atomic_load_explicit(&inst->diag.max_period_ns,
+                                               memory_order_relaxed);
+    int64_t  lat_sum    = atomic_load_explicit(&inst->diag.avg_latency_ns_sum,
+                                               memory_order_relaxed);
+    int64_t  min_lat_ns = atomic_load_explicit(&inst->diag.min_latency_ns,
+                                               memory_order_relaxed);
+    int64_t  max_lat_ns = atomic_load_explicit(&inst->diag.max_latency_ns,
+                                               memory_order_relaxed);
+
+    out->avg_period_us  = (per_sum / window) / 1000;
+    out->max_period_us  = (int64_t)(max_per_ns / 1000);
+    out->min_period_us  = (min_per_ns == UINT64_MAX) ? 0
+                                                     : (int64_t)(min_per_ns / 1000);
+    out->avg_latency_us = (lat_sum / window) / 1000;
+    out->max_latency_us = max_lat_ns / 1000;
+    out->min_latency_us = (min_lat_ns == INT64_MAX) ? 0 : min_lat_ns / 1000;
 }
 
 /**
@@ -1664,7 +1910,10 @@ static cJSON *build_master_status_json(ecat_master_instance_t *inst)
     add_slaves_json(inst, master, &slave_count, false);
     cJSON_AddNumberToObject(master, "slave_count", slave_count);
 
-    /* Cycle metrics */
+    /* Cycle metrics — work-window (cycle/exchange) and scheduling
+     * (period/latency). See build_master_diagnostics_json for the
+     * definitions; both shapes carry the same keys so the editor can
+     * render them through a single code path. */
     cJSON *metrics = cJSON_CreateObject();
     cJSON_AddNumberToObject(metrics, "cycle_count", (double)diag.cycle_count);
     cJSON_AddNumberToObject(metrics, "wkc_error_count", (double)diag.wkc_error_count);
@@ -1674,6 +1923,12 @@ static cJSON *build_master_status_json(ecat_master_instance_t *inst)
     cJSON_AddNumberToObject(metrics, "max_cycle_us", (double)diag.max_cycle_us);
     cJSON_AddNumberToObject(metrics, "min_exchange_us", (double)diag.min_exchange_us);
     cJSON_AddNumberToObject(metrics, "max_exchange_us", (double)diag.max_exchange_us);
+    cJSON_AddNumberToObject(metrics, "avg_period_us", (double)diag.avg_period_us);
+    cJSON_AddNumberToObject(metrics, "max_period_us", (double)diag.max_period_us);
+    cJSON_AddNumberToObject(metrics, "min_period_us", (double)diag.min_period_us);
+    cJSON_AddNumberToObject(metrics, "avg_latency_us", (double)diag.avg_latency_us);
+    cJSON_AddNumberToObject(metrics, "max_latency_us", (double)diag.max_latency_us);
+    cJSON_AddNumberToObject(metrics, "min_latency_us", (double)diag.min_latency_us);
     cJSON_AddNumberToObject(metrics, "consecutive_wkc_errors", consecutive_wkc);
     cJSON_AddNumberToObject(metrics, "recovery_attempts", recovery_attempts);
     cJSON_AddNumberToObject(metrics, "exchange_skips", (double)exchange_skips);
@@ -1733,7 +1988,20 @@ static cJSON *build_master_diagnostics_json(ecat_master_instance_t *inst)
     add_slaves_json(inst, master, &slave_count, true);
     cJSON_AddNumberToObject(master, "slave_count", slave_count);
 
-    /* Extended timing metrics */
+    /* Timing metrics, two distinct categories:
+     *
+     *   work-window (avg/max_cycle_us, max_exchange_us): how much time
+     *     the bus thread spends actually working per cycle. Tells you
+     *     whether the configured cycle period is sufficient to fit the
+     *     SOEM round-trip plus the two mutex-protected memcpys.
+     *
+     *   scheduling (avg/max/min_period_us, avg/max/min_latency_us):
+     *     how well the bus thread is being scheduled. period_us is
+     *     the observed time between cycle starts (should equal
+     *     configured_cycle_us on average); latency_us is the
+     *     wake-up delay from clock_nanosleep's deadline. Spikes here
+     *     point at OS scheduling jitter, not bus or PLC issues.
+     */
     cJSON *timing = cJSON_CreateObject();
     cJSON_AddNumberToObject(timing, "cycle_count", (double)diag.cycle_count);
     cJSON_AddNumberToObject(timing, "wkc_error_count", (double)diag.wkc_error_count);
@@ -1743,6 +2011,12 @@ static cJSON *build_master_diagnostics_json(ecat_master_instance_t *inst)
     cJSON_AddNumberToObject(timing, "max_cycle_us", (double)diag.max_cycle_us);
     cJSON_AddNumberToObject(timing, "min_exchange_us", (double)diag.min_exchange_us);
     cJSON_AddNumberToObject(timing, "max_exchange_us", (double)diag.max_exchange_us);
+    cJSON_AddNumberToObject(timing, "avg_period_us", (double)diag.avg_period_us);
+    cJSON_AddNumberToObject(timing, "max_period_us", (double)diag.max_period_us);
+    cJSON_AddNumberToObject(timing, "min_period_us", (double)diag.min_period_us);
+    cJSON_AddNumberToObject(timing, "avg_latency_us", (double)diag.avg_latency_us);
+    cJSON_AddNumberToObject(timing, "max_latency_us", (double)diag.max_latency_us);
+    cJSON_AddNumberToObject(timing, "min_latency_us", (double)diag.min_latency_us);
     cJSON_AddNumberToObject(timing, "configured_cycle_us",
                             inst->config.master.cycle_time_us);
     cJSON_AddNumberToObject(timing, "receive_timeout_us", inst->receive_timeout_us);

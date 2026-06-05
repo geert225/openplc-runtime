@@ -24,6 +24,7 @@ import flask_login
 from webserver.credentials import CertGen
 from webserver.debug_websocket import init_debug_websocket
 from webserver.discovery.discovery_routes import discovery_bp
+from webserver.discovery.network_discovery import responder as network_discovery_responder
 from webserver.logger import get_logger
 from webserver.plcapp_management import (
     MAX_FILE_SIZE,
@@ -32,6 +33,7 @@ from webserver.plcapp_management import (
     build_state,
     run_compile,
     safe_extract,
+    apply_vpp_plugin_conf,
     update_plugin_configurations,
 )
 from webserver.restapi import (
@@ -58,6 +60,11 @@ runtime_manager = RuntimeManager(
 )
 
 runtime_manager.start()
+
+# UDP discovery responder so the editor can find this runtime on the LAN.
+# Failure to bind is logged and ignored — discovery is a convenience, not a
+# hard dependency.
+network_discovery_responder.start()
 
 # Store in Flask app config so blueprints can access via current_app
 # without triggering a re-import of this module (which would create
@@ -241,8 +248,17 @@ def handle_upload_file(data: dict) -> dict:
 
         safe_extract(zip_file, extract_dir, valid_files)
 
-        # Update plugin configurations based on extracted config files
+        # Apply VPP plugin conf from upload (copy if present, delete if not)
+        apply_vpp_plugin_conf(extract_dir)
+
+        # Update built-in plugin configurations based on extracted config files
         update_plugin_configurations(extract_dir)
+
+        # ?clean=1 — wired from the editor's "Clean build and upload" UI
+        # option. Forces a full recompile by wiping core/build/ and the
+        # ccache contents before invoking compile.sh. Older editors
+        # don't pass this flag, so behaviour for them is unchanged.
+        clean_build = flask.request.args.get("clean") == "1"
 
         # Start compilation in a separate thread
         build_state.status = BuildStatus.COMPILING
@@ -250,7 +266,7 @@ def handle_upload_file(data: dict) -> dict:
         task_compile = threading.Thread(
             target=run_compile,
             args=(runtime_manager,),
-            kwargs={"cwd": extract_dir},
+            kwargs={"cwd": extract_dir, "clean": clean_build},
             daemon=True,
         )
 
@@ -376,6 +392,7 @@ def run_https():
     finally:
         logger.info("Runtime manager stopped")
         runtime_manager.stop()
+        network_discovery_responder.stop()
 
 
 if __name__ == "__main__":

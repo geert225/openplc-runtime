@@ -18,7 +18,7 @@
  * Architecture:
  *   Process data exchange runs synchronously inside the PLC scan cycle
  *   via the cycle_start() hook. The bus cycle is fully synchronized with
- *   the PLC common_ticktime.
+ *   the PLC base tick.
  *
  *   A background monitor thread (enabled by ECAT_ENABLE_MONITOR_THREAD)
  *   handles slave state checking and recovery outside the scan cycle.

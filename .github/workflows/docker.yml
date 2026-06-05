@@ -61,3 +61,9 @@ jobs:
           platforms: ${{ inputs.platforms || 'linux/amd64,linux/arm64,linux/arm/v7' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Bake the GitHub release tag (or the workflow_dispatch
+          # release_tag override) into the image so /api/version can
+          # report it back to clients.  Falls back to the Dockerfile
+          # default ("dev") for ad-hoc builds without a release tag.
+          build-args: |
+            RUNTIME_VERSION=${{ inputs.release_tag != '' && inputs.release_tag || github.ref_name }}

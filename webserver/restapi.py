@@ -14,6 +14,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 import webserver.config
 from webserver.logger import get_logger
+from webserver.version import RUNTIME_VERSION
 
 logger, buffer = get_logger("logger", use_buffer=True)
 
@@ -33,9 +34,39 @@ _handler_callback_post: Optional[Callable[[str, dict], dict]] = None
 
 @restapi_bp.after_request
 def add_runtime_version_header(response):
-    """Add runtime version header to all API responses for version detection."""
-    response.headers["X-OpenPLC-Runtime-Version"] = "v4"
+    """Add runtime version header to all API responses for version detection.
+
+    Editors gate firmware uploads on this value — the v4.1.x runtime
+    ships the STruC++ compile pipeline, which is not wire-compatible
+    with the MatIEC pipeline 4.0.x runtimes shipped.
+    """
+    response.headers["X-OpenPLC-Runtime-Version"] = RUNTIME_VERSION
     return response
+
+
+@restapi_bp.route("/version", methods=["GET"])
+def restapi_version():
+    """Return the runtime version.
+
+    Unauthenticated on purpose — editors call this before login to
+    decide whether their compile pipeline is compatible.  The string
+    is the GitHub release tag baked in at build time (e.g.
+    ``v4.1.0-rc.3``); ``dev`` means the image was built from source
+    without a CI tag.
+    ---
+    tags:
+      - Runtime
+    responses:
+      200:
+        description: Runtime version retrieved
+        schema:
+          type: object
+          properties:
+            version:
+              type: string
+              description: Runtime version string (GitHub release tag)
+    """
+    return jsonify({"version": RUNTIME_VERSION}), 200
 
 
 jwt = JWTManager(app_restapi)

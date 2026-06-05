@@ -3,6 +3,10 @@
 
 #include <stdio.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define LOG_SOCKET_PATH "/run/runtime/log_runtime.socket"
 
 typedef enum {
@@ -57,5 +61,9 @@ void log_warn(const char *fmt, ...);
  * @param[in]  ...  The values to format
  */
 void log_error(const char *fmt, ...);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
