@@ -60,6 +60,14 @@ typedef struct plugin_instance_s
      * succeeded) can roll back only the plugins that actually got
      * initialised, not those still untouched. */
     int initialized;
+    /* Set when an *enabled* plugin failed to load its symbols (e.g. a
+     * native .so whose runtime dependency is missing, such as the
+     * EtherCAT plugin without Npcap on Windows). A degraded plugin keeps
+     * its config slot but has a NULL native_plugin/python_plugin, so it
+     * is skipped by init/start/cycle. The runtime stays out of ERROR;
+     * commands routed to it return a clear "unavailable" response instead
+     * of crashing the whole runtime on boot. */
+    int degraded;
     plugin_config_t config;
 } plugin_instance_t;
 
