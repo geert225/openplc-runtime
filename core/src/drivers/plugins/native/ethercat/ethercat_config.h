@@ -582,6 +582,13 @@ typedef struct {
     int      iomap_bit_offset;  /* bit offset within the byte (0-7)          */
     uint8_t  byte_count;        /* bytes to copy (1, 2, 4, or 8)            */
     bool     is_bit;            /* true for IEC_SIZE_BIT channels            */
+    /* Journal coordinates for INPUT channels. Input data read from the bus
+     * is published into the PLC %I image through the lock-free journal (not
+     * poked directly via plc_ptr), so it is race-free against the IEC task
+     * threads without holding any image lock. Unused for output channels,
+     * which still read the %Q image directly through plc_ptr. */
+    int      journal_index;     /* byte index into the input image           */
+    int      journal_bit;       /* bit index (bit channels only, else 0)     */
 } ecat_transfer_entry_t;
 
 /**
