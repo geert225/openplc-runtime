@@ -81,10 +81,10 @@ extern "C"
      * Symbol resolution.
      *
      * Resolves all required entry points from the dlopen'd .so, including
-     * the strucpp shim entries (strucpp_get_config / strucpp_set_locks)
-     * the runtime needs to walk the configuration and plumb mutexes.
-     * Initializes runtime-owned image-tables and globals mutexes (recursive
-     * PI) on first call and hands their pointers to the .so.
+     * the strucpp shim entry (strucpp_get_config) the runtime needs to walk
+     * the configuration. Initializes the runtime-owned image-tables mutex
+     * (recursive PI) on first call. The mutex is locked by the runtime
+     * directly; it is not handed to the .so.
      *
      * Returns 0 on success, -1 if anything required is missing.
      * --------------------------------------------------------------------- */
@@ -111,14 +111,12 @@ extern "C"
     void image_tables_clear_null_pointers(void);
 
     /* -------------------------------------------------------------------------
-     * Resource mutex accessors. Returns pointers to the runtime-owned
-     * recursive PI mutexes that protect the image tables and the globals.
-     * Plugins / the runtime housekeeping use these directly; the codegen
-     * lock guards inside the .so lock the same instances via the pointer
-     * stash plumbed through strucpp_set_locks().
+     * Image-tables mutex accessor. Returns a pointer to the runtime-owned
+     * recursive PI mutex that protects the image tables. The runtime locks
+     * it directly; the .so never locks anything (generated code runs on its
+     * own storage), so there is no lock handoff into the .so.
      * --------------------------------------------------------------------- */
     pthread_mutex_t *image_tables_mutex(void);
-    pthread_mutex_t *global_vars_mutex(void);
 
     /* -------------------------------------------------------------------------
      * Returns the cached strucpp::ConfigurationInstance* (as void* — the

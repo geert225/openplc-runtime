@@ -78,15 +78,12 @@ uint8_t  (*ext_strucpp_debug_write)      (uint8_t, uint16_t,
 
 namespace {
     using GetConfigFn = strucpp::ConfigurationInstance *(*)(void);
-    using SetLocksFn  = void (*)(pthread_mutex_t *, pthread_mutex_t *);
 
     GetConfigFn ext_strucpp_get_config = nullptr;
-    SetLocksFn  ext_strucpp_set_locks  = nullptr;
 
     strucpp::ConfigurationInstance *g_config_ptr = nullptr;
 
     pthread_mutex_t g_image_tables_mutex;
-    pthread_mutex_t g_global_vars_mutex;
     bool            g_locks_initialized = false;
 
     int init_recursive_pi_mutex(pthread_mutex_t *m)
@@ -123,11 +120,6 @@ namespace {
 extern "C" pthread_mutex_t *image_tables_mutex(void)
 {
     return &g_image_tables_mutex;
-}
-
-extern "C" pthread_mutex_t *global_vars_mutex(void)
-{
-    return &g_global_vars_mutex;
 }
 
 extern "C" void *strucpp_config_handle(void)
@@ -173,7 +165,6 @@ extern "C" int symbols_init(PluginManager *pm)
     *(void **)&ext_strucpp_program_md5 = plugin_manager_get_symbol(pm, "strucpp_program_md5");
 
     *(void **)&ext_strucpp_get_config = resolve(pm, "strucpp_get_config", true);
-    *(void **)&ext_strucpp_set_locks  = resolve(pm, "strucpp_set_locks",  true);
 
     *(void **)&ext_strucpp_get_located_vars      = resolve(pm, "strucpp_get_located_vars",      true);
     *(void **)&ext_strucpp_get_located_var_count = resolve(pm, "strucpp_get_located_var_count", true);
@@ -186,7 +177,7 @@ extern "C" int symbols_init(PluginManager *pm)
     *(void **)&ext_strucpp_debug_write       = resolve(pm, "strucpp_debug_write",       true);
 
     if (!ext_strucpp_advance_time ||
-        !ext_strucpp_get_config || !ext_strucpp_set_locks ||
+        !ext_strucpp_get_config ||
         !ext_strucpp_get_located_vars || !ext_strucpp_get_located_var_count ||
         !ext_strucpp_debug_array_count || !ext_strucpp_debug_elem_count ||
         !ext_strucpp_debug_size || !ext_strucpp_debug_set ||
@@ -198,16 +189,13 @@ extern "C" int symbols_init(PluginManager *pm)
 
     if (!g_locks_initialized)
     {
-        if (init_recursive_pi_mutex(&g_image_tables_mutex) != 0 ||
-            init_recursive_pi_mutex(&g_global_vars_mutex)  != 0)
+        if (init_recursive_pi_mutex(&g_image_tables_mutex) != 0)
         {
-            log_error("[strucpp] failed to initialize resource mutexes");
+            log_error("[strucpp] failed to initialize the image-tables mutex");
             return -1;
         }
         g_locks_initialized = true;
     }
-
-    ext_strucpp_set_locks(&g_image_tables_mutex, &g_global_vars_mutex);
 
     g_config_ptr = ext_strucpp_get_config();
     if (!g_config_ptr)
@@ -420,7 +408,6 @@ void image_tables_clear_null_pointers(void)
     ext_strucpp_advance_time = nullptr;
     ext_strucpp_program_md5  = nullptr;
     ext_strucpp_get_config   = nullptr;
-    ext_strucpp_set_locks  = nullptr;
     ext_strucpp_debug_array_count = nullptr;
     ext_strucpp_debug_elem_count  = nullptr;
     ext_strucpp_debug_size        = nullptr;

@@ -12,19 +12,16 @@
 //      generated_debug.cpp's compile-time address-of expressions resolve.
 //   2. Export strucpp_get_config() — C-linkage entry the runtime dlsyms
 //      to obtain a ConfigurationInstance* pointer.
-//   3. Export strucpp_set_locks() — runtime-side image-tables / globals
-//      mutex pointers handed in right after dlopen, stored where
-//      iec_threading.hpp's lock guards can find them.
-//   4. Export strucpp_get_located_vars / strucpp_get_located_var_count
+//   3. Export strucpp_get_located_vars / strucpp_get_located_var_count
 //      — re-expose strucpp::locatedVars[] (a per-project namespaced
 //      symbol) under stable C linkage.
-//   5. Activate STRUCPP_V4_DEBUG_EXPORTS_DEFINE — emits the C-linkage
+//   4. Activate STRUCPP_V4_DEBUG_EXPORTS_DEFINE — emits the C-linkage
 //      strucpp_debug_* PDU helpers from debug_dispatch.hpp.
-//   6. Export strucpp_advance_time() — bumps the per-.so
+//   5. Export strucpp_advance_time() — bumps the per-.so
 //      strucpp::__CURRENT_TIME_NS by the runtime-supplied tick. The
 //      runtime owns the tick (computed from g_config); the shim just
 //      provides the cross-DSO advance entry point.
-//   7. Export strucpp_program_md5 — the project MD5, surfaced by FC 0x45
+//   6. Export strucpp_program_md5 — the project MD5, surfaced by FC 0x45
 //      so the editor can verify it's debugging the matching source.
 
 #define STRUCPP_V4_DEBUG_EXPORTS_DEFINE
@@ -37,23 +34,12 @@
 #include <cstdint>
 #include <pthread.h>
 
-namespace strucpp {
-    pthread_mutex_t* g_image_tables_mutex_ptr = nullptr;
-    pthread_mutex_t* g_global_vars_mutex_ptr  = nullptr;
-}
-
 // External linkage so generated_debug.cpp can reference &g_config.X.Y at
 // compile time. Same constraint as the Arduino sketch's g_config.
 strucpp::Configuration_CONFIG0 g_config;
 
 extern "C" strucpp::ConfigurationInstance* strucpp_get_config(void) {
     return &g_config;
-}
-
-extern "C" void strucpp_set_locks(pthread_mutex_t* image_tables_mutex,
-                                  pthread_mutex_t* global_vars_mutex) {
-    strucpp::g_image_tables_mutex_ptr = image_tables_mutex;
-    strucpp::g_global_vars_mutex_ptr  = global_vars_mutex;
 }
 
 // strucpp::locatedVars / locatedVarsCount are top-level externs declared in
