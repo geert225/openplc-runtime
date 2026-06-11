@@ -19,6 +19,24 @@ Editors gate firmware uploads on this string — a ``dev`` response
 gets rejected because the editor can't tell whether the target
 speaks the STruC++ wire format.  The VERSION file fallback closes
 that hole for local installers.
+
+=============================================================================
+RELEASE STEP — DO THIS EVERY TIME YOU CUT A NEW VERSION TAG:
+=============================================================================
+Bump the repo-root ``VERSION`` file to match the new git tag BEFORE you
+tag and push.  The Docker image gets its version from the tag (build-arg
+above), but the Windows installer payload and every manual
+``git clone … && ./install.sh`` install read the ``VERSION`` file directly.
+If you forget, those installs keep advertising the OLD version — the
+discovery scan and ``/api/version`` will be wrong even though the tag is
+right.  This is a manual step on purpose: a CI-only fix (e.g. writing the
+tag into the payload) would not cover manual source installs, which are
+common.  Keep ``VERSION`` in sync with the tag by hand.
+
+NOTE: the ``VERSION`` file is read verbatim (stripped of surrounding
+whitespace only) — it must contain ONLY the version string and nothing
+else (no comments). Match the tag format exactly, e.g. ``v4.1.3``.
+=============================================================================
 """
 
 import os

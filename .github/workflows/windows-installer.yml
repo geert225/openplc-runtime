@@ -143,6 +143,14 @@ jobs:
         run: |
           Write-Host "Building installer..."
 
+          # NOTE: $version here only labels the installer (filename +
+          # Add/Remove Programs AppVersion). The version the RUNTIME
+          # advertises (discovery scan, /api/version) comes from the
+          # repo-root VERSION file baked into the payload, NOT from the
+          # tag. That file must be bumped by hand for every release -- see
+          # webserver/version.py. (A CI-only injection here would not help
+          # manual `git clone && ./install.sh` installs, which are common.)
+          #
           # Set version from input or tag
           $version = "${{ github.event.inputs.version }}"
           if ([string]::IsNullOrEmpty($version)) {
