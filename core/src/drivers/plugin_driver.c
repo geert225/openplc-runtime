@@ -360,7 +360,7 @@ int plugin_driver_update_config(plugin_driver_t *driver, const char *config_file
      * and cause unnecessary GIL acquires throughout the driver. */
     has_python_plugin = 0;
 
-    int load_failures = 0;
+    int degraded_count = 0;
     driver->plugin_count = config_count;
 
     for (int w = 0; w < config_count; w++)
@@ -368,6 +368,7 @@ int plugin_driver_update_config(plugin_driver_t *driver, const char *config_file
         plugin_instance_t *plugin = &driver->plugins[w];
         // Slot already zeroed by the teardown loop (or never used).
         memcpy(&plugin->config, &configs[w], sizeof(plugin_config_t));
+        plugin->degraded = 0;
 
         if (configs[w].type == PLUGIN_TYPE_PYTHON)
         {
@@ -391,9 +392,16 @@ int plugin_driver_update_config(plugin_driver_t *driver, const char *config_file
                 {
                     if (plugin->config.enabled)
                     {
-                        log_error("[PLUGIN] enabled Python plugin '%s' failed to load symbols",
+                        /* Fail-safe: an enabled plugin that cannot load its
+                         * symbols is marked degraded and skipped, but does
+                         * NOT abort the whole runtime. Boot proceeds; the
+                         * plugin is simply unavailable until the missing
+                         * dependency is resolved and the runtime restarts. */
+                        log_error("[PLUGIN] enabled Python plugin '%s' failed to load symbols "
+                                  "- continuing without it (plugin unavailable)",
                                   configs[w].name);
-                        ++load_failures;
+                        plugin->degraded = 1;
+                        ++degraded_count;
                     }
                     else
                     {
@@ -409,16 +417,22 @@ int plugin_driver_update_config(plugin_driver_t *driver, const char *config_file
             {
                 if (plugin->config.enabled)
                 {
-                    /* An enabled native plugin failed to load its .so.
-                     * This is the fix for "update_config failure not
-                     * surfaced": previously this was a log_warn and the
-                     * caller proceeded into init/start with native_plugin
-                     * == NULL, silently dropping cycle hooks. Now we mark
-                     * the load as failed so load_plc_program can surface
-                     * it as an ERROR state instead of a silent no-op. */
-                    log_error("[PLUGIN] enabled native plugin '%s' failed to load symbols",
+                    /* Fail-safe: an enabled native plugin that cannot load
+                     * its .so (e.g. a missing runtime dependency such as
+                     * Npcap for the EtherCAT plugin on Windows) is marked
+                     * degraded and skipped, but does NOT abort the whole
+                     * runtime. native_plugin stays NULL, so init/start/cycle
+                     * skip it; commands routed to it return a clear
+                     * "unavailable" response. This keeps the runtime out of
+                     * ERROR so the PLC can still reach RUNNING. The loud
+                     * error above (plus any plugin-specific hint, e.g. the
+                     * Npcap notice in native_plugin_get_symbols) tells the
+                     * user what to fix. */
+                    log_error("[PLUGIN] enabled native plugin '%s' failed to load symbols "
+                              "- continuing without it (plugin unavailable)",
                               configs[w].name);
-                    ++load_failures;
+                    plugin->degraded = 1;
+                    ++degraded_count;
                 }
                 else
                 {
@@ -434,7 +448,16 @@ int plugin_driver_update_config(plugin_driver_t *driver, const char *config_file
         PyGILState_Release(plugin_gstate);
     }
 
-    return (load_failures > 0) ? -1 : 0;
+    if (degraded_count > 0)
+    {
+        log_warn("[PLUGIN] %d enabled plugin(s) failed to load and are unavailable; "
+                 "the runtime will continue without them",
+                 degraded_count);
+    }
+
+    /* A failed symbol load is no longer fatal — the runtime stays out of
+     * ERROR. Only hard errors above (config parse / file copy) return -1. */
+    return 0;
 }
 
 int plugin_driver_append_config(plugin_driver_t *driver, const char *config_file)
@@ -457,7 +480,7 @@ int plugin_driver_append_config(plugin_driver_t *driver, const char *config_file
         return -1;
     }
 
-    int load_failures = 0;
+    int degraded_count = 0;
 
     for (int w = 0; w < config_count; w++)
     {
@@ -480,9 +503,13 @@ int plugin_driver_append_config(plugin_driver_t *driver, const char *config_file
             {
                 if (plugin->config.enabled)
                 {
-                    log_error("[PLUGIN] enabled VPP plugin '%s' failed to load symbols",
+                    /* Fail-safe: degrade rather than abort (see
+                     * plugin_driver_update_config for rationale). */
+                    log_error("[PLUGIN] enabled VPP plugin '%s' failed to load symbols "
+                              "- continuing without it (plugin unavailable)",
                               configs[w].name);
-                    ++load_failures;
+                    plugin->degraded = 1;
+                    ++degraded_count;
                 }
                 else
                 {
@@ -493,7 +520,15 @@ int plugin_driver_append_config(plugin_driver_t *driver, const char *config_file
         }
     }
 
-    return (load_failures > 0) ? -1 : 0;
+    if (degraded_count > 0)
+    {
+        log_warn("[PLUGIN] %d enabled VPP plugin(s) failed to load and are unavailable; "
+                 "the runtime will continue without them",
+                 degraded_count);
+    }
+
+    /* Failed symbol loads are non-fatal; the runtime continues without them. */
+    return 0;
 }
 
 int plugin_driver_load_config(plugin_driver_t *driver, const char *config_file)
@@ -1418,6 +1453,18 @@ int plugin_driver_execute_command(plugin_driver_t *driver, const char *plugin_na
             plugin->native_plugin->execute_command)
         {
             return plugin->native_plugin->execute_command(command_json, response, response_size);
+        }
+
+        /* Plugin is present in the config but its symbols never loaded
+         * (degraded), so it cannot service commands. Tell the caller it is
+         * unavailable rather than reporting a misleading "not supported". */
+        if (plugin->degraded)
+        {
+            snprintf(response, response_size,
+                     "{\"error\":\"plugin '%s' failed to load and is unavailable. Check the "
+                     "runtime logs for the cause (e.g. a missing system dependency).\"}",
+                     plugin_name);
+            return -1;
         }
 
         snprintf(response, response_size,
