@@ -67,20 +67,42 @@ no-op on 64-bit, so the armv7 Docker / aarch64 builds are unaffected.
 
 ## No dead mutex
 `g_image_tables_mutex`, `g_global_mutex` (threaded global sync), `state_mutex`,
-`plc_tasks_lock`, `python_blocks_mutex`, `log_mutex`, `buffer_mutex` (plugin
-reads via the `mutex_take` thunk) are all live; the journal's mutex exists only
-in the non-lock-free fallback. None dead.
+`plc_tasks_lock`, `python_blocks_mutex`, `log_mutex` are all live; the journal's
+mutex exists only in the non-lock-free fallback. `buffer_mutex` was removed in
+step 5 (plugin reads use `image_lock`). None dead.
+
+**5. Flush-on-lock plugin read API — `buffer_mutex` retired (`607fc2f`)**
+Added `image_lock()`/`image_unlock()`: acquire the image mutex and drain the
+journal so any reader (the IEC copy-in and every plugin read) sees freshly
+committed values. Writes stay lock-free via `journal_write_*`. EtherCAT `%Q`
+reads, the s7comm read callback, and the Python `BufferAccessor`/`MutexManager`
+all moved onto it; `buffer_mutex` and the `mutex_take/give` thunks are removed.
+`BufferAccessor`'s API is unchanged, so plugin code is source-compatible. The
+journal drain gained a skip-if-empty fast path so a read-heavy plugin locking
+every cycle doesn't needlessly flip the bank or race producers mid-publish.
+
+## Build/codegen fixes surfaced during hardware validation
+- **`Makefile.strucpp` header dependencies (`0018b50`)**: the per-file rules
+  listed only the `.cpp` as a prerequisite with no `-MMD`/`-include`, so the
+  static `runtime_v4_entry.cpp` (mtime never changes) was never rebuilt when the
+  per-upload `generated.hpp` changed -> a stale `constexpr locatedVarsCount`
+  stayed baked in the shim object -> count/ABI mismatch -> crash. Fixed with
+  `-MMD -MP` + explicit `generated.hpp`/`defines.h` prereqs on the shim.
+- **strucpp threaded `sync_out()` (strucpp `876f877`)**: the compound dirty-diff
+  used `.raw_ptr()`, which only exists on scalar `IECVar<T>`, so any array/struct
+  `VAR_EXTERNAL` failed to compile in threaded mode. Switched to whole-object
+  `__builtin_memcmp(&x, &x__prev, sizeof(x))`.
+
+## Hardware validation (SLM-RP4, EK1818)
+- `image_lock` read path: 108,450 EtherCAT cycles reading `%Q` via `image_lock`,
+  0 WKC/frame errors, perfect 1 ms bus period alongside the IEC tasks.
+- Concurrency stress: 3 heavy IEC tasks over structs / arrays / arrays-of-structs
+  globals, sustained full load with the interval set just above the body time (no
+  overflow) -> true parallelism (lockstep heartbeats, ~85% CPU/core), zero torn
+  reads across ~387k compound-global reads, zero crashes.
 
 ## Known remaining refinements (not regressions; documented)
-- **Plugin output (`%Q`) reads still use `buffer_mutex`**, a different lock than
-  the journal drain's image mutex, so a *multi-byte* `%Q` read by a plugin can
-  tear against a concurrent drain (the pre-existing race, unchanged; EK1818's
-  bit outputs are byte-atomic and unaffected). Migrating plugin reads to a brief
-  image-lock read accessor would close this and retire `buffer_mutex`.
 - **Debug / OPC-UA path** (reads/writes any variable) is intentionally untouched
   this pass and still takes no lock.
-- **Compound (struct/array/string) globals**: `sync_out` diffs via `memcmp` on
-  the raw value (correct), but only scalar/located commit through the typed
-  journal; large compound globals would want a bulk-copy commit path.
 - The IEC `PRIORITY` value maps 1:1 to SCHED_FIFO (higher = higher); confirm this
   matches the editor's intended convention.
