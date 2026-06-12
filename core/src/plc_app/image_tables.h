@@ -119,6 +119,25 @@ extern "C"
     pthread_mutex_t *image_tables_mutex(void);
 
     /* -------------------------------------------------------------------------
+     * Threaded process-image model.
+     *
+     * image_is_threaded() reports whether the loaded .so was built for the
+     * threaded model (exports strucpp_threaded_abi). global_mutex() guards
+     * per-task global sync_in()/sync_out(). The copy_in/out functions move a
+     * program's located slice [offset, offset+count) of locatedVars[] between
+     * the runtime-owned image and the program's private storage:
+     *   - copy_in  : image -> program members (called before run(), under the
+     *                image mutex, after the journal drain).
+     *   - copy_out : changed program members -> journal (dirty-diff, lock-free;
+     *                applied to the image on the next drain). %I is never
+     *                committed.
+     * --------------------------------------------------------------------- */
+    int  image_is_threaded(void);
+    pthread_mutex_t *global_mutex(void);
+    void image_tables_threaded_copy_in(uint32_t offset, uint32_t count);
+    void image_tables_threaded_copy_out(uint32_t offset, uint32_t count);
+
+    /* -------------------------------------------------------------------------
      * Returns the cached strucpp::ConfigurationInstance* (as void* — the
      * runtime's .cpp callers static_cast to the right type). NULL until
      * symbols_init() succeeds; reset to NULL on image_tables_clear_null_pointers().

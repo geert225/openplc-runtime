@@ -36,7 +36,12 @@ CC     := $(if $(CCACHE),$(CCACHE) gcc,gcc)
 # scan-cycle housekeeping) live in the plc_app/ tree built separately
 # at higher optimization. -pipe avoids temp files between cc1plus and
 # as for an additional 5–10% win.
-CXXFLAGS := -std=c++17 -O1 -pipe -fPIC -Wall \
+# -DSTRUCPP_THREADED selects the threaded process-image codegen: per-program
+# private working copies of VAR_EXTERNAL globals (with sync_in/sync_out) and a
+# located_range() override, plus the strucpp_threaded_abi capability flag in
+# the shim. This runtime supports that model (per-task copy-in/out, no global
+# image lock across task bodies), so every program it compiles is built for it.
+CXXFLAGS := -std=c++17 -O1 -pipe -fPIC -Wall -DSTRUCPP_THREADED \
             -Wno-unknown-pragmas -Wno-deprecated-declarations \
             -I $(GENERATED_DIR) -I $(RUNTIME_INC) -I $(PYTHON_INC)
 

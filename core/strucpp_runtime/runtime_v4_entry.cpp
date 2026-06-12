@@ -92,3 +92,17 @@ char strucpp_program_md5[] = PROGRAM_MD5;
 extern "C" void strucpp_advance_time(uint64_t tick_ns) {
     strucpp::__CURRENT_TIME_NS += static_cast<int64_t>(tick_ns);
 }
+
+// Capability flag. Present (== 1) only when this .so was compiled with
+// STRUCPP_THREADED (the threaded runtime's compile.sh defines it). The runtime
+// dlsyms this optional symbol to decide whether the loaded program supports the
+// process-image execution model (per-task copy-in/out of located vars +
+// sync_in()/sync_out() of globals on private working copies), which lets it run
+// task bodies without the global image lock. When the symbol is absent the
+// runtime falls back to the shared-image + whole-body-lock path, so older
+// programs still run.
+#ifdef STRUCPP_THREADED
+extern "C" {
+const int strucpp_threaded_abi = 1;
+}
+#endif
