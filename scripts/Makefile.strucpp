@@ -41,7 +41,16 @@ CC     := $(if $(CCACHE),$(CCACHE) gcc,gcc)
 # located_range() override, plus the strucpp_threaded_abi capability flag in
 # the shim. This runtime supports that model (per-task copy-in/out, no global
 # image lock across task bodies), so every program it compiles is built for it.
-CXXFLAGS := -std=c++17 -O1 -pipe -fPIC -Wall -DSTRUCPP_THREADED \
+# -MMD -MP: emit a .d file next to each .o listing every header the TU
+# pulled in (-MMD), with phony targets for each header (-MP) so a later
+# removed/renamed header doesn't break the build. These .d files are
+# -include'd below so `make` rebuilds an object when ANY included header
+# changes -- not just when its own .cpp changes. Without this, the static
+# runtime_v4_entry.cpp (whose mtime never changes) would never be rebuilt
+# when the per-upload generated.hpp changes, leaving a stale locatedVarsCount
+# (a constexpr baked in at compile time) in the shim object -> ABI/count
+# mismatch against the freshly compiled program -> runtime crash.
+CXXFLAGS := -std=c++17 -O1 -pipe -fPIC -Wall -DSTRUCPP_THREADED -MMD -MP \
             -Wno-unknown-pragmas -Wno-deprecated-declarations \
             -I $(GENERATED_DIR) -I $(RUNTIME_INC) -I $(PYTHON_INC)
 
@@ -65,6 +74,12 @@ CBLOCKS_CPP   := $(wildcard $(GENERATED_DIR)/c_blocks_code.cpp)
 CBLOCKS_OBJ   := $(patsubst $(GENERATED_DIR)/%.cpp,$(BUILD_DIR)/%.o,$(CBLOCKS_CPP))
 
 LIBPLC := $(BUILD_DIR)/new_libplc.so
+
+# Auto-generated header-dependency files (one .d per .o, emitted by -MMD).
+# -include (leading dash) ignores them on the first build when they don't
+# exist yet; once present, they make `make` header-change aware.
+ALL_OBJS := $(GEN_OBJ) $(SHIM_OBJ) $(CBLOCKS_OBJ) $(PYTHON_OBJ)
+DEPS     := $(ALL_OBJS:.o=.d)
 
 # Cygwin/MSYS2: TCP/UDP communication blocks aren't supported, fall
 # back to no-op stubs so blocks-using programs still link.
@@ -94,7 +109,15 @@ $(BUILD_DIR)/%.o: $(GENERATED_DIR)/%.cpp | $(BUILD_DIR)
 
 # Static runtime shim — lives in the runtime repo, not in the user
 # upload. Doesn't get the iec_python.h force-include.
-$(SHIM_OBJ): $(RUNTIME_SHIM) | $(BUILD_DIR)
+#
+# generated.hpp and defines.h are listed as EXPLICIT prerequisites (on top of
+# the -MMD .d tracking) because the shim's .cpp mtime never changes, but it
+# bakes in per-upload constants from these headers: generated.hpp's constexpr
+# locatedVarsCount and defines.h's PROGRAM_MD5. The .d files only exist after
+# the shim has compiled at least once, so these explicit deps guarantee a
+# rebuild on the very first build after the headers change too -- without them,
+# a stale shim object survives and reports the previous program's var count.
+$(SHIM_OBJ): $(RUNTIME_SHIM) $(GENERATED_DIR)/generated.hpp $(GENERATED_DIR)/defines.h | $(BUILD_DIR)
 	@echo "[INFO] Compiling runtime_v4_entry.cpp..."
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
@@ -102,7 +125,7 @@ $(SHIM_OBJ): $(RUNTIME_SHIM) | $(BUILD_DIR)
 # include path so it sees iec_python.h alongside its own headers.
 $(BUILD_DIR)/python_loader.o: $(PYTHON_LOADER) | $(BUILD_DIR)
 	@echo "[INFO] Compiling python_loader.c..."
-	$(CC) -O2 -fPIC -I core/src/plc_app -c $< -o $@
+	$(CC) -O2 -fPIC -MMD -MP -I core/src/plc_app -c $< -o $@
 
 # Cygwin TCP/UDP stub — written on demand, then compiled.
 $(BUILD_DIR)/comm_stubs.o: | $(BUILD_DIR)
@@ -122,3 +145,7 @@ $(BUILD_DIR):
 
 clean:
 	rm -rf $(BUILD_DIR)
+
+# Pull in auto-generated header dependencies (see -MMD -MP above). Leading
+# dash: silently ignore on a clean tree where no .d files exist yet.
+-include $(DEPS)
