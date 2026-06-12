@@ -102,7 +102,10 @@ extern "C" void strucpp_advance_time(uint64_t tick_ns) {
 // runtime falls back to the shared-image + whole-body-lock path, so older
 // programs still run.
 #ifdef STRUCPP_THREADED
+// NOT const: a namespace-scope `const` has internal linkage in C++ and would
+// be hidden from the runtime's dlsym (the same trap documented for
+// strucpp_program_md5 above). A plain int has external linkage.
 extern "C" {
-const int strucpp_threaded_abi = 1;
+int strucpp_threaded_abi = 1;
 }
 #endif
