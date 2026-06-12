@@ -37,10 +37,12 @@ class PluginRuntimeArgs(ctypes.Structure):
         ("dint_memory", ctypes.POINTER(ctypes.POINTER(IEC_UDINT))),
         ("lint_memory", ctypes.POINTER(ctypes.POINTER(IEC_ULINT))),
         ("bool_memory", ctypes.POINTER(ctypes.POINTER(IEC_BOOL) * 8)),
-        # Mutex function pointers
-        ("mutex_take", ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p)),
-        ("mutex_give", ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p)),
-        ("buffer_mutex", ctypes.c_void_p),
+        # Flush-on-lock image read API. image_lock() takes the image mutex and
+        # drains the journal so the holder reads freshly committed values;
+        # image_unlock() releases it. Writes use journal_write_* (no lock).
+        # Both are void (*)(void).
+        ("image_lock", ctypes.CFUNCTYPE(None)),
+        ("image_unlock", ctypes.CFUNCTYPE(None)),
         # STruC++ debugger variable-access surface. Replaces the
         # MatIEC-era flat-index API (get_var_list/get_var_size/
         # get_var_count). Variables are addressed by (arr, elem); the
@@ -89,15 +91,11 @@ class PluginRuntimeArgs(ctypes.Structure):
         Returns: (bool, str) - (is_valid, error_message)
         """
         try:
-            # Check buffer mutex
-            if not self.buffer_mutex:
-                return False, "buffer_mutex is NULL"
-
-            # Check mutex functions
-            if not self.mutex_take:
-                return False, "mutex_take function pointer is NULL"
-            if not self.mutex_give:
-                return False, "mutex_give function pointer is NULL"
+            # Check image lock functions
+            if not self.image_lock:
+                return False, "image_lock function pointer is NULL"
+            if not self.image_unlock:
+                return False, "image_unlock function pointer is NULL"
 
             # Check buffer size is reasonable
             if self.buffer_size <= 0 or self.buffer_size > 10000:
@@ -160,9 +158,8 @@ class PluginRuntimeArgs(ctypes.Structure):
                 f"  int_memory=0x{addr(self.int_memory):x},\n"
                 f"  buffer_size={self.buffer_size},\n"
                 f"  bits_per_buffer={self.bits_per_buffer},\n"
-                f"  buffer_mutex=0x{self.buffer_mutex or 0:x},\n"
-                f"  mutex_take={'valid' if self.mutex_take else 'NULL'},\n"
-                f"  mutex_give={'valid' if self.mutex_give else 'NULL'}\n"
+                f"  image_lock={'valid' if self.image_lock else 'NULL'},\n"
+                f"  image_unlock={'valid' if self.image_unlock else 'NULL'}\n"
                 f")"
             )
         except Exception:

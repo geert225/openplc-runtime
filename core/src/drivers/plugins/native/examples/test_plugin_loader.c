@@ -23,10 +23,9 @@ typedef struct
     void **dint_memory;
     void **lint_memory;
 
-    // Mutex functions
-    int (*mutex_take)(pthread_mutex_t *mutex);
-    int (*mutex_give)(pthread_mutex_t *mutex);
-    pthread_mutex_t *buffer_mutex;
+    // Flush-on-lock image read API
+    void (*image_lock)(void);
+    void (*image_unlock)(void);
     char plugin_specific_config_file_path[256];
 
     // Buffer size information
@@ -37,13 +36,14 @@ typedef struct
 // Function pointer types
 typedef int (*plugin_init_func_t)(void *);
 
-// Simple mutex functions for testing
-int test_mutex_take(pthread_mutex_t *mutex) {
-    return pthread_mutex_lock(mutex);
+// Simple no-op image lock for testing (no real image in this harness)
+static pthread_mutex_t test_mutex;
+void test_image_lock(void) {
+    pthread_mutex_lock(&test_mutex);
 }
 
-int test_mutex_give(pthread_mutex_t *mutex) {
-    return pthread_mutex_unlock(mutex);
+void test_image_unlock(void) {
+    pthread_mutex_unlock(&test_mutex);
 }
 
 int main() {
@@ -58,12 +58,10 @@ int main() {
     args.bits_per_buffer = 8;
     strcpy(args.plugin_specific_config_file_path, "./test_config.ini");
 
-    // Create a test mutex
-    pthread_mutex_t test_mutex;
+    // Create a test mutex backing the image lock
     pthread_mutex_init(&test_mutex, NULL);
-    args.buffer_mutex = &test_mutex;
-    args.mutex_take = test_mutex_take;
-    args.mutex_give = test_mutex_give;
+    args.image_lock = test_image_lock;
+    args.image_unlock = test_image_unlock;
 
     // Load the plugin
     void *handle = dlopen("./test_plugin.so", RTLD_LAZY);

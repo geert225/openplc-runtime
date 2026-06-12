@@ -145,6 +145,34 @@ extern "C" int image_is_threaded(void)
     return g_threaded ? 1 : 0;
 }
 
+// Flush-on-lock read lock. This is the canonical entry for any consumer that
+// needs a coherent view of the image to READ it (plugins reading %Q, the IEC
+// task copy-in, etc.). It acquires the image mutex and then drains the journal
+// so the holder sees every committed write.
+//
+// Usage mirrors the original BufferAccessor contract:
+//   - Individual read:  image_lock(); v = <read>; image_unlock();
+//   - Bulk read (preferred): image_lock(); <copy region to a local buffer>;
+//                            image_unlock(); <slow work on the buffer>;
+//     i.e. do the slow part (network, conversion) OUTSIDE the lock.
+//
+// Writes do NOT take this lock -- they go through journal_write_* (lock-free)
+// and are applied by the drain here (or by the fastest task's drain).
+//
+// The mutex is recursive PI, so a consumer already holding it (e.g. the fastest
+// task running plugin cycle hooks) can re-enter safely. The drain skips its
+// bank flip when nothing is pending, so locking every cycle to read is cheap.
+extern "C" void image_lock(void)
+{
+    pthread_mutex_lock(&g_image_tables_mutex);
+    journal_apply_and_clear();
+}
+
+extern "C" void image_unlock(void)
+{
+    pthread_mutex_unlock(&g_image_tables_mutex);
+}
+
 extern "C" void *strucpp_config_handle(void)
 {
     return g_config_ptr;

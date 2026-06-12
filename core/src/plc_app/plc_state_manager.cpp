@@ -203,12 +203,14 @@ static void *plc_task_thread(void *arg)
              * so task bodies execute in parallel. holding_mutex/holding_global
              * gate the crash-handler unlock of whichever lock is held. */
 
-            /* 1. Copy-in: drain pending journal writes, then snapshot this
-             *    task's located inputs from the image into program storage.
-             *    Under the image mutex (coherent drain + read). */
-            pthread_mutex_lock(image_tables_mutex());
+            /* 1. Copy-in: snapshot this task's located inputs from the image
+             *    into program storage. image_lock() takes the image mutex and
+             *    drains the journal (flush-on-lock) so we read fresh committed
+             *    values -- the same API plugins use for coherent reads. Set
+             *    holding_mutex after the lock so a fatal signal between flag and
+             *    lock can't unlock a mutex we don't own. */
+            image_lock();
             ctx->holding_mutex = 1;
-            plc_run_io_cycle_threaded_drain();
             for (size_t p = 0; p < task->program_count; ++p)
             {
                 uint32_t off = 0, cnt = 0;
@@ -216,7 +218,7 @@ static void *plc_task_thread(void *arg)
                 if (cnt) image_tables_threaded_copy_in(off, cnt);
             }
             ctx->holding_mutex = 0;
-            pthread_mutex_unlock(image_tables_mutex());
+            image_unlock();
 
             /* 2. Global sync-in: canonical globals -> private working copies. */
             pthread_mutex_lock(global_mutex());

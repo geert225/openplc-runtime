@@ -259,6 +259,16 @@ void journal_apply_and_clear(void)
         return;
     }
 
+    /* Fast path: nothing pending -> nothing to apply, so skip the bank flip.
+     * The image already reflects every committed write. A producer that adds an
+     * entry after this load is simply applied on the next drain (one cycle
+     * later) -- the same ordering guarantee a flush-on-lock read offers. This
+     * keeps a read-heavy plugin (locking every cycle to read %Q via image_lock)
+     * from flipping the journal needlessly and racing producers mid-publish. */
+    if ((atomic_load_explicit(&g_control, memory_order_relaxed) & JOURNAL_COUNT_MASK) == 0) {
+        return;
+    }
+
     uint32_t cur     = atomic_load_explicit(&g_control, memory_order_relaxed);
     uint32_t active  = cur >> JOURNAL_BANK_SHIFT;
     uint32_t newbank = active ^ 1u;

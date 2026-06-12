@@ -1,9 +1,14 @@
 """
 Mutex Manager for OpenPLC Python Plugin System
 
-This module provides centralized mutex management for thread-safe buffer operations.
-It encapsulates all mutex-related logic and provides a clean interface for acquiring
-and releasing mutexes.
+This module provides centralized lock management for thread-safe buffer reads.
+It wraps the runtime's flush-on-lock image API: acquire() takes the image mutex
+and drains the journal (so reads see freshly committed values), release() frees
+it. Buffer WRITES do not use this lock -- they go through journal_write_*.
+
+The public method names (acquire / release / with_mutex) are unchanged so the
+plugin-facing BufferAccessor stays source-compatible; only the underlying lock
+moved from the retired buffer_mutex to image_lock()/image_unlock().
 """
 
 from typing import Any, Callable
@@ -34,29 +39,29 @@ class MutexManager(IMutexManager):
 
     def acquire(self) -> bool:
         """
-        Acquire the buffer mutex.
+        Acquire the image lock (image mutex + journal drain).
 
         Returns:
-            bool: True if mutex was acquired successfully, False otherwise
+            bool: True if the lock was acquired, False if unavailable
         """
-        if not self.args.buffer_mutex:
+        if not self.args.image_lock:
             return False
 
-        result = self.args.mutex_take(self.args.buffer_mutex)
-        return result == 0  # 0 typically indicates success
+        self.args.image_lock()
+        return True
 
     def release(self) -> bool:
         """
-        Release the buffer mutex.
+        Release the image lock.
 
         Returns:
-            bool: True if mutex was released successfully, False otherwise
+            bool: True if released, False if unavailable
         """
-        if not self.args.buffer_mutex:
+        if not self.args.image_unlock:
             return False
 
-        result = self.args.mutex_give(self.args.buffer_mutex)
-        return result == 0  # 0 typically indicates success
+        self.args.image_unlock()
+        return True
 
     def with_mutex(self, operation: Callable[[], Any]) -> Any:
         """
@@ -84,28 +89,25 @@ class MutexManager(IMutexManager):
 
     def is_mutex_available(self) -> bool:
         """
-        Check if the mutex is available for use.
+        Check if the image lock is available for use.
 
         Returns:
-            bool: True if mutex pointers are valid, False otherwise
+            bool: True if the lock function pointers are valid, False otherwise
         """
         return (
-            self.args.buffer_mutex is not None and
-            self.args.mutex_take is not None and
-            self.args.mutex_give is not None
+            self.args.image_lock is not None and
+            self.args.image_unlock is not None
         )
 
     def get_mutex_status(self) -> str:
         """
-        Get a human-readable status of the mutex configuration.
+        Get a human-readable status of the lock configuration.
 
         Returns:
             str: Status description
         """
-        if not self.args.buffer_mutex:
-            return "No buffer mutex available"
-        if not self.args.mutex_take:
-            return "No mutex_take function available"
-        if not self.args.mutex_give:
-            return "No mutex_give function available"
-        return "Mutex properly configured"
+        if not self.args.image_lock:
+            return "No image_lock function available"
+        if not self.args.image_unlock:
+            return "No image_unlock function available"
+        return "Image lock properly configured"

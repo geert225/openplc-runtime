@@ -119,6 +119,20 @@ extern "C"
     pthread_mutex_t *image_tables_mutex(void);
 
     /* -------------------------------------------------------------------------
+     * Flush-on-lock read API. The canonical way for any consumer to obtain a
+     * coherent view of the image for READING:
+     *   image_lock()   -- take the image mutex, then drain the journal so the
+     *                     holder sees every committed write.
+     *   image_unlock() -- release the image mutex.
+     * Writes never use this lock (they go through journal_write_*). Prefer the
+     * bulk pattern: lock, copy the region to a local buffer, unlock, then do
+     * any slow work (network, conversion) on the buffer outside the lock. The
+     * mutex is recursive PI; the drain is a no-op when nothing is pending.
+     * --------------------------------------------------------------------- */
+    void image_lock(void);
+    void image_unlock(void);
+
+    /* -------------------------------------------------------------------------
      * Threaded process-image model.
      *
      * image_is_threaded() reports whether the loaded .so was built for the
