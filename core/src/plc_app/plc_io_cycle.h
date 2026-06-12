@@ -29,6 +29,23 @@ extern "C" {
 void plc_run_io_cycle_pre(void);
 void plc_run_io_cycle_post(void);
 
+/*
+ * Threaded (process-image) model housekeeping.
+ *
+ *   plc_run_io_cycle_threaded_drain() — apply pending journal entries to the
+ *     image. Called at EVERY task's copy-in, under the image mutex, so each
+ *     task sees freshly-applied plugin/peer writes.
+ *
+ *   plc_run_io_cycle_threaded_pre()  — fire plugin cycle_start (fastest task,
+ *     before bodies; no image lock held).
+ *
+ *   plc_run_io_cycle_threaded_post() — advance time, fire plugin cycle_end,
+ *     update heartbeat, increment scan_counter (fastest task, after bodies).
+ */
+void plc_run_io_cycle_threaded_drain(void);
+void plc_run_io_cycle_threaded_pre(void);
+void plc_run_io_cycle_threaded_post(void);
+
 #ifdef __cplusplus
 }
 #endif

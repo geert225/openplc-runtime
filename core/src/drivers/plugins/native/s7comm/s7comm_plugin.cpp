@@ -1080,12 +1080,14 @@ static int s7comm_rw_area_callback(void *usrPtr, int Sender, int Operation, PS7T
 
     if (Operation == OperationRead) {
         /*
-         * S7 client is READing - provide fresh data from OpenPLC
-         * Acquire mutex, copy data, release mutex
+         * S7 client is READing - provide fresh data from OpenPLC.
+         * image_lock() takes the image mutex and drains the journal so the
+         * copy sees freshly committed values; the snap7 TCP send happens
+         * after this callback returns, outside the lock.
          */
-        g_runtime_args.mutex_take(g_runtime_args.buffer_mutex);
+        g_runtime_args.image_lock();
         read_openplc_to_buffer((uint8_t *)pUsrData, size, type, start_buffer);
-        g_runtime_args.mutex_give(g_runtime_args.buffer_mutex);
+        g_runtime_args.image_unlock();
     } else if (Operation == OperationWrite) {
         /*
          * S7 client is WRITing - journal the changes

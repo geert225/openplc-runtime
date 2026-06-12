@@ -4,7 +4,7 @@ Runtime-side asset:
 
 - `runtime_v4_entry.cpp` — small static C-linkage shim (~50 lines)
   compiled into every user `.so` by `scripts/compile.sh`. Defines
-  `g_config`, exports `strucpp_get_config()` / `strucpp_set_locks()` /
+  `g_config`, exports `strucpp_get_config()` /
   `strucpp_get_located_vars()` / `strucpp_get_located_var_count()`,
   and activates the C-linkage debug PDU exports from
   `debug_dispatch.hpp` (`STRUCPP_V4_DEBUG_EXPORTS_DEFINE`).

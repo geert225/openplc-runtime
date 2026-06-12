@@ -503,6 +503,20 @@ int ecat_io_build_transfer_list(const ecat_channel_map_t *map,
 {
     memset(xfer, 0, sizeof(*xfer));
 
+    /* EtherCAT input data is published into the %I image through the journal
+     * (lock-free, race-free against the IEC tasks). Refuse to build the list
+     * if the runtime did not supply the journal writers and we have input
+     * channels to map. */
+    if (map->input_count > 0 &&
+        (!args->journal_write_bool || !args->journal_write_byte ||
+         !args->journal_write_int  || !args->journal_write_dint ||
+         !args->journal_write_lint)) {
+        plugin_logger_error(logger,
+            "Journal write entry points unavailable; cannot map %d EtherCAT input channel(s)",
+            map->input_count);
+        return -1;
+    }
+
     int resolved = 0;
 
     /* Resolve input channels */
@@ -518,6 +532,8 @@ int ecat_io_build_transfer_list(const ecat_channel_map_t *map,
         t->iomap_bit_offset = e->iomap_bit_offset;
         t->byte_count      = iec_size_to_bytes(e->size);
         t->is_bit          = (e->size == IEC_SIZE_BIT);
+        t->journal_index   = e->byte_index;
+        t->journal_bit     = (e->size == IEC_SIZE_BIT) ? e->bit_index : 0;
         resolved++;
     }
 
@@ -555,16 +571,57 @@ int ecat_io_build_transfer_list(const ecat_channel_map_t *map,
     return 0;
 }
 
+/* Journal buffer-type ids for the INPUT image. Must match
+ * journal_buffer_type_t in journal_buffer.h (mirrored in plugin_types.h). */
+#define ECAT_JOURNAL_BOOL_INPUT 0
+#define ECAT_JOURNAL_BYTE_INPUT 3
+#define ECAT_JOURNAL_INT_INPUT  5
+#define ECAT_JOURNAL_DINT_INPUT 8
+#define ECAT_JOURNAL_LINT_INPUT 11
+
 void ecat_io_read_inputs_fast(const ecat_transfer_list_t *xfer,
-                              const uint8_t *iomap_base)
+                              const uint8_t *iomap_base,
+                              plugin_runtime_args_t *args)
 {
     for (int i = 0; i < xfer->input_count; i++) {
         const ecat_transfer_entry_t *e = &xfer->inputs[i];
+        const uint8_t *src = iomap_base + e->iomap_offset;
         if (e->is_bit) {
-            *(uint8_t *)e->plc_ptr =
-                iomap_read_bit(iomap_base + e->iomap_offset, e->iomap_bit_offset);
-        } else {
-            memcpy(e->plc_ptr, iomap_base + e->iomap_offset, e->byte_count);
+            int v = iomap_read_bit(src, e->iomap_bit_offset);
+            args->journal_write_bool(ECAT_JOURNAL_BOOL_INPUT,
+                                     e->journal_index, e->journal_bit, v);
+            continue;
+        }
+        /* EtherCAT process data is little-endian; OpenPLC targets are LE, so
+         * the raw bytes map straight onto the IEC value (same as the previous
+         * memcpy). */
+        switch (e->byte_count) {
+        case 1: {
+            uint8_t v;
+            memcpy(&v, src, 1);
+            args->journal_write_byte(ECAT_JOURNAL_BYTE_INPUT, e->journal_index, v);
+            break;
+        }
+        case 2: {
+            uint16_t v;
+            memcpy(&v, src, 2);
+            args->journal_write_int(ECAT_JOURNAL_INT_INPUT, e->journal_index, v);
+            break;
+        }
+        case 4: {
+            uint32_t v;
+            memcpy(&v, src, 4);
+            args->journal_write_dint(ECAT_JOURNAL_DINT_INPUT, e->journal_index, v);
+            break;
+        }
+        case 8: {
+            uint64_t v;
+            memcpy(&v, src, 8);
+            args->journal_write_lint(ECAT_JOURNAL_LINT_INPUT, e->journal_index, v);
+            break;
+        }
+        default:
+            break;
         }
     }
 }

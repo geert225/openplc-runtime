@@ -1293,9 +1293,8 @@ async def main():
             # Create simple boolean list for testing
             self.bool_data = [[False] * 8]  # 1 buffer, 8 booleans
             self.bool_output = self.bool_data  # Simple reference
-            self.mutex_take = None
-            self.mutex_give = None
-            self.buffer_mutex = None
+            self.image_lock = None
+            self.image_unlock = None
 
         def safe_access_buffer_size(self):
             """Mock implementation of safe_access_buffer_size"""

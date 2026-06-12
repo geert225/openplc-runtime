@@ -58,25 +58,10 @@ plugin_driver_t *plugin_driver_create(void)
         return NULL;
     }
 
-    // Initialize mutex with priority inheritance to prevent priority inversion
-    if (init_rt_mutex(&driver->buffer_mutex) != 0)
-    {
-        free(driver);
-        return NULL;
-    }
-
+    // Buffer access no longer uses a driver-owned mutex: reads go through the
+    // runtime's image_lock()/image_unlock() (flush-on-lock) and writes through
+    // the lock-free journal. Nothing to initialize here.
     return driver;
-}
-
-// Mutex helper functions for plugins
-int plugin_mutex_take(pthread_mutex_t *mutex)
-{
-    return pthread_mutex_lock(mutex);
-}
-
-int plugin_mutex_give(pthread_mutex_t *mutex)
-{
-    return pthread_mutex_unlock(mutex);
 }
 
 // Journal write wrapper functions for plugins
@@ -875,7 +860,6 @@ void plugin_driver_destroy(plugin_driver_t *driver)
     if (driver->plugin_count == 0)
     {
         log_info("No plugins to destroy");
-        pthread_mutex_destroy(&driver->buffer_mutex);
         free(driver);
         return;
     }
@@ -931,8 +915,6 @@ void plugin_driver_destroy(plugin_driver_t *driver)
         Py_FinalizeEx();
     }
 
-    pthread_mutex_destroy(&driver->buffer_mutex);
-
     free(driver);
 }
 
@@ -987,9 +969,10 @@ void *generate_structured_args_with_driver(plugin_type_t type, plugin_driver_t *
     args->lint_memory = lint_memory;
     args->bool_memory = bool_memory;
 
-    // Initialize mutex functions
-    args->mutex_take = plugin_mutex_take;
-    args->mutex_give = plugin_mutex_give;
+    // Flush-on-lock image read API (image mutex + journal drain). Points
+    // directly at the runtime's image_tables entries; writes use the journal.
+    args->image_lock   = image_lock;
+    args->image_unlock = image_unlock;
     // STruC++ debugger surface — replaces the MatIEC-era
     // get_var_list / get_var_size / get_var_count flat-index API.
     // Each thunk forwards to the corresponding ext_strucpp_debug_*
@@ -1000,8 +983,6 @@ void *generate_structured_args_with_driver(plugin_type_t type, plugin_driver_t *
     args->debug_read        = plugin_debug_read;
     args->debug_set         = plugin_debug_set;
     args->debug_write       = plugin_debug_write;
-    // Set buffer mutex from driver
-    args->buffer_mutex = &driver->buffer_mutex;
 
     // Initialize plugin specific config path as empty
     memset(args->plugin_specific_config_file_path, '\0',
@@ -1039,22 +1020,13 @@ void *generate_structured_args_with_driver(plugin_type_t type, plugin_driver_t *
     // printf("[PLUGIN]: Runtime args initialized:\n");
     // printf("[PLUGIN]:   buffer_size = %d\n", args->buffer_size);
     // printf("[PLUGIN]:   bits_per_buffer = %d\n", args->bits_per_buffer);
-    // printf("[PLUGIN]:   buffer_mutex = %p\n", (void *)args->buffer_mutex);
     // printf("[PLUGIN]:   bool_input = %p\n", (void *)args->bool_input);
-    // printf("[PLUGIN]:   mutex_take = %p\n", (void *)args->mutex_take);
-    // printf("[PLUGIN]:   mutex_give = %p\n", (void *)args->mutex_give);
+    // printf("[PLUGIN]:   image_lock = %p\n", (void *)args->image_lock);
 
     // Validate critical pointers
-    if (!args->buffer_mutex)
+    if (!args->image_lock || !args->image_unlock)
     {
-        log_error("Error - buffer_mutex is NULL");
-        free(args);
-        return NULL;
-    }
-
-    if (!args->mutex_take || !args->mutex_give)
-    {
-        log_error("Error - mutex function pointers are NULL");
+        log_error("Error - image lock function pointers are NULL");
         free(args);
         return NULL;
     }
