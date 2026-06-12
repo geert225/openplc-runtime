@@ -2,12 +2,24 @@
  * @file journal_buffer.c
  * @brief Journal Buffer Implementation for Race-Condition-Free Plugin Writes
  *
- * This implementation provides:
- * - Static journal buffer with configurable max entries
- * - Thread-safe write operations with mutex protection
- * - Atomic application of journal entries at cycle start
- * - Emergency flush when buffer is full
- * - Last-writer-wins conflict resolution via sequence numbers
+ * Producers (plugin threads, EtherCAT bus thread, etc.) enqueue writes; a
+ * single consumer (the fastest PLC task, holding the image-tables mutex)
+ * drains them into the image at the scan boundary, last-writer-wins by order.
+ *
+ * Two implementations selected at compile time:
+ *
+ *   - LOCK-FREE (default on targets with always-lock-free 32-bit + 8-bit
+ *     atomics): a double-buffer "flip" MPSC. Producers never block and never
+ *     take a lock; the consumer flips the active bank with a single atomic
+ *     exchange and drains the retired bank. Overflow within a cycle drops the
+ *     excess write(s) and is reported (see journal_apply_and_clear). This is
+ *     the path used on x86/x64/arm64/armv7/riscv-with-A.
+ *
+ *   - MUTEX FALLBACK (when the required atomics are not lock-free, e.g. a
+ *     RISC-V core without the 'A' extension, or when JOURNAL_FORCE_MUTEX is
+ *     defined): the original mutex-protected ring with an emergency flush.
+ *
+ * The public API and the per-entry apply semantics are identical for both.
  */
 
 #include "journal_buffer.h"
@@ -15,44 +27,161 @@
 #include "utils/utils.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdatomic.h>
+#include <sched.h>
+
+/* The lock-free path needs 32-bit (control word, atomic_uint) and 8-bit
+ * (per-slot publish flag, atomic_uchar) atomics to be ALWAYS lock-free.
+ * ATOMIC_*_LOCK_FREE == 2 means "always lock-free" per the C11 standard. */
+#if !defined(JOURNAL_FORCE_MUTEX) && (ATOMIC_INT_LOCK_FREE == 2) && (ATOMIC_CHAR_LOCK_FREE == 2)
+#define JOURNAL_LOCKFREE 1
+#else
+#define JOURNAL_LOCKFREE 0
+#endif
 
 /*
  * =============================================================================
- * Static State
+ * Shared State
  * =============================================================================
  */
 
-/* Journal entries buffer */
-static journal_entry_t g_entries[JOURNAL_MAX_ENTRIES];
-
-/* Current number of entries in journal */
-static size_t g_count = 0;
-
-/* Next sequence number to assign (auto-increment) */
-static uint32_t g_next_sequence = 0;
-
-/* Journal mutex - protects g_entries, g_count, g_next_sequence */
-static pthread_mutex_t g_journal_mutex;
-
-/* Buffer pointers for applying entries */
+/* Buffer pointers used by apply_entry() to write into the image tables. */
 static journal_buffer_ptrs_t g_buffer_ptrs;
 
-/* Initialization flag */
-static bool g_initialized = false;
+/* Forward declaration: per-mode enqueue. Returns 0 on success, -1 on
+ * drop/overflow/uninitialised. Fills one entry from the validated args. */
+static int journal_add(uint8_t type, uint16_t index, uint8_t bit, uint64_t value);
 
 /*
  * =============================================================================
- * Forward Declarations
+ * Apply (shared by both implementations)
  * =============================================================================
  */
-static void apply_entry(const journal_entry_t *entry);
-static void emergency_flush_locked(void);
+
+static void apply_entry(const journal_entry_t *entry)
+{
+    uint16_t idx = entry->index;
+
+    /* Bounds check */
+    if (idx >= (uint16_t)g_buffer_ptrs.buffer_size) {
+        return;
+    }
+
+    switch ((journal_buffer_type_t)entry->buffer_type) {
+        case JOURNAL_BOOL_INPUT: {
+            IEC_BOOL *ptr = g_buffer_ptrs.bool_input[idx][entry->bit_index];
+            if (ptr != NULL) { *ptr = (IEC_BOOL)(entry->value & 1); }
+            break;
+        }
+        case JOURNAL_BOOL_OUTPUT: {
+            IEC_BOOL *ptr = g_buffer_ptrs.bool_output[idx][entry->bit_index];
+            if (ptr != NULL) { *ptr = (IEC_BOOL)(entry->value & 1); }
+            break;
+        }
+        case JOURNAL_BOOL_MEMORY: {
+            IEC_BOOL *ptr = g_buffer_ptrs.bool_memory[idx][entry->bit_index];
+            if (ptr != NULL) { *ptr = (IEC_BOOL)(entry->value & 1); }
+            break;
+        }
+        case JOURNAL_BYTE_INPUT: {
+            IEC_BYTE *ptr = g_buffer_ptrs.byte_input[idx];
+            if (ptr != NULL) { *ptr = (IEC_BYTE)(entry->value & 0xFF); }
+            break;
+        }
+        case JOURNAL_BYTE_OUTPUT: {
+            IEC_BYTE *ptr = g_buffer_ptrs.byte_output[idx];
+            if (ptr != NULL) { *ptr = (IEC_BYTE)(entry->value & 0xFF); }
+            break;
+        }
+        case JOURNAL_INT_INPUT: {
+            IEC_UINT *ptr = g_buffer_ptrs.int_input[idx];
+            if (ptr != NULL) { *ptr = (IEC_UINT)(entry->value & 0xFFFF); }
+            break;
+        }
+        case JOURNAL_INT_OUTPUT: {
+            IEC_UINT *ptr = g_buffer_ptrs.int_output[idx];
+            if (ptr != NULL) { *ptr = (IEC_UINT)(entry->value & 0xFFFF); }
+            break;
+        }
+        case JOURNAL_INT_MEMORY: {
+            IEC_UINT *ptr = g_buffer_ptrs.int_memory[idx];
+            if (ptr != NULL) { *ptr = (IEC_UINT)(entry->value & 0xFFFF); }
+            break;
+        }
+        case JOURNAL_DINT_INPUT: {
+            IEC_UDINT *ptr = g_buffer_ptrs.dint_input[idx];
+            if (ptr != NULL) { *ptr = (IEC_UDINT)(entry->value & 0xFFFFFFFF); }
+            break;
+        }
+        case JOURNAL_DINT_OUTPUT: {
+            IEC_UDINT *ptr = g_buffer_ptrs.dint_output[idx];
+            if (ptr != NULL) { *ptr = (IEC_UDINT)(entry->value & 0xFFFFFFFF); }
+            break;
+        }
+        case JOURNAL_DINT_MEMORY: {
+            IEC_UDINT *ptr = g_buffer_ptrs.dint_memory[idx];
+            if (ptr != NULL) { *ptr = (IEC_UDINT)(entry->value & 0xFFFFFFFF); }
+            break;
+        }
+        case JOURNAL_LINT_INPUT: {
+            IEC_ULINT *ptr = g_buffer_ptrs.lint_input[idx];
+            if (ptr != NULL) { *ptr = (IEC_ULINT)entry->value; }
+            break;
+        }
+        case JOURNAL_LINT_OUTPUT: {
+            IEC_ULINT *ptr = g_buffer_ptrs.lint_output[idx];
+            if (ptr != NULL) { *ptr = (IEC_ULINT)entry->value; }
+            break;
+        }
+        case JOURNAL_LINT_MEMORY: {
+            IEC_ULINT *ptr = g_buffer_ptrs.lint_memory[idx];
+            if (ptr != NULL) { *ptr = (IEC_ULINT)entry->value; }
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+#if JOURNAL_LOCKFREE
 
 /*
  * =============================================================================
- * Initialization and Cleanup
+ * Lock-free double-buffer-flip implementation (MPSC)
  * =============================================================================
+ *
+ * Control word layout (32-bit):
+ *   bit  31    : active bank index (0 or 1)
+ *   bits 0..30 : write count claimed in the active bank this cycle
+ *
+ * Producer: fetch_add(1) atomically claims (bank, slot). It writes the entry
+ * (plain stores) then publishes with a release store on the per-slot flag.
+ *
+ * Consumer (single, under image mutex): one atomic exchange flips the active
+ * bank and resets the count; the returned old value gives the retired bank and
+ * its final count. The consumer drains [0, count), acquiring each publish flag
+ * (a bounded wait covers a producer caught mid-write at the instant of flip).
+ *
+ * Only the consumer ever changes the bank bit, and the runtime calls the
+ * consumer from a single thread, so read-active-then-exchange is race-free.
  */
+
+#define JOURNAL_NBANKS          2
+#define JOURNAL_BANK_SHIFT      31u
+#define JOURNAL_COUNT_MASK      0x7FFFFFFFu
+/* Bounded wait for an in-flight producer's publish at flip time. Each spin is
+ * one acquire load; this caps the consumer's wait so a dead/stalled producer
+ * can never hang the scan. ~one yield every 64 spins helps on single-core. */
+#define JOURNAL_PUBLISH_SPIN_MAX 200000u
+
+typedef struct {
+    journal_entry_t entries[JOURNAL_MAX_ENTRIES];
+    atomic_uchar    published[JOURNAL_MAX_ENTRIES]; /* 0 = empty, 1 = ready */
+} journal_bank_t;
+
+static journal_bank_t g_banks[JOURNAL_NBANKS];
+static atomic_uint    g_control;          /* [bank:1][count:31] */
+static atomic_bool    g_initialized = false;
 
 int journal_init(const journal_buffer_ptrs_t *buffer_ptrs)
 {
@@ -60,43 +189,180 @@ int journal_init(const journal_buffer_ptrs_t *buffer_ptrs)
         log_error("Journal: buffer_ptrs is NULL");
         return -1;
     }
-
     if (buffer_ptrs->image_mutex == NULL) {
         log_error("Journal: image_mutex is NULL");
         return -1;
     }
 
+    memcpy(&g_buffer_ptrs, buffer_ptrs, sizeof(journal_buffer_ptrs_t));
+
+    for (int b = 0; b < JOURNAL_NBANKS; b++) {
+        memset(g_banks[b].entries, 0, sizeof(g_banks[b].entries));
+        for (size_t i = 0; i < JOURNAL_MAX_ENTRIES; i++) {
+            atomic_init(&g_banks[b].published[i], 0);
+        }
+    }
+    atomic_store_explicit(&g_control, 0u, memory_order_relaxed);
+    atomic_store_explicit(&g_initialized, true, memory_order_release);
+
+    log_info("[JOURNAL] lock-free double-buffer mode (capacity=%d entries/cycle/bank)",
+             JOURNAL_MAX_ENTRIES);
+    return 0;
+}
+
+void journal_cleanup(void)
+{
+    atomic_store_explicit(&g_initialized, false, memory_order_release);
+    atomic_store_explicit(&g_control, 0u, memory_order_relaxed);
+    memset(&g_buffer_ptrs, 0, sizeof(g_buffer_ptrs));
+}
+
+bool journal_is_initialized(void)
+{
+    return atomic_load_explicit(&g_initialized, memory_order_acquire);
+}
+
+static int journal_add(uint8_t type, uint16_t index, uint8_t bit, uint64_t value)
+{
+    if (!atomic_load_explicit(&g_initialized, memory_order_acquire)) {
+        return -1;
+    }
+
+    /* Claim a unique (bank, slot). relaxed: publication ordering is carried by
+     * the per-slot release/acquire below, not by the counter itself. */
+    uint32_t ctrl = atomic_fetch_add_explicit(&g_control, 1u, memory_order_relaxed);
+    uint32_t bank = ctrl >> JOURNAL_BANK_SHIFT;
+    uint32_t slot = ctrl & JOURNAL_COUNT_MASK;
+
+    if (slot >= JOURNAL_MAX_ENTRIES) {
+        /* Overflow: the active bank is full for this cycle. Drop. The consumer
+         * detects and reports the drop count from the raw control count. */
+        return -1;
+    }
+
+    journal_entry_t *e = &g_banks[bank].entries[slot];
+    e->sequence    = slot;
+    e->buffer_type = type;
+    e->bit_index   = bit;
+    e->index       = index;
+    e->value       = value;
+
+    /* Publish: release pairs with the consumer's acquire so the full entry is
+     * visible before the flag is observed set. */
+    atomic_store_explicit(&g_banks[bank].published[slot], 1u, memory_order_release);
+    return 0;
+}
+
+void journal_apply_and_clear(void)
+{
+    if (!atomic_load_explicit(&g_initialized, memory_order_acquire)) {
+        return;
+    }
+
+    uint32_t cur     = atomic_load_explicit(&g_control, memory_order_relaxed);
+    uint32_t active  = cur >> JOURNAL_BANK_SHIFT;
+    uint32_t newbank = active ^ 1u;
+
+    /* Flip + reset count in one RMW. Linearizes producers into either the
+     * retired bank (counted in `old`) or the fresh bank (count from 0). */
+    uint32_t old = atomic_exchange_explicit(&g_control,
+                                            newbank << JOURNAL_BANK_SHIFT,
+                                            memory_order_acq_rel);
+    uint32_t retired = old >> JOURNAL_BANK_SHIFT;   /* == active */
+    uint32_t raw     = old & JOURNAL_COUNT_MASK;
+    uint32_t count   = raw;
+
+    if (count > JOURNAL_MAX_ENTRIES) {
+        log_warn("[JOURNAL] overflow: %u write(s) dropped this cycle "
+                 "(capacity=%d) -- increase JOURNAL_MAX_ENTRIES or reduce the "
+                 "plugin write rate",
+                 raw - JOURNAL_MAX_ENTRIES, JOURNAL_MAX_ENTRIES);
+        count = JOURNAL_MAX_ENTRIES;
+    }
+
+    journal_bank_t *bank = &g_banks[retired];
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t spins = 0;
+        while (atomic_load_explicit(&bank->published[i], memory_order_acquire) == 0) {
+            if (++spins >= JOURNAL_PUBLISH_SPIN_MAX) {
+                break;
+            }
+            if ((spins & 0x3Fu) == 0) {
+                sched_yield();
+            }
+        }
+        if (atomic_load_explicit(&bank->published[i], memory_order_acquire) != 0) {
+            apply_entry(&bank->entries[i]);
+        } else {
+            /* Producer claimed the slot before the flip but never published
+             * (died / pathologically delayed). Skip to keep the scan bounded. */
+            log_warn("[JOURNAL] slot %u unpublished at flip; skipped", i);
+        }
+        atomic_store_explicit(&bank->published[i], 0u, memory_order_relaxed);
+    }
+}
+
+size_t journal_pending_count(void)
+{
+    uint32_t c = atomic_load_explicit(&g_control, memory_order_relaxed) & JOURNAL_COUNT_MASK;
+    return (c > JOURNAL_MAX_ENTRIES) ? JOURNAL_MAX_ENTRIES : c;
+}
+
+uint32_t journal_get_sequence(void)
+{
+    return atomic_load_explicit(&g_control, memory_order_relaxed) & JOURNAL_COUNT_MASK;
+}
+
+#else /* !JOURNAL_LOCKFREE -- mutex fallback */
+
+/*
+ * =============================================================================
+ * Mutex fallback implementation
+ * =============================================================================
+ */
+
+static journal_entry_t g_entries[JOURNAL_MAX_ENTRIES];
+static size_t          g_count = 0;
+static uint32_t        g_next_sequence = 0;
+static pthread_mutex_t g_journal_mutex;
+static bool            g_initialized = false;
+
+static void emergency_flush_locked(void);
+
+int journal_init(const journal_buffer_ptrs_t *buffer_ptrs)
+{
+    if (buffer_ptrs == NULL) {
+        log_error("Journal: buffer_ptrs is NULL");
+        return -1;
+    }
+    if (buffer_ptrs->image_mutex == NULL) {
+        log_error("Journal: image_mutex is NULL");
+        return -1;
+    }
     if (init_rt_mutex(&g_journal_mutex) != 0) {
         fprintf(stderr, "[JOURNAL] Error: failed to initialize mutex\n");
         return -1;
     }
 
     pthread_mutex_lock(&g_journal_mutex);
-
-    /* Copy buffer pointers */
     memcpy(&g_buffer_ptrs, buffer_ptrs, sizeof(journal_buffer_ptrs_t));
-
-    /* Reset journal state */
     g_count = 0;
     g_next_sequence = 0;
     memset(g_entries, 0, sizeof(g_entries));
-
     g_initialized = true;
-
     pthread_mutex_unlock(&g_journal_mutex);
 
+    log_info("[JOURNAL] mutex-fallback mode (atomics not lock-free on this target)");
     return 0;
 }
 
 void journal_cleanup(void)
 {
     pthread_mutex_lock(&g_journal_mutex);
-
     g_initialized = false;
     g_count = 0;
     g_next_sequence = 0;
     memset(&g_buffer_ptrs, 0, sizeof(g_buffer_ptrs));
-
     pthread_mutex_unlock(&g_journal_mutex);
     pthread_mutex_destroy(&g_journal_mutex);
 }
@@ -110,317 +376,26 @@ bool journal_is_initialized(void)
     return result;
 }
 
-/*
- * =============================================================================
- * Write Functions
- * =============================================================================
- */
-
-/**
- * @brief Internal function to add an entry to the journal
- *
- * Must be called with g_journal_mutex held.
- * Handles emergency flush if buffer is full.
- *
- * @return Pointer to the new entry, or NULL on failure
- */
-static journal_entry_t *add_entry_locked(void)
+static int journal_add(uint8_t type, uint16_t index, uint8_t bit, uint64_t value)
 {
-    /* Check if buffer is full */
+    if (!g_initialized) {
+        return -1;
+    }
+    pthread_mutex_lock(&g_journal_mutex);
+
     if (g_count >= JOURNAL_MAX_ENTRIES) {
-        /* Emergency flush: apply all entries and clear */
         emergency_flush_locked();
     }
-
-    /* Add new entry */
-    journal_entry_t *entry = &g_entries[g_count];
-    entry->sequence = g_next_sequence++;
+    journal_entry_t *e = &g_entries[g_count];
+    e->sequence    = g_next_sequence++;
+    e->buffer_type = type;
+    e->bit_index   = bit;
+    e->index       = index;
+    e->value       = value;
     g_count++;
 
-    return entry;
-}
-
-int journal_write_bool(journal_buffer_type_t type, uint16_t index,
-                       uint8_t bit, bool value)
-{
-    if (!g_initialized) {
-        return -1;
-    }
-
-    /* Validate type */
-    if (type != JOURNAL_BOOL_INPUT &&
-        type != JOURNAL_BOOL_OUTPUT &&
-        type != JOURNAL_BOOL_MEMORY) {
-        return -1;
-    }
-
-    /* Validate bit index */
-    if (bit > 7) {
-        return -1;
-    }
-
-    pthread_mutex_lock(&g_journal_mutex);
-
-    journal_entry_t *entry = add_entry_locked();
-    if (entry == NULL) {
-        pthread_mutex_unlock(&g_journal_mutex);
-        return -1;
-    }
-
-    entry->buffer_type = (uint8_t)type;
-    entry->index = index;
-    entry->bit_index = bit;
-    entry->value = value ? 1 : 0;
-
     pthread_mutex_unlock(&g_journal_mutex);
     return 0;
-}
-
-int journal_write_byte(journal_buffer_type_t type, uint16_t index,
-                       uint8_t value)
-{
-    if (!g_initialized) {
-        return -1;
-    }
-
-    /* Validate type */
-    if (type != JOURNAL_BYTE_INPUT && type != JOURNAL_BYTE_OUTPUT) {
-        return -1;
-    }
-
-    pthread_mutex_lock(&g_journal_mutex);
-
-    journal_entry_t *entry = add_entry_locked();
-    if (entry == NULL) {
-        pthread_mutex_unlock(&g_journal_mutex);
-        return -1;
-    }
-
-    entry->buffer_type = (uint8_t)type;
-    entry->index = index;
-    entry->bit_index = 0xFF;  /* Not applicable for non-bool types */
-    entry->value = value;
-
-    pthread_mutex_unlock(&g_journal_mutex);
-    return 0;
-}
-
-int journal_write_int(journal_buffer_type_t type, uint16_t index,
-                      uint16_t value)
-{
-    if (!g_initialized) {
-        return -1;
-    }
-
-    /* Validate type */
-    if (type != JOURNAL_INT_INPUT &&
-        type != JOURNAL_INT_OUTPUT &&
-        type != JOURNAL_INT_MEMORY) {
-        return -1;
-    }
-
-    pthread_mutex_lock(&g_journal_mutex);
-
-    journal_entry_t *entry = add_entry_locked();
-    if (entry == NULL) {
-        pthread_mutex_unlock(&g_journal_mutex);
-        return -1;
-    }
-
-    entry->buffer_type = (uint8_t)type;
-    entry->index = index;
-    entry->bit_index = 0xFF;
-    entry->value = value;
-
-    pthread_mutex_unlock(&g_journal_mutex);
-    return 0;
-}
-
-int journal_write_dint(journal_buffer_type_t type, uint16_t index,
-                       uint32_t value)
-{
-    if (!g_initialized) {
-        return -1;
-    }
-
-    /* Validate type */
-    if (type != JOURNAL_DINT_INPUT &&
-        type != JOURNAL_DINT_OUTPUT &&
-        type != JOURNAL_DINT_MEMORY) {
-        return -1;
-    }
-
-    pthread_mutex_lock(&g_journal_mutex);
-
-    journal_entry_t *entry = add_entry_locked();
-    if (entry == NULL) {
-        pthread_mutex_unlock(&g_journal_mutex);
-        return -1;
-    }
-
-    entry->buffer_type = (uint8_t)type;
-    entry->index = index;
-    entry->bit_index = 0xFF;
-    entry->value = value;
-
-    pthread_mutex_unlock(&g_journal_mutex);
-    return 0;
-}
-
-int journal_write_lint(journal_buffer_type_t type, uint16_t index,
-                       uint64_t value)
-{
-    if (!g_initialized) {
-        return -1;
-    }
-
-    /* Validate type */
-    if (type != JOURNAL_LINT_INPUT &&
-        type != JOURNAL_LINT_OUTPUT &&
-        type != JOURNAL_LINT_MEMORY) {
-        return -1;
-    }
-
-    pthread_mutex_lock(&g_journal_mutex);
-
-    journal_entry_t *entry = add_entry_locked();
-    if (entry == NULL) {
-        pthread_mutex_unlock(&g_journal_mutex);
-        return -1;
-    }
-
-    entry->buffer_type = (uint8_t)type;
-    entry->index = index;
-    entry->bit_index = 0xFF;
-    entry->value = value;
-
-    pthread_mutex_unlock(&g_journal_mutex);
-    return 0;
-}
-
-/*
- * =============================================================================
- * Apply and Clear
- * =============================================================================
- */
-
-/**
- * @brief Apply a single journal entry to the image tables
- *
- * @param entry The entry to apply
- */
-static void apply_entry(const journal_entry_t *entry)
-{
-    uint16_t idx = entry->index;
-
-    /* Bounds check */
-    if (idx >= (uint16_t)g_buffer_ptrs.buffer_size) {
-        return;
-    }
-
-    switch ((journal_buffer_type_t)entry->buffer_type) {
-        case JOURNAL_BOOL_INPUT: {
-            IEC_BOOL *ptr = g_buffer_ptrs.bool_input[idx][entry->bit_index];
-            if (ptr != NULL) {
-                *ptr = (IEC_BOOL)(entry->value & 1);
-            }
-            break;
-        }
-        case JOURNAL_BOOL_OUTPUT: {
-            IEC_BOOL *ptr = g_buffer_ptrs.bool_output[idx][entry->bit_index];
-            if (ptr != NULL) {
-                *ptr = (IEC_BOOL)(entry->value & 1);
-            }
-            break;
-        }
-        case JOURNAL_BOOL_MEMORY: {
-            IEC_BOOL *ptr = g_buffer_ptrs.bool_memory[idx][entry->bit_index];
-            if (ptr != NULL) {
-                *ptr = (IEC_BOOL)(entry->value & 1);
-            }
-            break;
-        }
-        case JOURNAL_BYTE_INPUT: {
-            IEC_BYTE *ptr = g_buffer_ptrs.byte_input[idx];
-            if (ptr != NULL) {
-                *ptr = (IEC_BYTE)(entry->value & 0xFF);
-            }
-            break;
-        }
-        case JOURNAL_BYTE_OUTPUT: {
-            IEC_BYTE *ptr = g_buffer_ptrs.byte_output[idx];
-            if (ptr != NULL) {
-                *ptr = (IEC_BYTE)(entry->value & 0xFF);
-            }
-            break;
-        }
-        case JOURNAL_INT_INPUT: {
-            IEC_UINT *ptr = g_buffer_ptrs.int_input[idx];
-            if (ptr != NULL) {
-                *ptr = (IEC_UINT)(entry->value & 0xFFFF);
-            }
-            break;
-        }
-        case JOURNAL_INT_OUTPUT: {
-            IEC_UINT *ptr = g_buffer_ptrs.int_output[idx];
-            if (ptr != NULL) {
-                *ptr = (IEC_UINT)(entry->value & 0xFFFF);
-            }
-            break;
-        }
-        case JOURNAL_INT_MEMORY: {
-            IEC_UINT *ptr = g_buffer_ptrs.int_memory[idx];
-            if (ptr != NULL) {
-                *ptr = (IEC_UINT)(entry->value & 0xFFFF);
-            }
-            break;
-        }
-        case JOURNAL_DINT_INPUT: {
-            IEC_UDINT *ptr = g_buffer_ptrs.dint_input[idx];
-            if (ptr != NULL) {
-                *ptr = (IEC_UDINT)(entry->value & 0xFFFFFFFF);
-            }
-            break;
-        }
-        case JOURNAL_DINT_OUTPUT: {
-            IEC_UDINT *ptr = g_buffer_ptrs.dint_output[idx];
-            if (ptr != NULL) {
-                *ptr = (IEC_UDINT)(entry->value & 0xFFFFFFFF);
-            }
-            break;
-        }
-        case JOURNAL_DINT_MEMORY: {
-            IEC_UDINT *ptr = g_buffer_ptrs.dint_memory[idx];
-            if (ptr != NULL) {
-                *ptr = (IEC_UDINT)(entry->value & 0xFFFFFFFF);
-            }
-            break;
-        }
-        case JOURNAL_LINT_INPUT: {
-            IEC_ULINT *ptr = g_buffer_ptrs.lint_input[idx];
-            if (ptr != NULL) {
-                *ptr = (IEC_ULINT)entry->value;
-            }
-            break;
-        }
-        case JOURNAL_LINT_OUTPUT: {
-            IEC_ULINT *ptr = g_buffer_ptrs.lint_output[idx];
-            if (ptr != NULL) {
-                *ptr = (IEC_ULINT)entry->value;
-            }
-            break;
-        }
-        case JOURNAL_LINT_MEMORY: {
-            IEC_ULINT *ptr = g_buffer_ptrs.lint_memory[idx];
-            if (ptr != NULL) {
-                *ptr = (IEC_ULINT)entry->value;
-            }
-            break;
-        }
-        default:
-            /* Unknown type - ignore */
-            break;
-    }
 }
 
 void journal_apply_and_clear(void)
@@ -428,72 +403,30 @@ void journal_apply_and_clear(void)
     if (!g_initialized) {
         return;
     }
-
     pthread_mutex_lock(&g_journal_mutex);
-
-    /* Apply all entries in sequence order (they're already in order) */
     for (size_t i = 0; i < g_count; i++) {
         apply_entry(&g_entries[i]);
     }
-
-    /* Clear journal */
     g_count = 0;
     g_next_sequence = 0;
-
     pthread_mutex_unlock(&g_journal_mutex);
 }
 
-/*
- * =============================================================================
- * Emergency Flush
- * =============================================================================
- */
-
-/**
- * @brief Emergency flush - apply all entries when buffer is full
- *
- * Called when a new write is attempted but the journal buffer is full.
- * Must be called with g_journal_mutex already held.
- *
- * Lock ordering to prevent deadlock:
- * 1. Release journal mutex
- * 2. Acquire image mutex
- * 3. Re-acquire journal mutex
- * 4. Apply entries
- * 5. Release image mutex
- * (Continue holding journal mutex for the pending write)
- */
+/* Emergency flush when full. Caller holds g_journal_mutex. Releases it to take
+ * the image mutex first (image -> journal order), re-takes journal, applies,
+ * releases image, returns with g_journal_mutex held for the pending write. */
 static void emergency_flush_locked(void)
 {
-    /* Release journal mutex to respect lock ordering */
     pthread_mutex_unlock(&g_journal_mutex);
-
-    /* Acquire image mutex first (lock ordering) */
     pthread_mutex_lock(g_buffer_ptrs.image_mutex);
-
-    /* Re-acquire journal mutex */
     pthread_mutex_lock(&g_journal_mutex);
-
-    /* Apply all entries */
     for (size_t i = 0; i < g_count; i++) {
         apply_entry(&g_entries[i]);
     }
-
-    /* Clear journal */
     g_count = 0;
     g_next_sequence = 0;
-
-    /* Release image mutex (keep journal mutex for the pending write) */
     pthread_mutex_unlock(g_buffer_ptrs.image_mutex);
-
-    /* Note: We return with g_journal_mutex still held */
 }
-
-/*
- * =============================================================================
- * Diagnostics
- * =============================================================================
- */
 
 size_t journal_pending_count(void)
 {
@@ -511,4 +444,68 @@ uint32_t journal_get_sequence(void)
     seq = g_next_sequence;
     pthread_mutex_unlock(&g_journal_mutex);
     return seq;
+}
+
+#endif /* JOURNAL_LOCKFREE */
+
+/*
+ * =============================================================================
+ * Public write functions (shared) -- validate, then enqueue via journal_add()
+ * =============================================================================
+ */
+
+int journal_write_bool(journal_buffer_type_t type, uint16_t index,
+                       uint8_t bit, bool value)
+{
+    if (type != JOURNAL_BOOL_INPUT &&
+        type != JOURNAL_BOOL_OUTPUT &&
+        type != JOURNAL_BOOL_MEMORY) {
+        return -1;
+    }
+    if (bit > 7) {
+        return -1;
+    }
+    return journal_add((uint8_t)type, index, bit, value ? 1u : 0u);
+}
+
+int journal_write_byte(journal_buffer_type_t type, uint16_t index,
+                       uint8_t value)
+{
+    if (type != JOURNAL_BYTE_INPUT && type != JOURNAL_BYTE_OUTPUT) {
+        return -1;
+    }
+    return journal_add((uint8_t)type, index, 0xFF, value);
+}
+
+int journal_write_int(journal_buffer_type_t type, uint16_t index,
+                      uint16_t value)
+{
+    if (type != JOURNAL_INT_INPUT &&
+        type != JOURNAL_INT_OUTPUT &&
+        type != JOURNAL_INT_MEMORY) {
+        return -1;
+    }
+    return journal_add((uint8_t)type, index, 0xFF, value);
+}
+
+int journal_write_dint(journal_buffer_type_t type, uint16_t index,
+                       uint32_t value)
+{
+    if (type != JOURNAL_DINT_INPUT &&
+        type != JOURNAL_DINT_OUTPUT &&
+        type != JOURNAL_DINT_MEMORY) {
+        return -1;
+    }
+    return journal_add((uint8_t)type, index, 0xFF, value);
+}
+
+int journal_write_lint(journal_buffer_type_t type, uint16_t index,
+                       uint64_t value)
+{
+    if (type != JOURNAL_LINT_INPUT &&
+        type != JOURNAL_LINT_OUTPUT &&
+        type != JOURNAL_LINT_MEMORY) {
+        return -1;
+    }
+    return journal_add((uint8_t)type, index, 0xFF, value);
 }
