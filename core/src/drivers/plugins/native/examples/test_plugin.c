@@ -61,20 +61,14 @@ int init(void *args)
     plugin_logger_debug(&g_logger, "Plugin config path: %s",
                         g_runtime_args->plugin_specific_config_file_path);
 
-    /* Test mutex functions if available */
-    if (g_runtime_args->mutex_take && g_runtime_args->mutex_give && g_runtime_args->buffer_mutex)
+    /* Test the flush-on-lock image read API if available */
+    if (g_runtime_args->image_lock && g_runtime_args->image_unlock)
     {
-        plugin_logger_debug(&g_logger, "Testing mutex functions...");
-        if (g_runtime_args->mutex_take(g_runtime_args->buffer_mutex) == 0)
-        {
-            plugin_logger_debug(&g_logger, "Mutex acquired successfully");
-            g_runtime_args->mutex_give(g_runtime_args->buffer_mutex);
-            plugin_logger_debug(&g_logger, "Mutex released successfully");
-        }
-        else
-        {
-            plugin_logger_warn(&g_logger, "Failed to acquire mutex");
-        }
+        plugin_logger_debug(&g_logger, "Testing image lock...");
+        g_runtime_args->image_lock();
+        plugin_logger_debug(&g_logger, "Image lock acquired (journal drained)");
+        g_runtime_args->image_unlock();
+        plugin_logger_debug(&g_logger, "Image lock released");
     }
 
     plugin_initialized = 1;

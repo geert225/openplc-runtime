@@ -12,19 +12,16 @@
 //      generated_debug.cpp's compile-time address-of expressions resolve.
 //   2. Export strucpp_get_config() — C-linkage entry the runtime dlsyms
 //      to obtain a ConfigurationInstance* pointer.
-//   3. Export strucpp_set_locks() — runtime-side image-tables / globals
-//      mutex pointers handed in right after dlopen, stored where
-//      iec_threading.hpp's lock guards can find them.
-//   4. Export strucpp_get_located_vars / strucpp_get_located_var_count
+//   3. Export strucpp_get_located_vars / strucpp_get_located_var_count
 //      — re-expose strucpp::locatedVars[] (a per-project namespaced
 //      symbol) under stable C linkage.
-//   5. Activate STRUCPP_V4_DEBUG_EXPORTS_DEFINE — emits the C-linkage
+//   4. Activate STRUCPP_V4_DEBUG_EXPORTS_DEFINE — emits the C-linkage
 //      strucpp_debug_* PDU helpers from debug_dispatch.hpp.
-//   6. Export strucpp_advance_time() — bumps the per-.so
+//   5. Export strucpp_advance_time() — bumps the per-.so
 //      strucpp::__CURRENT_TIME_NS by the runtime-supplied tick. The
 //      runtime owns the tick (computed from g_config); the shim just
 //      provides the cross-DSO advance entry point.
-//   7. Export strucpp_program_md5 — the project MD5, surfaced by FC 0x45
+//   6. Export strucpp_program_md5 — the project MD5, surfaced by FC 0x45
 //      so the editor can verify it's debugging the matching source.
 
 #define STRUCPP_V4_DEBUG_EXPORTS_DEFINE
@@ -37,23 +34,12 @@
 #include <cstdint>
 #include <pthread.h>
 
-namespace strucpp {
-    pthread_mutex_t* g_image_tables_mutex_ptr = nullptr;
-    pthread_mutex_t* g_global_vars_mutex_ptr  = nullptr;
-}
-
 // External linkage so generated_debug.cpp can reference &g_config.X.Y at
 // compile time. Same constraint as the Arduino sketch's g_config.
 strucpp::Configuration_CONFIG0 g_config;
 
 extern "C" strucpp::ConfigurationInstance* strucpp_get_config(void) {
     return &g_config;
-}
-
-extern "C" void strucpp_set_locks(pthread_mutex_t* image_tables_mutex,
-                                  pthread_mutex_t* global_vars_mutex) {
-    strucpp::g_image_tables_mutex_ptr = image_tables_mutex;
-    strucpp::g_global_vars_mutex_ptr  = global_vars_mutex;
 }
 
 // strucpp::locatedVars / locatedVarsCount are top-level externs declared in
@@ -106,3 +92,20 @@ char strucpp_program_md5[] = PROGRAM_MD5;
 extern "C" void strucpp_advance_time(uint64_t tick_ns) {
     strucpp::__CURRENT_TIME_NS += static_cast<int64_t>(tick_ns);
 }
+
+// Capability flag. Present (== 1) only when this .so was compiled with
+// STRUCPP_THREADED (the threaded runtime's compile.sh defines it). The runtime
+// dlsyms this optional symbol to decide whether the loaded program supports the
+// process-image execution model (per-task copy-in/out of located vars +
+// sync_in()/sync_out() of globals on private working copies), which lets it run
+// task bodies without the global image lock. When the symbol is absent the
+// runtime falls back to the shared-image + whole-body-lock path, so older
+// programs still run.
+#ifdef STRUCPP_THREADED
+// NOT const: a namespace-scope `const` has internal linkage in C++ and would
+// be hidden from the runtime's dlsym (the same trap documented for
+// strucpp_program_md5 above). A plain int has external linkage.
+extern "C" {
+int strucpp_threaded_abi = 1;
+}
+#endif

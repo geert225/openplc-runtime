@@ -76,7 +76,6 @@ typedef struct
 {
     plugin_instance_t plugins[MAX_PLUGINS];
     int plugin_count;
-    pthread_mutex_t buffer_mutex;
 } plugin_driver_t;
 
 // Driver management functions
@@ -100,8 +99,6 @@ int plugin_driver_cleanup_init(plugin_driver_t *driver);
 int plugin_driver_start(plugin_driver_t *driver);
 int plugin_driver_stop(plugin_driver_t *driver);
 void plugin_driver_destroy(plugin_driver_t *driver);
-int plugin_mutex_take(pthread_mutex_t *mutex);
-int plugin_mutex_give(pthread_mutex_t *mutex);
 
 // Cycle hook functions for native plugins (called during PLC scan cycle)
 // These iterate through all active native plugins and call their cycle hooks

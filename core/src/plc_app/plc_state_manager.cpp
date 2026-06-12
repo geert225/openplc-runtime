@@ -171,6 +171,11 @@ static void *plc_task_thread(void *arg)
             ctx->holding_mutex = 0;
             pthread_mutex_unlock(image_tables_mutex());
         }
+        if (ctx->holding_global)
+        {
+            ctx->holding_global = 0;
+            pthread_mutex_unlock(global_mutex());
+        }
         log_error("[task %s] crashed (signal %d) — entering ERROR state",
                   ctx->name, ctx->crash_sig);
         plc_force_error_state();
@@ -179,41 +184,92 @@ static void *plc_task_thread(void *arg)
 
     auto *task = static_cast<strucpp::TaskInstance *>(ctx->task_handle);
 
+    /* Cached once: the loaded .so either supports the threaded process-image
+     * model (copy-in/out + global sync, parallel bodies) or it doesn't (legacy
+     * whole-body lock). g_threaded is fixed before any task thread starts. */
+    const bool threaded = (image_is_threaded() != 0);
+
     timespec next_wakeup;
     clock_gettime(CLOCK_MONOTONIC, &next_wakeup);
 
     while (plc_get_state() == PLC_STATE_RUNNING)
     {
-        /* Set the holding flag AFTER acquiring the mutex. If a fatal signal
-         * lands between the flag set and the lock returning, the crash
-         * handler's cleanup would call pthread_mutex_unlock on a mutex this
-         * thread never owned — UB on PI mutexes. */
-        pthread_mutex_lock(image_tables_mutex());
-        ctx->holding_mutex = 1;
-
-        /* Per-task scan timing. Every task thread tracks its own
-         * scan/cycle/latency stats around its body; the IO housekeeping
-         * window (plugin cycle hooks) is still anchored on the fastest
-         * task because plugins assume one cross-cycle handoff per scan. */
         scan_cycle_tracker_start(&ctx->tracker);
-        if (ctx->is_fastest_task)
+
+        if (threaded)
         {
-            plc_run_io_cycle_pre();
+            /* Process-image model: short locked windows for I/O and global
+             * sync; the body runs lock-free on the program's private storage,
+             * so task bodies execute in parallel. holding_mutex/holding_global
+             * gate the crash-handler unlock of whichever lock is held. */
+
+            /* 1. Copy-in: snapshot this task's located inputs from the image
+             *    into program storage. image_lock() takes the image mutex and
+             *    drains the journal (flush-on-lock) so we read fresh committed
+             *    values -- the same API plugins use for coherent reads. Set
+             *    holding_mutex after the lock so a fatal signal between flag and
+             *    lock can't unlock a mutex we don't own. */
+            image_lock();
+            ctx->holding_mutex = 1;
+            for (size_t p = 0; p < task->program_count; ++p)
+            {
+                uint32_t off = 0, cnt = 0;
+                task->programs[p]->located_range(&off, &cnt);
+                if (cnt) image_tables_threaded_copy_in(off, cnt);
+            }
+            ctx->holding_mutex = 0;
+            image_unlock();
+
+            /* 2. Global sync-in: canonical globals -> private working copies. */
+            pthread_mutex_lock(global_mutex());
+            ctx->holding_global = 1;
+            for (size_t p = 0; p < task->program_count; ++p)
+                task->programs[p]->sync_in();
+            ctx->holding_global = 0;
+            pthread_mutex_unlock(global_mutex());
+
+            if (ctx->is_fastest_task) plc_run_io_cycle_threaded_pre();
+
+            /* 3. Run the bodies on private storage -- NO lock held. */
+            for (size_t p = 0; p < task->program_count; ++p)
+                task->programs[p]->run();
+
+            /* 4. Global sync-out: commit changed externals back. */
+            pthread_mutex_lock(global_mutex());
+            ctx->holding_global = 1;
+            for (size_t p = 0; p < task->program_count; ++p)
+                task->programs[p]->sync_out();
+            ctx->holding_global = 0;
+            pthread_mutex_unlock(global_mutex());
+
+            /* 5. Copy-out: journal this task's changed located outputs
+             *    (lock-free; applied to the image on the next drain). */
+            for (size_t p = 0; p < task->program_count; ++p)
+            {
+                uint32_t off = 0, cnt = 0;
+                task->programs[p]->located_range(&off, &cnt);
+                if (cnt) image_tables_threaded_copy_out(off, cnt);
+            }
+
+            if (ctx->is_fastest_task) plc_run_io_cycle_threaded_post();
+        }
+        else
+        {
+            /* Legacy shared-image model: the whole body runs under the image
+             * mutex (serializes task bodies). Used for .so that predate the
+             * threaded ABI. Set holding_mutex AFTER the lock so a fatal signal
+             * between flag and lock can't unlock a mutex we don't own. */
+            pthread_mutex_lock(image_tables_mutex());
+            ctx->holding_mutex = 1;
+            if (ctx->is_fastest_task) plc_run_io_cycle_pre();
+            for (size_t p = 0; p < task->program_count; ++p)
+                task->programs[p]->run();
+            if (ctx->is_fastest_task) plc_run_io_cycle_post();
+            ctx->holding_mutex = 0;
+            pthread_mutex_unlock(image_tables_mutex());
         }
 
-        for (size_t p = 0; p < task->program_count; ++p)
-        {
-            task->programs[p]->run();
-        }
-
-        if (ctx->is_fastest_task)
-        {
-            plc_run_io_cycle_post();
-        }
         scan_cycle_tracker_end(&ctx->tracker);
-
-        pthread_mutex_unlock(image_tables_mutex());
-        ctx->holding_mutex = 0;
 
         ctx->heartbeat.store((long)time(nullptr), std::memory_order_relaxed);
         ctx->local_tick.fetch_add(1, std::memory_order_relaxed);

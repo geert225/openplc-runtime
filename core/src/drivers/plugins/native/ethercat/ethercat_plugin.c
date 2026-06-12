@@ -870,9 +870,9 @@ static void stop_single_master(ecat_master_instance_t *inst)
  * exchange (which is the slow part — tens to hundreds of microseconds
  * for typical networks):
  *
- *   1. lock buffer_mutex → copy PLC outputs into IOmap → unlock
+ *   1. image_lock (drain journal) → copy PLC outputs into IOmap → unlock
  *   2. SOEM exchange (no mutex held — IEC tasks can run during it)
- *   3. lock buffer_mutex → copy IOmap inputs into PLC buffers → unlock
+ *   3. publish IOmap inputs into the %I image via the lock-free journal
  *   4. Update WKC + diagnostics
  *
  * Diag timing distinguishes two metrics:
@@ -914,14 +914,15 @@ static bool ecat_run_one_cycle(ecat_master_instance_t *inst)
     ec_timet t_exch_start, t_exch_end;
 
     /* 1. Lock briefly, snapshot outputs from PLC buffers into the IOmap.
+     *    image_lock() drains the journal so we read freshly committed %Q.
      *    This is a pure memcpy — microseconds — so we don't hold the
      *    image-tables mutex across the SOEM exchange. */
-    if (g_runtime_args.mutex_take && g_runtime_args.buffer_mutex) {
-        g_runtime_args.mutex_take(g_runtime_args.buffer_mutex);
-    }
-    ecat_io_write_outputs_fast(&inst->transfer_list, iomap);
-    if (g_runtime_args.mutex_give && g_runtime_args.buffer_mutex) {
-        g_runtime_args.mutex_give(g_runtime_args.buffer_mutex);
+    if (g_runtime_args.image_lock && g_runtime_args.image_unlock) {
+        g_runtime_args.image_lock();
+        ecat_io_write_outputs_fast(&inst->transfer_list, iomap);
+        g_runtime_args.image_unlock();
+    } else {
+        ecat_io_write_outputs_fast(&inst->transfer_list, iomap);
     }
 
     /* 2. Exchange process data with slaves (synchronous, NO mutex held).
@@ -932,15 +933,11 @@ static bool ecat_run_one_cycle(ecat_master_instance_t *inst)
 
     uint64_t exchange_ns = elapsed_ns(&t_exch_start, &t_exch_end);
 
-    /* 3. Lock again briefly, copy received inputs from IOmap into PLC
-     *    buffers. */
-    if (g_runtime_args.mutex_take && g_runtime_args.buffer_mutex) {
-        g_runtime_args.mutex_take(g_runtime_args.buffer_mutex);
-    }
-    ecat_io_read_inputs_fast(&inst->transfer_list, iomap);
-    if (g_runtime_args.mutex_give && g_runtime_args.buffer_mutex) {
-        g_runtime_args.mutex_give(g_runtime_args.buffer_mutex);
-    }
+    /* 3. Publish received inputs into the %I image through the journal.
+     *    Journal writes are lock-free and thread-safe, so no buffer mutex is
+     *    held here; the entries apply atomically at the next scan boundary,
+     *    race-free against the IEC task threads. */
+    ecat_io_read_inputs_fast(&inst->transfer_list, iomap, &g_runtime_args);
 
 #if ECAT_ENABLE_MONITOR_THREAD
     pthread_mutex_unlock(&inst->soem_lock);

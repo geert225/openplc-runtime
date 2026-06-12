@@ -86,13 +86,20 @@ int ecat_io_build_transfer_list(const ecat_channel_map_t *map,
                                 plugin_logger_t *logger);
 
 /**
- * @brief Fast per-cycle: copy IOmap inputs into PLC variables
+ * @brief Fast per-cycle: publish IOmap inputs into the PLC %I image
+ *
+ * Input values are written through the lock-free journal (args->journal_write_*)
+ * rather than poked directly into the image, so they apply atomically at the
+ * next scan boundary and never race the IEC task threads. No image lock is
+ * held here.
  *
  * @param xfer       Transfer list built by ecat_io_build_transfer_list()
  * @param iomap_base Base pointer of the IOmap buffer
+ * @param args       Runtime args providing the journal_write_* entry points
  */
 void ecat_io_read_inputs_fast(const ecat_transfer_list_t *xfer,
-                              const uint8_t *iomap_base);
+                              const uint8_t *iomap_base,
+                              plugin_runtime_args_t *args);
 
 /**
  * @brief Fast per-cycle: copy PLC variables into IOmap outputs

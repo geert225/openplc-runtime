@@ -74,6 +74,16 @@ struct ProgramBase {
     virtual void run() = 0;
     virtual const RetainVarInfo *getRetainVars() const { return nullptr; }
     virtual size_t getRetainCount() const { return 0; }
+    // Threaded-runtime hooks (vtable slots 4,5,6). MUST match the order in
+    // strucpp's iec_std_lib.hpp. The runtime calls these on .so built by a
+    // matching (threaded) strucpp; programs override them under
+    // STRUCPP_THREADED, otherwise they are no-ops.
+    virtual void sync_in() {}
+    virtual void sync_out() {}
+    virtual void located_range(uint32_t *offset, uint32_t *count) const {
+        *offset = 0;
+        *count = 0;
+    }
 };
 
 // ---------------------------------------------------------------------------

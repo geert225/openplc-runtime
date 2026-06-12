@@ -111,8 +111,9 @@ typedef void (*plugin_request_plc_stop_func_t)(const char *reason);
  * - Buffer size information
  * - Centralized logging functions
  *
- * Plugins should use mutex_take/mutex_give when accessing buffers to ensure
- * thread safety with the PLC scan cycle.
+ * Plugins read buffers under image_lock()/image_unlock() (flush-on-lock) and
+ * write through journal_write_* (lock-free), keeping access race-free against
+ * the PLC scan cycle.
  */
 typedef struct
 {
@@ -132,10 +133,15 @@ typedef struct
     IEC_ULINT **lint_memory;
     IEC_BOOL *(*bool_memory)[8];
 
-    /* Mutex functions for thread-safe buffer access */
-    int (*mutex_take)(pthread_mutex_t *mutex);
-    int (*mutex_give)(pthread_mutex_t *mutex);
-    pthread_mutex_t *buffer_mutex;
+    /* Flush-on-lock image read API for thread-safe buffer access.
+     *
+     * image_lock() takes the runtime's image mutex and drains the journal so
+     * the holder sees every committed write; image_unlock() releases it. Writes
+     * never take this lock -- use journal_write_* (lock-free). Prefer the bulk
+     * pattern for reads: lock, copy the region to a local buffer, unlock, then
+     * do any slow work (network, conversion) on the buffer OUTSIDE the lock. */
+    void (*image_lock)(void);
+    void (*image_unlock)(void);
 
     /* STruC++ debugger variable-access surface.
      * Replaces the MatIEC-era flat-index API (get_var_list /

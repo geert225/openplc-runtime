@@ -81,10 +81,10 @@ extern "C"
      * Symbol resolution.
      *
      * Resolves all required entry points from the dlopen'd .so, including
-     * the strucpp shim entries (strucpp_get_config / strucpp_set_locks)
-     * the runtime needs to walk the configuration and plumb mutexes.
-     * Initializes runtime-owned image-tables and globals mutexes (recursive
-     * PI) on first call and hands their pointers to the .so.
+     * the strucpp shim entry (strucpp_get_config) the runtime needs to walk
+     * the configuration. Initializes the runtime-owned image-tables mutex
+     * (recursive PI) on first call. The mutex is locked by the runtime
+     * directly; it is not handed to the .so.
      *
      * Returns 0 on success, -1 if anything required is missing.
      * --------------------------------------------------------------------- */
@@ -111,14 +111,45 @@ extern "C"
     void image_tables_clear_null_pointers(void);
 
     /* -------------------------------------------------------------------------
-     * Resource mutex accessors. Returns pointers to the runtime-owned
-     * recursive PI mutexes that protect the image tables and the globals.
-     * Plugins / the runtime housekeeping use these directly; the codegen
-     * lock guards inside the .so lock the same instances via the pointer
-     * stash plumbed through strucpp_set_locks().
+     * Image-tables mutex accessor. Returns a pointer to the runtime-owned
+     * recursive PI mutex that protects the image tables. The runtime locks
+     * it directly; the .so never locks anything (generated code runs on its
+     * own storage), so there is no lock handoff into the .so.
      * --------------------------------------------------------------------- */
     pthread_mutex_t *image_tables_mutex(void);
-    pthread_mutex_t *global_vars_mutex(void);
+
+    /* -------------------------------------------------------------------------
+     * Flush-on-lock read API. The canonical way for any consumer to obtain a
+     * coherent view of the image for READING:
+     *   image_lock()   -- take the image mutex, then drain the journal so the
+     *                     holder sees every committed write.
+     *   image_unlock() -- release the image mutex.
+     * Writes never use this lock (they go through journal_write_*). Prefer the
+     * bulk pattern: lock, copy the region to a local buffer, unlock, then do
+     * any slow work (network, conversion) on the buffer outside the lock. The
+     * mutex is recursive PI; the drain is a no-op when nothing is pending.
+     * --------------------------------------------------------------------- */
+    void image_lock(void);
+    void image_unlock(void);
+
+    /* -------------------------------------------------------------------------
+     * Threaded process-image model.
+     *
+     * image_is_threaded() reports whether the loaded .so was built for the
+     * threaded model (exports strucpp_threaded_abi). global_mutex() guards
+     * per-task global sync_in()/sync_out(). The copy_in/out functions move a
+     * program's located slice [offset, offset+count) of locatedVars[] between
+     * the runtime-owned image and the program's private storage:
+     *   - copy_in  : image -> program members (called before run(), under the
+     *                image mutex, after the journal drain).
+     *   - copy_out : changed program members -> journal (dirty-diff, lock-free;
+     *                applied to the image on the next drain). %I is never
+     *                committed.
+     * --------------------------------------------------------------------- */
+    int  image_is_threaded(void);
+    pthread_mutex_t *global_mutex(void);
+    void image_tables_threaded_copy_in(uint32_t offset, uint32_t count);
+    void image_tables_threaded_copy_out(uint32_t offset, uint32_t count);
 
     /* -------------------------------------------------------------------------
      * Returns the cached strucpp::ConfigurationInstance* (as void* — the

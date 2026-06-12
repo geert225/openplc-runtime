@@ -59,6 +59,28 @@ target_link_libraries(plc_main
     ${PYTHON_LIBRARIES}
 )
 
+# Some 64-bit atomic operations (e.g. std::atomic<uint64_t> in the scan-cycle
+# bookkeeping) are lowered to libatomic calls on 32-bit targets such as armv7
+# (Raspberry Pi OS 32-bit / Raspbian), producing link errors like:
+#   undefined reference to '__atomic_load_8' ... libatomic.so.1: DSO missing
+# On 64-bit targets (arm64, x86_64) the compiler inlines them and libatomic is
+# often absent, so detect-and-link only when it is actually required.
+include(CheckCXXSourceCompiles)
+set(_OPENPLC_ATOMIC_TEST
+    "#include <atomic>\n#include <cstdint>\nint main(){ std::atomic<uint64_t> a{0}; a.fetch_add(1); return (int)a.load(); }")
+check_cxx_source_compiles("${_OPENPLC_ATOMIC_TEST}" OPENPLC_ATOMICS_BUILTIN)
+if(NOT OPENPLC_ATOMICS_BUILTIN)
+    set(CMAKE_REQUIRED_LIBRARIES atomic)
+    check_cxx_source_compiles("${_OPENPLC_ATOMIC_TEST}" OPENPLC_ATOMICS_NEED_LIBATOMIC)
+    unset(CMAKE_REQUIRED_LIBRARIES)
+    if(OPENPLC_ATOMICS_NEED_LIBATOMIC)
+        target_link_libraries(plc_main atomic)
+        message(STATUS "Linking libatomic (64-bit atomics require it on this target)")
+    else()
+        message(WARNING "64-bit atomics require libatomic but it was not found")
+    endif()
+endif()
+
 # Export symbols from the executable so that dlopen'd PLC shared libraries
 # can resolve functions provided by the runtime (e.g. TCP communication blocks)
 target_link_options(plc_main PRIVATE -rdynamic)

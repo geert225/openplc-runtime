@@ -36,12 +36,17 @@ extern "C" {
 #endif
 
 /**
- * @brief Maximum number of journal entries per cycle
+ * @brief Journal capacity per cycle (per bank in the lock-free implementation)
  *
- * If this limit is reached, an emergency flush is triggered to apply
- * pending entries and make room for new ones.
+ * Sized so a full scan's worth of plugin writes fits comfortably. Writes
+ * accumulate between drains -- a plugin running faster than the fastest task
+ * contributes several writes per cell per drain -- so this is deliberately
+ * generous. Overflow within a cycle is handled by the implementation: the
+ * lock-free path drops the excess write(s) and logs it; the mutex fallback
+ * triggers an emergency flush. Keep this large enough that overflow only
+ * happens under genuine misconfiguration/overload.
  */
-#define JOURNAL_MAX_ENTRIES 1024
+#define JOURNAL_MAX_ENTRIES 4096
 
 /**
  * @brief Buffer type enumeration for journal entries
