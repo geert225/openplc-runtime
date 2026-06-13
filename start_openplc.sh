@@ -206,5 +206,12 @@ setup_plugin_venvs() {
 setup_plugin_venvs
 setup_runtime_venv
 
+# Optional virtual serial port pair for testing serial-based plugins (e.g.
+# Profibus DP) without physical RS-485 hardware. Enable with
+# OPENPLC_VIRTUAL_SERIAL=1.
+if [ "${OPENPLC_VIRTUAL_SERIAL:-0}" = "1" ]; then
+    bash "$OPENPLC_DIR/scripts/setup-virtual-serial.sh" || log_warning "Failed to set up virtual serial ports"
+fi
+
 # Start the PLC webserver (forward all arguments)
 "$OPENPLC_DIR/venvs/runtime/bin/python3" -m "webserver.app" "$@"

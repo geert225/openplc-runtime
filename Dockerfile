@@ -24,6 +24,10 @@ RUN rm -rf build/ venvs/ .venv/ 2>/dev/null || true
 # Run installation script
 RUN ./install.sh
 
+# socat is used to create virtual serial port pairs for testing serial-based
+# plugins (e.g. Profibus DP) without physical RS-485 hardware.
+RUN apt-get update && apt-get install -y --no-install-recommends socat
+
 # Clean up apt cache to reduce image size (Docker-specific optimization)
 RUN rm -rf /var/lib/apt/lists/*
 

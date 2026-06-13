@@ -1,0 +1,88 @@
+[
+  {
+    "name": "profibus_master_1",
+    "protocol": "PROFIBUS_DP",
+    "config": {
+      "master": {
+        "device": "/dev/ttyUSB0",
+        "baudrate": 500000,
+        "parity": "even",
+        "stop_bits": 1,
+        "station_address": 2,
+        "highest_station_address": 15,
+        "rs485_rts_control": true,
+        "rts_delay_us": 0,
+        "slot_time_us": 1000,
+        "gap_update_factor": 10,
+        "max_retry_limit": 3,
+        "cycle_time_us": 10000,
+        "task_priority": 80,
+        "log_level": "info"
+      },
+      "diagnostics": {
+        "log_connections": true,
+        "log_errors": true,
+        "max_log_entries": 100,
+        "status_update_interval_ms": 1000
+      },
+      "slaves": [
+        {
+          "station_address": 3,
+          "name": "DI8_DO8",
+          "ident_number": "0x806A",
+          "group": 1,
+          "watchdog_enabled": true,
+          "watchdog_ms": 400,
+          "min_tsdr": 11,
+          "user_prm_data": [],
+          "cfg_data": ["0x10", "0x30"],
+          "input_length": 1,
+          "output_length": 1,
+          "strict": true,
+          "channels": [
+            { "index": 0, "name": "DI0", "type": "digital_input", "bit_length": 1, "iec_location": "%IX0.0", "byte_offset": 0, "bit_offset": 0, "data_type": "BOOL" },
+            { "index": 1, "name": "DI1", "type": "digital_input", "bit_length": 1, "iec_location": "%IX0.1", "byte_offset": 0, "bit_offset": 1, "data_type": "BOOL" },
+            { "index": 2, "name": "DI2", "type": "digital_input", "bit_length": 1, "iec_location": "%IX0.2", "byte_offset": 0, "bit_offset": 2, "data_type": "BOOL" },
+            { "index": 3, "name": "DI3", "type": "digital_input", "bit_length": 1, "iec_location": "%IX0.3", "byte_offset": 0, "bit_offset": 3, "data_type": "BOOL" },
+            { "index": 4, "name": "DI4", "type": "digital_input", "bit_length": 1, "iec_location": "%IX0.4", "byte_offset": 0, "bit_offset": 4, "data_type": "BOOL" },
+            { "index": 5, "name": "DI5", "type": "digital_input", "bit_length": 1, "iec_location": "%IX0.5", "byte_offset": 0, "bit_offset": 5, "data_type": "BOOL" },
+            { "index": 6, "name": "DI6", "type": "digital_input", "bit_length": 1, "iec_location": "%IX0.6", "byte_offset": 0, "bit_offset": 6, "data_type": "BOOL" },
+            { "index": 7, "name": "DI7", "type": "digital_input", "bit_length": 1, "iec_location": "%IX0.7", "byte_offset": 0, "bit_offset": 7, "data_type": "BOOL" },
+            { "index": 8, "name": "DO0", "type": "digital_output", "bit_length": 1, "iec_location": "%QX0.0", "byte_offset": 0, "bit_offset": 0, "data_type": "BOOL" },
+            { "index": 9, "name": "DO1", "type": "digital_output", "bit_length": 1, "iec_location": "%QX0.1", "byte_offset": 0, "bit_offset": 1, "data_type": "BOOL" },
+            { "index": 10, "name": "DO2", "type": "digital_output", "bit_length": 1, "iec_location": "%QX0.2", "byte_offset": 0, "bit_offset": 2, "data_type": "BOOL" },
+            { "index": 11, "name": "DO3", "type": "digital_output", "bit_length": 1, "iec_location": "%QX0.3", "byte_offset": 0, "bit_offset": 3, "data_type": "BOOL" },
+            { "index": 12, "name": "DO4", "type": "digital_output", "bit_length": 1, "iec_location": "%QX0.4", "byte_offset": 0, "bit_offset": 4, "data_type": "BOOL" },
+            { "index": 13, "name": "DO5", "type": "digital_output", "bit_length": 1, "iec_location": "%QX0.5", "byte_offset": 0, "bit_offset": 5, "data_type": "BOOL" },
+            { "index": 14, "name": "DO6", "type": "digital_output", "bit_length": 1, "iec_location": "%QX0.6", "byte_offset": 0, "bit_offset": 6, "data_type": "BOOL" },
+            { "index": 15, "name": "DO7", "type": "digital_output", "bit_length": 1, "iec_location": "%QX0.7", "byte_offset": 0, "bit_offset": 7, "data_type": "BOOL" }
+          ],
+          "dpv1_parameters": []
+        },
+        {
+          "station_address": 4,
+          "name": "AI_AO_with_params",
+          "ident_number": "0x806B",
+          "group": 1,
+          "watchdog_enabled": true,
+          "watchdog_ms": 400,
+          "min_tsdr": 11,
+          "user_prm_data": ["0x00"],
+          "cfg_data": ["0x51", "0x71"],
+          "input_length": 2,
+          "output_length": 2,
+          "strict": true,
+          "channels": [
+            { "index": 0, "name": "AI0", "type": "analog_input", "bit_length": 16, "iec_location": "%IW0", "byte_offset": 0, "data_type": "UINT16" },
+            { "index": 1, "name": "AO0", "type": "analog_output", "bit_length": 16, "iec_location": "%QW0", "byte_offset": 0, "data_type": "UINT16" }
+          ],
+          "dpv1_parameters": [
+            { "name": "Setpoint", "slot": 0, "index": 1, "data_type": "UINT16", "length": 2, "writable": true, "initial_value": 100 },
+            { "name": "Scale_Factor", "slot": 0, "index": 2, "data_type": "REAL32", "length": 4, "writable": true, "initial_value": 1.0 },
+            { "name": "Serial_Number", "slot": 1, "index": 0, "data_type": "UINT32", "length": 4, "writable": false }
+          ]
+        }
+      ]
+    }
+  }
+]

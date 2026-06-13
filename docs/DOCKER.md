@@ -195,6 +195,29 @@ docker run -d \
 **Capabilities:**
 - `SYS_NICE` - Required for SCHED_FIFO real-time scheduling
 
+## Virtual Serial Ports (Profibus DP Testing)
+
+To test the Profibus DP plugin without physical RS-485 hardware, enable the
+built-in virtual serial port pair with `OPENPLC_VIRTUAL_SERIAL=1`:
+
+```bash
+docker run -d \
+  --name openplc-runtime \
+  -p 8443:8443 \
+  --cap-add=SYS_NICE \
+  --cap-add=SYS_RESOURCE \
+  -e OPENPLC_VIRTUAL_SERIAL=1 \
+  -v openplc-runtime-data:/var/run/runtime \
+  ghcr.io/autonomy-logic/openplc-runtime:latest
+```
+
+This creates a linked pseudo-terminal pair at `/var/run/runtime/ttyPB0` and
+`/var/run/runtime/ttyPB1` at startup (via `socat`):
+
+- Configure the Profibus DP master's `device` to `/var/run/runtime/ttyPB0`
+- Drive the other end (`/var/run/runtime/ttyPB1`) from a slave simulator,
+  e.g. via `docker exec -it openplc-runtime <simulator>`
+
 ## Docker Compose
 
 ### Basic Configuration
