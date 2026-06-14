@@ -38,6 +38,7 @@
 #include "plugin_types.h"
 #include "profinet_plugin.h"
 #include "profinet_config.h"
+#include "profinet_dcp.h"
 #include "profinet_master.h"
 #include "cJSON.h"
 

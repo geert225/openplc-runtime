@@ -14,6 +14,7 @@
  */
 
 #include "profinet_rpc.h"
+#include "profinet_eth.h" /* PN_ETHERTYPE_PROFINET */
 
 #include <string.h>
 #include <stdio.h>
