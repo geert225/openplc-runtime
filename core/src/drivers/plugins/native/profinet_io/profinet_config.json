@@ -1,0 +1,67 @@
+[
+  {
+    "name": "profinet_controller_1",
+    "protocol": "PROFINET_IO",
+    "config": {
+      "master": {
+        "interface": "eth0",
+        "station_name": "openplc-controller",
+        "send_clock_factor": 32,
+        "reduction_ratio": 1,
+        "task_priority": 80,
+        "log_level": "info"
+      },
+      "diagnostics": {
+        "log_connections": true,
+        "log_errors": true,
+        "max_log_entries": 100,
+        "status_update_interval_ms": 1000
+      },
+      "devices": [
+        {
+          "name": "DI8_DO8",
+          "station_name": "et200sp-station-1",
+          "ip_address": "192.168.1.50",
+          "vendor_id": "0x002A",
+          "device_id": "0x0313",
+          "watchdog_factor": 3,
+          "strict": true,
+          "slots": [
+            {
+              "slot_number": 1,
+              "module_ident_number": "0x00000001",
+              "submodules": [
+                { "subslot_number": 1, "submodule_ident_number": "0x00000001", "input_length": 1, "output_length": 0 }
+              ]
+            },
+            {
+              "slot_number": 2,
+              "module_ident_number": "0x00000002",
+              "submodules": [
+                { "subslot_number": 1, "submodule_ident_number": "0x00000002", "input_length": 0, "output_length": 1 }
+              ]
+            }
+          ],
+          "channels": [
+            { "index": 0, "name": "DI0", "type": "digital_input", "bit_length": 1, "iec_location": "%IX0.0", "byte_offset": 0, "bit_offset": 0, "data_type": "BOOL" },
+            { "index": 1, "name": "DI1", "type": "digital_input", "bit_length": 1, "iec_location": "%IX0.1", "byte_offset": 0, "bit_offset": 1, "data_type": "BOOL" },
+            { "index": 2, "name": "DI2", "type": "digital_input", "bit_length": 1, "iec_location": "%IX0.2", "byte_offset": 0, "bit_offset": 2, "data_type": "BOOL" },
+            { "index": 3, "name": "DI3", "type": "digital_input", "bit_length": 1, "iec_location": "%IX0.3", "byte_offset": 0, "bit_offset": 3, "data_type": "BOOL" },
+            { "index": 4, "name": "DI4", "type": "digital_input", "bit_length": 1, "iec_location": "%IX0.4", "byte_offset": 0, "bit_offset": 4, "data_type": "BOOL" },
+            { "index": 5, "name": "DI5", "type": "digital_input", "bit_length": 1, "iec_location": "%IX0.5", "byte_offset": 0, "bit_offset": 5, "data_type": "BOOL" },
+            { "index": 6, "name": "DI6", "type": "digital_input", "bit_length": 1, "iec_location": "%IX0.6", "byte_offset": 0, "bit_offset": 6, "data_type": "BOOL" },
+            { "index": 7, "name": "DI7", "type": "digital_input", "bit_length": 1, "iec_location": "%IX0.7", "byte_offset": 0, "bit_offset": 7, "data_type": "BOOL" },
+            { "index": 8, "name": "DO0", "type": "digital_output", "bit_length": 1, "iec_location": "%QX0.0", "byte_offset": 0, "bit_offset": 0, "data_type": "BOOL" },
+            { "index": 9, "name": "DO1", "type": "digital_output", "bit_length": 1, "iec_location": "%QX0.1", "byte_offset": 0, "bit_offset": 1, "data_type": "BOOL" },
+            { "index": 10, "name": "DO2", "type": "digital_output", "bit_length": 1, "iec_location": "%QX0.2", "byte_offset": 0, "bit_offset": 2, "data_type": "BOOL" },
+            { "index": 11, "name": "DO3", "type": "digital_output", "bit_length": 1, "iec_location": "%QX0.3", "byte_offset": 0, "bit_offset": 3, "data_type": "BOOL" },
+            { "index": 12, "name": "DO4", "type": "digital_output", "bit_length": 1, "iec_location": "%QX0.4", "byte_offset": 0, "bit_offset": 4, "data_type": "BOOL" },
+            { "index": 13, "name": "DO5", "type": "digital_output", "bit_length": 1, "iec_location": "%QX0.5", "byte_offset": 0, "bit_offset": 5, "data_type": "BOOL" },
+            { "index": 14, "name": "DO6", "type": "digital_output", "bit_length": 1, "iec_location": "%QX0.6", "byte_offset": 0, "bit_offset": 6, "data_type": "BOOL" },
+            { "index": 15, "name": "DO7", "type": "digital_output", "bit_length": 1, "iec_location": "%QX0.7", "byte_offset": 0, "bit_offset": 7, "data_type": "BOOL" }
+          ]
+        }
+      ]
+    }
+  }
+]
